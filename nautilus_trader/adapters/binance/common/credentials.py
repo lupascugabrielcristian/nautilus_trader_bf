@@ -93,7 +93,7 @@ def get_api_key(account_type: BinanceAccountType, environment: BinanceEnvironmen
             )
 
     if environment == BinanceEnvironment.DEMO:
-        return get_env_key("BINANCE_DEMO_API_KEY")
+        return _normalize_credential("BINANCE_DEMO_API_KEY", get_env_key("BINANCE_DEMO_API_KEY"))
 
     _resolve = _get_credential if account_type.is_spot_or_margin else _get_credential_soft
     return _resolve(
@@ -122,7 +122,7 @@ def get_api_secret(account_type: BinanceAccountType, environment: BinanceEnviron
             )
 
     if environment == BinanceEnvironment.DEMO:
-        return get_env_key("BINANCE_DEMO_API_SECRET")
+        return _normalize_credential("BINANCE_DEMO_API_SECRET", get_env_key("BINANCE_DEMO_API_SECRET"))
 
     _resolve = _get_credential if account_type.is_spot_or_margin else _get_credential_soft
     return _resolve(
@@ -134,7 +134,7 @@ def get_api_secret(account_type: BinanceAccountType, environment: BinanceEnviron
 def _get_credential(standard_key: str, deprecated_key: str) -> str:
     standard_value = os.environ.get(standard_key)
     if standard_value is not None:
-        return standard_value
+        return _normalize_credential(standard_key, standard_value)
 
     if os.environ.get(deprecated_key) is not None:
         raise ValueError(
@@ -148,7 +148,7 @@ def _get_credential(standard_key: str, deprecated_key: str) -> str:
 def _get_credential_soft(standard_key: str, deprecated_key: str) -> str:
     standard_value = os.environ.get(standard_key)
     if standard_value is not None:
-        return standard_value
+        return _normalize_credential(standard_key, standard_value)
 
     deprecated_value = os.environ.get(deprecated_key)
     if deprecated_value is not None:
@@ -158,6 +158,17 @@ def _get_credential_soft(standard_key: str, deprecated_key: str) -> str:
             DeprecationWarning,
             stacklevel=4,
         )
-        return deprecated_value
+        return _normalize_credential(deprecated_key, deprecated_value)
 
     raise ValueError(f"'{standard_key}' not found in environment")
+
+
+def _normalize_credential(key_name: str, value: str) -> str:
+    normalized = value.strip()
+    if normalized != value:
+        warnings.warn(
+            f"Environment variable '{key_name}' had leading/trailing whitespace and was normalized.",
+            UserWarning,
+            stacklevel=3,
+        )
+    return normalized
