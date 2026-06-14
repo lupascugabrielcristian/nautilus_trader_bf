@@ -17,28 +17,28 @@ if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
 
 client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
-# 1. Establish a timezone-aware timestamp for exactly 1 month ago
-#    Using America/New_York avoids offset issues with market open/close times
+# --- Config ---
+# Timeframe options: TimeFrameUnit.Minute, TimeFrameUnit.Hour, TimeFrameUnit.Day, TimeFrameUnit.Week, TimeFrameUnit.Month
+SYMBOL = "NVDA"
+TIMEFRAME = TimeFrame(1, TimeFrameUnit.Minute)
+
 now = pd.Timestamp.now(tz="America/New_York")
 one_month_ago = now - pd.Timedelta(days=30)
 
-# 2. Define your target intraday timeframe
-#    For 1-minute bars:  TimeFrame(1, TimeFrameUnit.Minute)
-#    For 15-minute bars: TimeFrame(15, TimeFrameUnit.Minute)
-target_timeframe = TimeFrame(15, TimeFrameUnit.Minute)
-
 request_params = StockBarsRequest(
-    symbol_or_symbols="AAPL",
-    timeframe=target_timeframe,
+    symbol_or_symbols=SYMBOL,
+    timeframe=TIMEFRAME,
     start=one_month_ago,
     end=now,
     feed="iex"
 )
 
-# Fetch bars - on the free tier, this data is sourced from IEX
-bars = client.get_stock_bars(request_params).df.loc["AAPL"]
+bars_df = client.get_stock_bars(request_params).df
+if bars_df.empty:
+    raise ValueError(f"No bars returned for symbol '{SYMBOL}'")
+bars = bars_df.loc[SYMBOL] if "symbol" in bars_df.index.names else bars_df
 
-# 3. Generate the interactive intraday Candlestick chart
+# Generate the interactive Candlestick chart
 fig = go.Figure(data=[go.Candlestick(
     x=bars.index,
     open=bars['open'],
@@ -49,6 +49,6 @@ fig = go.Figure(data=[go.Candlestick(
 
 # Update layout for cleaner intraday viewing (removes empty weekend gaps)
 fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-fig.update_layout(title="AAPL 15-Min Bars (Past 30 Days)", xaxis_title="Date/Time", yaxis_title="Price")
+fig.update_layout(title=f"{SYMBOL} {TIMEFRAME} Bars (Past 30 Days)", xaxis_title="Date/Time", yaxis_title="Price")
 
 fig.show()
