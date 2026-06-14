@@ -1,15 +1,52 @@
-# Binance user scripts
+# User scripts
 
-## Scripts
+## Alpaca paper trading
+
+Script: `alpaca_demo_run.py`
+
+Runs a live paper trading system using Alpaca Markets for streaming data
+and order execution, with NautilusTrader as the strategy engine and
+`SandboxExecutionClient` for local fill simulation.
+
+### Quick start
+
+```bash
+# Edit user/.env with your Alpaca API keys
+python user/alpaca_demo_run.py [SYMBOL]
+```
+
+The symbol is optional; defaults to `AAPL` (or the value from `.env` / `ALPACA_SYMBOL`).
+
+### Configuration
+
+Create `user/.env`:
+
+```ini
+ALPACA_API_KEY=your_paper_key
+ALPACA_SECRET_KEY=your_paper_secret
+ALPACA_SYMBOL=AAPL
+```
+
+The script loads `.env` automatically from the `user/` directory.
+
+### Requirements
+
+- `alpaca-py>=0.13,<1.0` (listed in `user/requirements.txt`)
+
+---
+
+## Binance scripts
+
+### Scripts
 
 - `run_binance_data_monitor.py`: data-only monitoring (no order execution)
 - `run_binance_paper_live.py`: paper/live workflow with execution enabled
 
 Both scripts were switched from AX to Binance adapter usage.
 
-## Required environment variables
+### Required environment variables
 
-### Common runtime settings
+#### Common runtime settings
 
 - `BINANCE_ENV`
   - `LIVE` for production Binance
@@ -34,7 +71,7 @@ Both scripts were switched from AX to Binance adapter usage.
     - `ERROR`
   - Use uppercase values.
 
-### Strategy parameters used by `run_binance_paper_live.py`
+#### Strategy parameters used by `run_binance_paper_live.py`
 
 - `BINANCE_TRADE_SIZE` (example: `0.01`)
 - `BINANCE_BB_PERIOD` (example: `20`)
@@ -43,16 +80,16 @@ Both scripts were switched from AX to Binance adapter usage.
 - `BINANCE_RSI_BUY` (example: `0.30`)
 - `BINANCE_RSI_SELL` (example: `0.70`)
 
-## API credential variables
+### API credential variables
 
 Credentials are only required when private endpoints are used (execution/account data).
 
-### LIVE
+#### LIVE
 
 - `BINANCE_API_KEY`
 - `BINANCE_API_SECRET`
 
-### TESTNET
+#### TESTNET
 
 For spot/margin:
 
@@ -64,14 +101,14 @@ For futures:
 - `BINANCE_FUTURES_TESTNET_API_KEY`
 - `BINANCE_FUTURES_TESTNET_API_SECRET`
 
-### DEMO
+#### DEMO
 
 - `BINANCE_DEMO_API_KEY`
 - `BINANCE_DEMO_API_SECRET`
 
-## Example setups
+### Example setups
 
-### 1) Data-only monitoring on public market data (no credentials required)
+#### 1) Data-only monitoring on public market data (no credentials required)
 
 ```bash
 export BINANCE_ENV=DEMO
@@ -82,7 +119,7 @@ export BINANCE_LOG_LEVEL=INFO
 PYTHONPATH=. python user/run_binance_data_monitor.py
 ```
 
-### 2) Futures testnet with execution enabled
+#### 2) Futures testnet with execution enabled
 
 ```bash
 export BINANCE_ENV=TESTNET
@@ -96,7 +133,7 @@ export BINANCE_TRADE_SIZE=0.02
 PYTHONPATH=. python user/run_binance_paper_live.py
 ```
 
-### 3) Spot testnet with execution enabled
+#### 3) Spot testnet with execution enabled
 
 ```bash
 export BINANCE_ENV=TESTNET
@@ -110,7 +147,7 @@ export BINANCE_TRADE_SIZE=0.01
 PYTHONPATH=. python user/run_binance_paper_live.py
 ```
 
-### 4) Futures demo with execution enabled
+#### 4) Futures demo with execution enabled
 
 ```bash
 export BINANCE_ENV=DEMO
@@ -127,7 +164,7 @@ PYTHONPATH=. python user/run_binance_paper_live.py
 ```bash
 export BINANCE_ENV=DEMO
 export BINANCE_ACCOUNT_TYPE=SPOT
-export BINANCE_INSTRUMENT=JUPUSDC
+export BINANCE_INSTRUMENT=ACTUSDC
 export BINANCE_TRADER_ID=TESTER-001
 export BINANCE_LOG_LEVEL=INFO
 export BINANCE_DEMO_API_KEY=D4l48f9wKt5FTzaVWENwwI1pvmmeu02xk49Dhg0KK9Jsk42DAsRSlZkjvIvTQCYI
@@ -135,7 +172,3 @@ export BINANCE_DEMO_API_SECRET=MC4CAQAwBQYDK2VwBCIEIHfyJhO6VzfrbtXNPG9DpOIeSpwQg
 export BINANCE_TRADE_SIZE=0.01
 PYTHONPATH=. python user/run_binance_paper_live.py
 ```
-
-
-
-export BINANCE_INSTRUMENT=ACTUSDC
