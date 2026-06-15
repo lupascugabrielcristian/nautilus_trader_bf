@@ -33,7 +33,8 @@ from nautilus_trader.config import LoggingConfig
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.core.data import Data
 from nautilus_trader.live.node import TradingNode
-from nautilus_trader.model.data import Bar
+from nautilus_trader.model.data import Bar, BarSpecification, BarType
+from nautilus_trader.model.enums import AggregationSource
 from nautilus_trader.model.data import DataType
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.data import TradeTick
@@ -51,9 +52,11 @@ from nautilus_trader.trading.config import StrategyConfig
 
 
 class TestStrategyConfig(StrategyConfig, frozen=True):
+    bar_type: BarType
     futures_client_id: ClientId
     futures_instrument_id: InstrumentId
     spot_instrument_id: InstrumentId
+    bar_instrument_id: InstrumentId
 
 
 class TestStrategy(Strategy):
@@ -90,8 +93,9 @@ class TestStrategy(Strategy):
         self.log.info(f"Spot balances\n{json.dumps(balances, indent=4)}", LogColor.GREEN)
 
         # Subscribe to live data
+        self.subscribe_bars(self.config.bar_type)
         # self.subscribe_quote_ticks(self.config.futures_instrument_id)
-        self.subscribe_quote_ticks(self.config.spot_instrument_id)
+        # self.subscribe_quote_ticks(self.config.spot_instrument_id)
         # self.subscribe_data(
         #     data_type=DataType(
         #         BinanceFuturesMarkPriceUpdate,
@@ -110,12 +114,14 @@ class TestStrategy(Strategy):
         self.log.info(repr(tick), LogColor.CYAN)
 
     def on_bar(self, bar: Bar) -> None:
+        self.log.info("NEW BAR: close at " + str(bar.close), LogColor.YELLOW)
         self.log.info(repr(bar), LogColor.CYAN)
 
     def on_stop(self) -> None:
         # Unsubscribe from data
         self.unsubscribe_quote_ticks(self.config.futures_instrument_id)
         self.unsubscribe_quote_ticks(self.config.spot_instrument_id)
+        self.unsubscribe_bars(self.config.bar_type)
 
 
 async def main():
@@ -187,6 +193,12 @@ async def main():
         futures_client_id=ClientId("BINANCE_FUTURES"),
         futures_instrument_id=InstrumentId.from_str("BTCUSDT-PERP.BINANCE_FUTURES"),
         spot_instrument_id=InstrumentId.from_str("ETHBTC.BINANCE_SPOT"),
+        bar_type=BarType(
+            instrument_id=InstrumentId.from_str("ETHUSDT-PERP.BINANCE_FUTURES"),
+            bar_spec=BarSpecification.from_str("1-MINUTE-LAST"),
+            aggregation_source=AggregationSource.EXTERNAL,
+        ),
+        bar_instrument_id=InstrumentId.from_str("ETHUSDT-PERP.BINANCE_FUTURES"),
     )
     # Instantiate your strategy
     strategy = TestStrategy(config=strat_config)
