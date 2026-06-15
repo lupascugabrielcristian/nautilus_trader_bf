@@ -41,8 +41,40 @@ The script loads `.env` automatically from the `user/` directory.
 
 - `run_binance_data_monitor.py`: data-only monitoring (no order execution)
 - `run_binance_paper_live.py`: paper/live workflow with execution enabled
+- `binance_live_bars_web.py`: pulls the latest 50 bars from Binance, uses Nautilus Binance live data subscription for incoming bars, keeps only 50 bars in memory, and serves a live-updating web chart
 
 Both scripts were switched from AX to Binance adapter usage.
+
+### Binance live bars web chart
+
+Script: `binance_live_bars_web.py`
+
+This script:
+
+- Loads the last 50 klines via Binance REST
+- Subscribes to live bars through the same Nautilus Binance data-client mechanism used by `run_binance_paper_live.py`
+- Keeps only the latest 50 bars in memory (older bars are discarded)
+- Serves a local web page with a live-updating candlestick chart
+
+#### Run
+
+```bash
+PYTHONPATH=. conda run -n nautilus python user/binance_live_bars_web.py --interval 1m --host 127.0.0.1 --port 8080
+```
+
+Open in browser:
+
+```bash
+http://127.0.0.1:8080/
+```
+
+#### Optional arguments
+
+- `--interval` (default: `1m`)
+- `--host` (default: `127.0.0.1`)
+- `--port` (default: `8080`)
+
+Note: symbol/environment/account type are taken from `BINANCE_INSTRUMENT`, `BINANCE_ENV`, and `BINANCE_ACCOUNT_TYPE` to mirror `run_binance_paper_live.py`.
 
 ### Required environment variables
 
@@ -143,7 +175,7 @@ export BINANCE_TRADER_ID=TESTER-001
 export BINANCE_LOG_LEVEL=INFO
 export BINANCE_TESTNET_API_KEY=AACt88gJfD9BN3FxEl7mb59dZPgNWV0H2zG3ln16JndQuZSyAZvfFRIR1kAuzLmi
 export BINANCE_TESTNET_API_SECRET=MC4CAQAwBQYDK2VwBCIEICVUs+P86MURyo6+kvakuuxhmcsMf0Q7zi0+Ft9dDmMg
-export BINANCE_TRADE_SIZE=0.01
+export BINANCE_TRADE_SIZE=0.1
 PYTHONPATH=. python user/run_binance_paper_live.py
 ```
 
@@ -157,7 +189,7 @@ export BINANCE_TRADER_ID=TESTER-001
 export BINANCE_LOG_LEVEL=INFO
 export BINANCE_DEMO_API_KEY=Ntk9Xu9On1VdB8jtgiVqFdZ8Z0r0iQjoQHpSexiNTIrftV6860t2iwCrWHVAURRM
 export BINANCE_DEMO_API_SECRET=QlzqpNvF5JtnBegg7Y5jsXAkqxuNOTMg3RAzjKMUEhdIyfwY8W7QhRdPqDU0sPhW
-export BINANCE_TRADE_SIZE=0.01
+export BINANCE_TRADE_SIZE=0.1
 PYTHONPATH=. python user/run_binance_paper_live.py
 ```
 
@@ -169,6 +201,6 @@ export BINANCE_TRADER_ID=TESTER-001
 export BINANCE_LOG_LEVEL=INFO
 export BINANCE_DEMO_API_KEY=D4l48f9wKt5FTzaVWENwwI1pvmmeu02xk49Dhg0KK9Jsk42DAsRSlZkjvIvTQCYI
 export BINANCE_DEMO_API_SECRET=MC4CAQAwBQYDK2VwBCIEIHfyJhO6VzfrbtXNPG9DpOIeSpwQgtF1vzBi0XvolUbA
-export BINANCE_TRADE_SIZE=0.01
+export BINANCE_TRADE_SIZE=0.1
 PYTHONPATH=. python user/run_binance_paper_live.py
 ```
