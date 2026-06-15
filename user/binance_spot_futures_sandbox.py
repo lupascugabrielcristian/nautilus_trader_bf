@@ -16,6 +16,7 @@
 
 import asyncio
 import json
+import os
 from decimal import Decimal
 
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
@@ -35,14 +36,11 @@ from nautilus_trader.core.data import Data
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.data import Bar, BarSpecification, BarType
 from nautilus_trader.model.enums import AggregationSource
-from nautilus_trader.model.data import DataType
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.data import TradeTick
-from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import TraderId
 from nautilus_trader.model.identifiers import Venue
-from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.trading import Strategy
 from nautilus_trader.trading.config import StrategyConfig
 
@@ -118,9 +116,12 @@ async def main():
             flush_on_start=False,
         ),
         data_clients={
+            # If I pass the keys here, is throwing the error that free acount is not allowed to do this request
             "BINANCE_FUTURES": BinanceDataClientConfig(
                 venue=Venue("BINANCE_FUTURES"),
                 account_type=BinanceAccountType.USDT_FUTURES,
+                # api_key=os.getenv("BINANCE_DEMO_API_KEY"),
+                # api_secret=os.getenv("BINANCE_DEMO_API_SECRET"),
                 base_url_http=None,  # Override with custom endpoint
                 base_url_ws=None,  # Override with custom endpoint
                 environment=BinanceEnvironment.LIVE,
@@ -130,6 +131,8 @@ async def main():
             "BINANCE_SPOT": BinanceDataClientConfig(
                 venue=Venue("BINANCE_SPOT"),
                 account_type=BinanceAccountType.SPOT,
+                # api_key=os.getenv("BINANCE_DEMO_API_KEY"),
+                # api_secret=os.getenv("BINANCE_DEMO_API_SECRET"),
                 base_url_http=None,  # Override with custom endpoint
                 base_url_ws=None,  # Override with custom endpoint
                 environment=BinanceEnvironment.LIVE,
