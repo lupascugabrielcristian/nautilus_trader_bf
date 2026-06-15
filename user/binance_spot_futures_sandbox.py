@@ -52,57 +52,31 @@ from nautilus_trader.trading.config import StrategyConfig
 
 
 class TestStrategyConfig(StrategyConfig, frozen=True):
-    bar_type: BarType
-    futures_client_id: ClientId
-    futures_instrument_id: InstrumentId
+    spot_bar_type: BarType
     spot_instrument_id: InstrumentId
-    bar_instrument_id: InstrumentId
 
 
 class TestStrategy(Strategy):
     def __init__(self, config: TestStrategyConfig) -> None:
         super().__init__(config)
 
-        self.futures_instrument: Instrument | None = None  # Initialized in on_start
-        self.spot_instrument: Instrument | None = None  # Initialized in on_start
-        self.futures_client_id = config.futures_client_id
-
     def on_start(self) -> None:
-        self.futures_instrument = self.cache.instrument(self.config.futures_instrument_id)
-        if self.futures_instrument is None:
-            self.log.error(
-                f"Could not find instrument for {self.config.futures_instrument_id}"
-                f"\nPossible instruments: {self.cache.instrument_ids()}",
-            )
-            self.stop()
-            return
         self.spot_instrument = self.cache.instrument(self.config.spot_instrument_id)
         if self.spot_instrument is None:
             self.log.error(
                 f"Could not find futures instrument for {self.config.spot_instrument_id}"
                 f"\nPossible instruments: {self.cache.instrument_ids()}",
+                LogColor.RED
             )
             self.stop()
             return
 
-        account = self.portfolio.account(venue=self.futures_instrument.venue)
-        balances = {str(currency): str(balance) for currency, balance in account.balances().items()}
-        self.log.info(f"Futures balances\n{json.dumps(balances, indent=4)}", LogColor.GREEN)
         account = self.portfolio.account(venue=self.spot_instrument.venue)
         balances = {str(currency): str(balance) for currency, balance in account.balances().items()}
         self.log.info(f"Spot balances\n{json.dumps(balances, indent=4)}", LogColor.GREEN)
 
         # Subscribe to live data
-        self.subscribe_bars(self.config.bar_type)
-        # self.subscribe_quote_ticks(self.config.futures_instrument_id)
-        # self.subscribe_quote_ticks(self.config.spot_instrument_id)
-        # self.subscribe_data(
-        #     data_type=DataType(
-        #         BinanceFuturesMarkPriceUpdate,
-        #         metadata={"instrument_id": self.futures_instrument.id},
-        #     ),
-        #     client_id=self.futures_client_id,
-        # )
+        self.subscribe_bars(self.config.spot_bar_type)
 
     def on_data(self, data: Data) -> None:
         self.log.info(repr(data), LogColor.CYAN)
@@ -119,9 +93,7 @@ class TestStrategy(Strategy):
 
     def on_stop(self) -> None:
         # Unsubscribe from data
-        self.unsubscribe_quote_ticks(self.config.futures_instrument_id)
-        self.unsubscribe_quote_ticks(self.config.spot_instrument_id)
-        self.unsubscribe_bars(self.config.bar_type)
+        self.unsubscribe_bars(self.config.spot_bar_type)
 
 
 async def main():
@@ -190,15 +162,12 @@ async def main():
 
     # Configure your strategy
     strat_config = TestStrategyConfig(
-        futures_client_id=ClientId("BINANCE_FUTURES"),
-        futures_instrument_id=InstrumentId.from_str("BTCUSDT-PERP.BINANCE_FUTURES"),
         spot_instrument_id=InstrumentId.from_str("ETHBTC.BINANCE_SPOT"),
-        bar_type=BarType(
-            instrument_id=InstrumentId.from_str("ETHUSDT-PERP.BINANCE_FUTURES"),
+        spot_bar_type=BarType(
+            instrument_id=InstrumentId.from_str("ETHBTC.BINANCE_SPOT"),
             bar_spec=BarSpecification.from_str("1-MINUTE-LAST"),
             aggregation_source=AggregationSource.EXTERNAL,
         ),
-        bar_instrument_id=InstrumentId.from_str("ETHUSDT-PERP.BINANCE_FUTURES"),
     )
     # Instantiate your strategy
     strategy = TestStrategy(config=strat_config)
@@ -207,9 +176,7 @@ async def main():
     node.trader.add_strategy(strategy)
 
     # Register your client factories with the node (can take user-defined factories)
-    node.add_data_client_factory("BINANCE_FUTURES", BinanceLiveDataClientFactory)
     node.add_data_client_factory("BINANCE_SPOT", BinanceLiveDataClientFactory)
-    node.add_exec_client_factory("BINANCE_FUTURES", SandboxLiveExecClientFactory)
     node.add_exec_client_factory("BINANCE_SPOT", SandboxLiveExecClientFactory)
     node.build()
 
