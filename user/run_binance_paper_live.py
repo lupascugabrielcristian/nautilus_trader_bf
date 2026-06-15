@@ -9,6 +9,7 @@ from nautilus_trader.adapters.binance import BinanceInstrumentProviderConfig
 from nautilus_trader.adapters.binance import BinanceLiveDataClientFactory
 from nautilus_trader.adapters.binance import BinanceLiveExecClientFactory
 from nautilus_trader.adapters.binance.common.enums import BinanceEnvironment
+from nautilus_trader.common.enums import LogColor
 from nautilus_trader.config import LiveExecEngineConfig
 from nautilus_trader.config import LoggingConfig
 from nautilus_trader.config import TradingNodeConfig
@@ -16,6 +17,7 @@ from nautilus_trader.examples.strategies.bb_mean_reversion import BBMeanReversio
 from nautilus_trader.examples.strategies.bb_mean_reversion import BBMeanReversionConfig
 from nautilus_trader.live.config import LiveRiskEngineConfig
 from nautilus_trader.live.node import TradingNode
+from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import BarType
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import TraderId
@@ -43,6 +45,12 @@ def _validate_credentials(environment: BinanceEnvironment, account_type: Binance
         missing_list = ", ".join(missing)
         raise ValueError(f"Missing required environment variables: {missing_list}")
     print("Credential environment variables found.")
+
+
+class LoggedBBMeanReversion(BBMeanReversion):
+    def on_bar(self, bar: Bar) -> None:
+        self.log.info(f"LIVE BAR RECEIVED {bar}", color=LogColor.MAGENTA)
+        super().on_bar(bar)
 
 
 def main() -> None:
@@ -117,7 +125,7 @@ def main() -> None:
     node = TradingNode(config=config_node)
     bar_type = BarType.from_str(f"{instrument_id}-1-MINUTE-LAST-EXTERNAL")
 
-    strategy = BBMeanReversion(
+    strategy = LoggedBBMeanReversion(
         config=BBMeanReversionConfig(
             instrument_id=instrument_id,
             bar_type=bar_type,
