@@ -1,0 +1,49 @@
+import numpy as np
+from decimal import Decimal
+from nautilus_trader.config import StrategyConfig
+from nautilus_trader.trading.strategy import Strategy
+from nautilus_trader.model.data import Bar
+from nautilus_trader.model.enums import OrderSide, TimeInForce
+
+class LiveRandomConfig(StrategyConfig):
+    instrument_id: str
+    trade_size: Decimal
+    # Instead of a fixed bar count, pass the execution probability per bar
+    signal_probability: float  # e.g., 0.108 for ~10.8% chance per bar
+    seed: int = 42
+
+class LiveRandomStrategy(Strategy):
+    def __init__(self, config: LiveRandomConfig) -> None:
+        super().__init__(config)
+        # Initialize the random number generator for the live stream
+        self.rng = np.random.default_rng(self.config.seed)
+        self.in_position = False
+
+    def on_start(self) -> None:
+        instrument = self.cache.instrument(self.config.instrument_id)
+        self.subscribe_bars(instrument.id)
+        self.log.info(f"Live random strategy started with per-bar probability: {self.config.signal_probability}")
+
+    def on_bar(self, bar: Bar) -> None:
+        """Processes each live bar as it arrives in real time."""
+        
+        # Roll the dice: generate a uniform random number between 0.0 and 1.0
+        if self.rng.random() < self.config.signal_probability:
+            
+            # Alternating entry/exit logic
+            if not self.in_position:
+                self.execute_order(OrderSide.BUY)
+                self.in_position = True
+            else:
+                self.execute_order(OrderSide.SELL)
+                self.in_position = False
+
+    def execute_order(self, side: OrderSide) -> None:
+        order = self.order_factory.market_order(
+            instrument_id=self.config.instrument_id,
+            order_side=side,
+            quantity=self.config.trade_size,
+            time_in_force=TimeInForce.GTC
+        )
+        self.submit_order(order)
+        self.log.info(f"Live Random Signal Triggered: {side.name}")

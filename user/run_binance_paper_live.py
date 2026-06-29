@@ -125,18 +125,20 @@ def main() -> None:
     node = TradingNode(config=config_node)
     bar_type = BarType.from_str(f"{instrument_id}-1-MINUTE-LAST-EXTERNAL")
 
-    strategy = LoggedBBMeanReversion(
-        config=BBMeanReversionConfig(
-            instrument_id=instrument_id,
-            bar_type=bar_type,
-            trade_size=Decimal(os.getenv("BINANCE_TRADE_SIZE", "0.01")),
-            bb_period=int(os.getenv("BINANCE_BB_PERIOD", "20")),
-            bb_std=float(os.getenv("BINANCE_BB_STD", "2.0")),
-            rsi_period=int(os.getenv("BINANCE_RSI_PERIOD", "14")),
-            rsi_buy_threshold=float(os.getenv("BINANCE_RSI_BUY", "0.30")),
-            rsi_sell_threshold=float(os.getenv("BINANCE_RSI_SELL", "0.70")),
-        ),
-    )
+    # strategy = LoggedBBMeanReversion(
+    #     config=BBMeanReversionConfig(
+    #         instrument_id=instrument_id,
+    #         bar_type=bar_type,
+    #         trade_size=Decimal(os.getenv("BINANCE_TRADE_SIZE", "0.01")),
+    #         bb_period=int(os.getenv("BINANCE_BB_PERIOD", "20")),
+    #         bb_std=float(os.getenv("BINANCE_BB_STD", "2.0")),
+    #         rsi_period=int(os.getenv("BINANCE_RSI_PERIOD", "14")),
+    #         rsi_buy_threshold=float(os.getenv("BINANCE_RSI_BUY", "0.30")),
+    #         rsi_sell_threshold=float(os.getenv("BINANCE_RSI_SELL", "0.70")),
+    #     ),
+    # )
+
+    strategy = LiveRandomStrategy()
 
     node.trader.add_strategy(strategy)
     node.add_data_client_factory(BINANCE, BinanceLiveDataClientFactory)
