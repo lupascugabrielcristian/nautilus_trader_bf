@@ -7,10 +7,9 @@ from nautilus_trader.adapters.binance import BINANCE
 from nautilus_trader.adapters.binance import BinanceAccountType
 from nautilus_trader.adapters.binance import BinanceDataClientConfig
 from nautilus_trader.adapters.binance import BinanceExecClientConfig
-from nautilus_trader.adapters.binance import BinanceInstrumentProviderConfig
 from nautilus_trader.adapters.binance import BinanceLiveDataClientFactory
 from nautilus_trader.adapters.binance import BinanceLiveExecClientFactory
-from nautilus_trader.adapters.binance.common.enums import BinanceEnvironment
+from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.config import LiveExecEngineConfig
 from nautilus_trader.config import LoggingConfig
 from nautilus_trader.config import TradingNodeConfig
@@ -39,21 +38,21 @@ Optional environment variables:
 
 
 
-def _required_credential_env_vars(environment: BinanceEnvironment, account_type: BinanceAccountType) -> tuple[str, str]:
-    if environment == BinanceEnvironment.DEMO:
+def _required_credential_env_vars(env_name: str, account_type: BinanceAccountType) -> tuple[str, str]:
+    if env_name == "DEMO":
         return ("BINANCE_DEMO_API_KEY", "BINANCE_DEMO_API_SECRET")
-    if environment == BinanceEnvironment.TESTNET:
+    if env_name == "TESTNET":
         if account_type in {BinanceAccountType.SPOT, BinanceAccountType.MARGIN, BinanceAccountType.ISOLATED_MARGIN}:
             return ("BINANCE_TESTNET_API_KEY", "BINANCE_TESTNET_API_SECRET")
         return ("BINANCE_FUTURES_TESTNET_API_KEY", "BINANCE_FUTURES_TESTNET_API_SECRET")
     return ("BINANCE_API_KEY", "BINANCE_API_SECRET")
 
 
-def _validate_credentials(environment: BinanceEnvironment, account_type: BinanceAccountType) -> None:
-    key_var, secret_var = _required_credential_env_vars(environment, account_type)
+def _validate_credentials(env_name: str, account_type: BinanceAccountType) -> None:
+    key_var, secret_var = _required_credential_env_vars(env_name, account_type)
     key_is_set = bool(os.getenv(key_var))
     secret_is_set = bool(os.getenv(secret_var))
-    print(f"Binance startup validation: env={environment}, account_type={account_type}")
+    print(f"Binance startup validation: env={env_name}, account_type={account_type}")
     print(f"Credential var status: {key_var}={'SET' if key_is_set else 'MISSING'}")
     print(f"Credential var status: {secret_var}={'SET' if secret_is_set else 'MISSING'}")
     missing = [name for name, is_set in ((key_var, key_is_set), (secret_var, secret_is_set)) if not is_set]
@@ -69,13 +68,11 @@ def main() -> None:
     args = parser.parse_args()
 
     env_name = os.getenv("BINANCE_ENV", "TESTNET").upper()
-    environment = {
-        "LIVE": BinanceEnvironment.LIVE,
-        "TESTNET": BinanceEnvironment.TESTNET,
-        "DEMO": BinanceEnvironment.DEMO,
-    }.get(env_name)
-    if environment is None:
+    if env_name not in ("LIVE", "TESTNET", "DEMO"):
         raise ValueError("BINANCE_ENV must be one of LIVE, TESTNET, DEMO")
+    else:
+        print(f"Got env name: {env_name}")
+    is_testnet = env_name != "LIVE"
 
     account_type_name = os.getenv("BINANCE_ACCOUNT_TYPE", "USDT_FUTURES").upper()
     account_type = {
@@ -90,7 +87,7 @@ def main() -> None:
             "BINANCE_ACCOUNT_TYPE must be one of SPOT, MARGIN, ISOLATED_MARGIN, USDT_FUTURES, COIN_FUTURES",
         )
 
-    _validate_credentials(environment, account_type)
+    _validate_credentials(env_name, account_type)
 
     trader = os.getenv("BINANCE_TRADER_ID", "TESTER-001")
     instrument_id = InstrumentId.from_str(f"{args.symbol}.{BINANCE}")
@@ -109,20 +106,18 @@ def main() -> None:
         data_clients={
             BINANCE: BinanceDataClientConfig(
                 account_type=account_type,
-                environment=environment,
-                instrument_provider=BinanceInstrumentProviderConfig(
+                testnet=is_testnet,
+                instrument_provider=InstrumentProviderConfig(
                     load_ids=frozenset([instrument_id]),
-                    query_commission_rates=True,
                 ),
             ),
         },
         exec_clients={
             BINANCE: BinanceExecClientConfig(
                 account_type=account_type,
-                environment=environment,
-                instrument_provider=BinanceInstrumentProviderConfig(
+                testnet=is_testnet,
+                instrument_provider=InstrumentProviderConfig(
                     load_ids=frozenset([instrument_id]),
-                    query_commission_rates=True,
                 ),
                 max_retries=3,
             ),
