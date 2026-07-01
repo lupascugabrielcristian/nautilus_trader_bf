@@ -2,6 +2,7 @@ import argparse
 from decimal import Decimal
 import os
 import sys
+import yaml
 
 from nautilus_trader.adapters.binance import BINANCE
 from nautilus_trader.adapters.binance import BinanceAccountType
@@ -62,7 +63,26 @@ def _validate_credentials(env_name: str, account_type: BinanceAccountType) -> No
     print("Credential environment variables found.")
 
 
+def _load_global_config() -> dict:
+    config_path = os.path.join(os.path.dirname(__file__), "..", "..", "trading_orchestrator", "global_config.yaml")
+    config_path = os.path.normpath(config_path)
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            data = yaml.safe_load(f)
+        if data and "steps" in data:
+            for step in data["steps"]:
+                if step.get("name") == "7_paper_trading":
+                    return step
+    return {}
+
+
+def _resolve_log_level(global_config: dict) -> str:
+    return os.getenv("BINANCE_LOG_LEVEL") or global_config.get("BINANCE_LOG_LEVEL", "INFO")
+
+
 def main() -> None:
+    global_config = _load_global_config()
+
     parser = argparse.ArgumentParser(description="Run LiveRandomStrategy on Binance")
     parser.add_argument("symbol", type=str, help="Instrument symbol e.g. BTCUSDT-PERP or ETHUSDT")
     args = parser.parse_args()
@@ -92,10 +112,14 @@ def main() -> None:
     trader = os.getenv("BINANCE_TRADER_ID", "TESTER-001")
     instrument_id = InstrumentId.from_str(f"{args.symbol}.{BINANCE}")
 
+    # Map DEMO env vars to Nautilus config (which only understands LIVE/TESTNET)
+    api_key = os.getenv("BINANCE_DEMO_API_KEY") if env_name == "DEMO" else None
+    api_secret = os.getenv("BINANCE_DEMO_API_SECRET") if env_name == "DEMO" else None
+
     config_node = TradingNodeConfig(
         trader_id=TraderId(trader),
         logging=LoggingConfig(
-            log_level=os.getenv("BINANCE_LOG_LEVEL", "INFO"),
+            log_level=_resolve_log_level(global_config),
             use_pyo3=True,
         ),
         exec_engine=LiveExecEngineConfig(
@@ -107,6 +131,8 @@ def main() -> None:
             BINANCE: BinanceDataClientConfig(
                 account_type=account_type,
                 testnet=is_testnet,
+                api_key=api_key,
+                api_secret=api_secret,
                 instrument_provider=InstrumentProviderConfig(
                     load_ids=frozenset([instrument_id]),
                 ),
@@ -116,6 +142,8 @@ def main() -> None:
             BINANCE: BinanceExecClientConfig(
                 account_type=account_type,
                 testnet=is_testnet,
+                api_key=api_key,
+                api_secret=api_secret,
                 instrument_provider=InstrumentProviderConfig(
                     load_ids=frozenset([instrument_id]),
                 ),
