@@ -10,6 +10,7 @@ from nautilus_trader.adapters.binance import BinanceDataClientConfig
 from nautilus_trader.adapters.binance import BinanceExecClientConfig
 from nautilus_trader.adapters.binance import BinanceLiveDataClientFactory
 from nautilus_trader.adapters.binance import BinanceLiveExecClientFactory
+from nautilus_trader.adapters.binance.common.enums import BinanceEnvironment
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.config import LiveExecEngineConfig
 from nautilus_trader.config import LoggingConfig
@@ -40,6 +41,7 @@ Optional environment variables:
 
 
 def _required_credential_env_vars(env_name: str, account_type: BinanceAccountType) -> tuple[str, str]:
+
     if env_name == "DEMO":
         return ("BINANCE_DEMO_API_KEY", "BINANCE_DEMO_API_SECRET")
     if env_name == "TESTNET":
@@ -81,7 +83,15 @@ def _resolve_log_level(global_config: dict) -> str:
 
 
 def main() -> None:
+    print("[PAPER_TRADING] Getting configs and symbol")
     global_config = _load_global_config()
+
+
+    # TODO remove after connection is checked
+    print("[PAPER_TRADING] Checking keys")
+    e = os.getenv("BINANCE_ENV", "TESTNET").upper()
+    print(f"Got env name: {e}")
+
 
     parser = argparse.ArgumentParser(description="Run LiveRandomStrategy on Binance")
     parser.add_argument("symbol", type=str, help="Instrument symbol e.g. BTCUSDT-PERP or ETHUSDT")
@@ -90,9 +100,11 @@ def main() -> None:
     env_name = os.getenv("BINANCE_ENV", "TESTNET").upper()
     if env_name not in ("LIVE", "TESTNET", "DEMO"):
         raise ValueError("BINANCE_ENV must be one of LIVE, TESTNET, DEMO")
-    else:
-        print(f"Got env name: {env_name}")
-    is_testnet = env_name != "LIVE"
+    environment = {
+        "LIVE": BinanceEnvironment.LIVE,
+        "TESTNET": BinanceEnvironment.TESTNET,
+        "DEMO": BinanceEnvironment.DEMO,
+    }[env_name]
 
     account_type_name = os.getenv("BINANCE_ACCOUNT_TYPE", "USDT_FUTURES").upper()
     account_type = {
@@ -112,9 +124,17 @@ def main() -> None:
     trader = os.getenv("BINANCE_TRADER_ID", "TESTER-001")
     instrument_id = InstrumentId.from_str(f"{args.symbol}.{BINANCE}")
 
-    # Map DEMO env vars to Nautilus config (which only understands LIVE/TESTNET)
-    api_key = os.getenv("BINANCE_DEMO_API_KEY") if env_name == "DEMO" else None
-    api_secret = os.getenv("BINANCE_DEMO_API_SECRET") if env_name == "DEMO" else None
+    key_var, secret_var = _required_credential_env_vars(env_name, account_type)
+    api_key = os.getenv(key_var)
+    api_secret = os.getenv(secret_var)
+
+    from nautilus_trader.adapters.binance.common.urls import get_http_base_url, get_ws_api_base_url
+    resolved_http = get_http_base_url(account_type, environment, False)
+    resolved_ws_api = get_ws_api_base_url(account_type, environment, False)
+    print(f"[PAPER_TRADING] env={env_name} account={account_type.value}")
+    print(f"[PAPER_TRADING] HTTP base_url={resolved_http}")
+    print(f"[PAPER_TRADING] WS API base_url={resolved_ws_api}")
+    print(f"[PAPER_TRADING] api_key={(api_key or '')[:8]}…")
 
     config_node = TradingNodeConfig(
         trader_id=TraderId(trader),
@@ -130,7 +150,7 @@ def main() -> None:
         data_clients={
             BINANCE: BinanceDataClientConfig(
                 account_type=account_type,
-                testnet=is_testnet,
+                environment=environment,
                 api_key=api_key,
                 api_secret=api_secret,
                 instrument_provider=InstrumentProviderConfig(
@@ -141,7 +161,7 @@ def main() -> None:
         exec_clients={
             BINANCE: BinanceExecClientConfig(
                 account_type=account_type,
-                testnet=is_testnet,
+                environment=environment,
                 api_key=api_key,
                 api_secret=api_secret,
                 instrument_provider=InstrumentProviderConfig(
