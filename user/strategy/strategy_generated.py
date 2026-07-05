@@ -2,14 +2,23 @@ import numpy as np
 from decimal import Decimal
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.trading.strategy import Strategy
-from nautilus_trader.model.data import Bar
+from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.model.enums import OrderSide, TimeInForce
+
+#   Examples of valid values:
+#      - 1-MINUTE-LAST-EXTERNAL (default)
+#      - 5-MINUTE-LAST-EXTERNAL
+#      - 15-MINUTE-LAST-EXTERNAL
+#      - 1-HOUR-LAST-EXTERNAL
+#      - 1-SECOND-LAST-EXTERNAL
+
 
 class LiveRandomConfig(StrategyConfig):
     instrument_id: str
     trade_size: Decimal
     # Instead of a fixed bar count, pass the execution probability per bar
     signal_probability: float  # e.g., 0.108 for ~10.8% chance per bar
+    bar_suffix: str = "5-MINUTE-LAST-EXTERNAL"  # e.g. 5-MINUTE-LAST-EXTERNAL, 1-SECOND-LAST-EXTERNAL
     seed: int = 42
 
 class LiveRandomStrategy(Strategy):
@@ -21,11 +30,14 @@ class LiveRandomStrategy(Strategy):
 
     def on_start(self) -> None:
         instrument = self.cache.instrument(self.config.instrument_id)
-        self.subscribe_bars(instrument.id)
+        bar_type = BarType.from_str(f"{instrument.id}-{self.config.bar_suffix}")
+        self.subscribe_bars(bar_type)
         self.log.info(f"Live random strategy started with per-bar probability: {self.config.signal_probability}")
 
     def on_bar(self, bar: Bar) -> None:
         """Processes each live bar as it arrives in real time."""
+
+        print("[PAPER_TRADING - STRATEGY] on_bar")
         
         # Roll the dice: generate a uniform random number between 0.0 and 1.0
         if self.rng.random() < self.config.signal_probability:

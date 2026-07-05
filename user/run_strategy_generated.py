@@ -184,6 +184,7 @@ def main() -> None:
             instrument_id=instrument_id,
             trade_size=Decimal(os.getenv("BINANCE_TRADE_SIZE", "0.01")),
             signal_probability=float(os.getenv("BINANCE_SIGNAL_PROBABILITY", "0.108")),
+            bar_suffix=os.getenv("BINANCE_BAR_SUFFIX", "5-MINUTE-LAST-EXTERNAL"),
             seed=int(os.getenv("BINANCE_SEED", "42")),
         ),
     )
