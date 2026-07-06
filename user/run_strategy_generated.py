@@ -179,12 +179,19 @@ def main() -> None:
 
     node = TradingNode(config=config_node)
 
+#   Examples of valid values:
+#      - 1-MINUTE-LAST-EXTERNAL
+#      - 5-MINUTE-LAST-EXTERNAL
+#      - 15-MINUTE-LAST-EXTERNAL
+#      - 1-HOUR-LAST-EXTERNAL
+#      - 1-SECOND-LAST-EXTERNAL
+
     strategy = LiveRandomStrategy(
         config=LiveRandomConfig(
             instrument_id=instrument_id,
-            trade_size=Decimal(os.getenv("BINANCE_TRADE_SIZE", "0.01")),
+            trade_size=Decimal(os.getenv("BINANCE_TRADE_SIZE", "0.2")),
             signal_probability=float(os.getenv("BINANCE_SIGNAL_PROBABILITY", "0.108")),
-            bar_suffix=os.getenv("BINANCE_BAR_SUFFIX", "5-MINUTE-LAST-EXTERNAL"),
+            bar_suffix="1-MINUTE-LAST-EXTERNAL",
             seed=int(os.getenv("BINANCE_SEED", "42")),
         ),
     )
