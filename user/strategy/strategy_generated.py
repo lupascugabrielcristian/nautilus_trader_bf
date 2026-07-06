@@ -18,7 +18,7 @@ class LiveRandomConfig(StrategyConfig):
     trade_size: Decimal
     # Instead of a fixed bar count, pass the execution probability per bar
     signal_probability: float  # e.g., 0.108 for ~10.8% chance per bar
-    bar_suffix: str = "5-MINUTE-LAST-EXTERNAL"  # e.g. 5-MINUTE-LAST-EXTERNAL, 1-SECOND-LAST-EXTERNAL
+    bar_suffix: str = "1-MINUTE-LAST-EXTERNAL"  # e.g. 5-MINUTE-LAST-EXTERNAL, 1-SECOND-LAST-EXTERNAL
     seed: int = 42
 
 class LiveRandomStrategy(Strategy):
@@ -38,9 +38,17 @@ class LiveRandomStrategy(Strategy):
         """Processes each live bar as it arrives in real time."""
 
         print("[PAPER_TRADING - STRATEGY] on_bar")
+        print(f"[PAPER_TRADING - STRATEGY] H{bar.high}")
+        print(f"[PAPER_TRADING - STRATEGY]    |")
+        print(f"[PAPER_TRADING - STRATEGY] O{bar.open}")
+        print(f"[PAPER_TRADING - STRATEGY] C{bar.close}")
+        print(f"[PAPER_TRADING - STRATEGY]    |")
+        print(f"[PAPER_TRADING - STRATEGY] L{bar.low}")
+        print(" ")
         
         # Roll the dice: generate a uniform random number between 0.0 and 1.0
         if self.rng.random() < self.config.signal_probability:
+            print("[PAPER_TRADING - STRATEGY] passed the random number")
             
             # Alternating entry/exit logic
             if not self.in_position:
@@ -51,11 +59,11 @@ class LiveRandomStrategy(Strategy):
                 self.in_position = False
 
     def execute_order(self, side: OrderSide) -> None:
-        order = self.order_factory.market_order(
+        instrument = self.cache.instrument(self.config.instrument_id)
+        order = self.order_factory.market(
             instrument_id=self.config.instrument_id,
             order_side=side,
-            quantity=self.config.trade_size,
-            time_in_force=TimeInForce.GTC
+            quantity=instrument.make_qty(self.config.trade_size),
         )
         self.submit_order(order)
         self.log.info(f"Live Random Signal Triggered: {side.name}")
