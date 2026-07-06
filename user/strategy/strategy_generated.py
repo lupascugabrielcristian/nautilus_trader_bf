@@ -4,6 +4,7 @@ from nautilus_trader.config import StrategyConfig
 from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.model.enums import OrderSide, TimeInForce
+from nautilus_trader.model.events import OrderCanceled, OrderFilled, OrderRejected
 
 #   Examples of valid values:
 #      - 1-MINUTE-LAST-EXTERNAL (default)
@@ -27,6 +28,7 @@ class LiveRandomStrategy(Strategy):
         # Initialize the random number generator for the live stream
         self.rng = np.random.default_rng(self.config.seed)
         self.in_position = False
+        self.order_in_flight = False
 
     def on_start(self) -> None:
         instrument = self.cache.instrument(self.config.instrument_id)
@@ -45,18 +47,20 @@ class LiveRandomStrategy(Strategy):
         print(f"[PAPER_TRADING - STRATEGY]    |")
         print(f"[PAPER_TRADING - STRATEGY] L{bar.low}")
         print(" ")
-        
+
+        if self.order_in_flight:
+            print("[PAPER_TRADING - STRATEGY] order in flight, skipping bar")
+            return
+
         # Roll the dice: generate a uniform random number between 0.0 and 1.0
         if self.rng.random() < self.config.signal_probability:
             print("[PAPER_TRADING - STRATEGY] passed the random number")
-            
-            # Alternating entry/exit logic
+
+            # Alternating entry/exit logic (state is updated on fill/reject events)
             if not self.in_position:
                 self.execute_order(OrderSide.BUY)
-                self.in_position = True
             else:
                 self.execute_order(OrderSide.SELL)
-                self.in_position = False
 
     def execute_order(self, side: OrderSide) -> None:
         instrument = self.cache.instrument(self.config.instrument_id)
@@ -66,4 +70,29 @@ class LiveRandomStrategy(Strategy):
             quantity=instrument.make_qty(self.config.trade_size),
         )
         self.submit_order(order)
+        self.order_in_flight = True
         self.log.info(f"Live Random Signal Triggered: {side.name}")
+
+    def on_order_filled(self, event: OrderFilled) -> None:
+        order = self.cache.order(event.client_order_id)
+        if order is not None and order.is_closed:
+            self.order_in_flight = False
+            self.in_position = (order.side == OrderSide.BUY)
+            self.log.info(
+                f"Order filled & closed: side={order.side.name} "
+                f"in_position={self.in_position}"
+            )
+
+    def on_order_rejected(self, event: OrderRejected) -> None:
+        self.order_in_flight = False
+        self.log.warning(
+            f"Order rejected: {event.client_order_id} reason={event.reason} "
+            f"(in_position unchanged={self.in_position})"
+        )
+
+    def on_order_canceled(self, event: OrderCanceled) -> None:
+        self.order_in_flight = False
+        self.log.warning(
+            f"Order canceled: {event.client_order_id} "
+            f"(in_position unchanged={self.in_position})"
+        )

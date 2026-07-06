@@ -82,6 +82,10 @@ def _resolve_log_level(global_config: dict) -> str:
     return os.getenv("BINANCE_LOG_LEVEL") or global_config.get("BINANCE_LOG_LEVEL", "INFO")
 
 
+def _resolve_trade_size(global_config: dict) -> Decimal:
+    return Decimal(os.getenv("BINANCE_TRADE_SIZE") or global_config.get("LOT_SIZE", "0.2"))
+
+
 def main() -> None:
     print("[PAPER_TRADING] Getting configs and symbol")
     global_config = _load_global_config()
@@ -186,10 +190,13 @@ def main() -> None:
 #      - 1-HOUR-LAST-EXTERNAL
 #      - 1-SECOND-LAST-EXTERNAL
 
+    trade_size = _resolve_trade_size(global_config)
+    print(f"[PAPER_TRADING] trade_size={trade_size} (LOT_SIZE from global_config={global_config.get('LOT_SIZE')})")
+
     strategy = LiveRandomStrategy(
         config=LiveRandomConfig(
             instrument_id=instrument_id,
-            trade_size=Decimal(os.getenv("BINANCE_TRADE_SIZE", "0.2")),
+            trade_size=trade_size,
             signal_probability=float(os.getenv("BINANCE_SIGNAL_PROBABILITY", "0.108")),
             bar_suffix="1-MINUTE-LAST-EXTERNAL",
             seed=int(os.getenv("BINANCE_SEED", "42")),
