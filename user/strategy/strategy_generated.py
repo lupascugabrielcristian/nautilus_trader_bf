@@ -57,7 +57,9 @@ class LiveRandomStrategy(Strategy):
             return
 
         # Roll the dice: generate a uniform random number between 0.0 and 1.0
-        if self.rng.random() < self.config.signal_probability:
+        rn = self._get_random_number()
+        print(f"{rn}")
+        if rn < self.config.signal_probability:
             print("[PAPER_TRADING - STRATEGY] passed the random number")
 
             # Alternating entry/exit logic (state is updated on fill/reject events)
@@ -104,6 +106,12 @@ class LiveRandomStrategy(Strategy):
             f"Order canceled: {event.client_order_id} "
             f"(in_position unchanged={self.in_position})"
         )
+
+    def _get_random_number(self) -> float:
+        base_dir = self.config.global_config.get("base_working_dir", "/app/")
+        script_path = os.path.join(base_dir, "trading_tools", "random_number.py")
+        result = subprocess.check_output(["python", script_path])
+        return float(result.strip())
 
     def _sendTelegramOrder(self, side: OrderSide, quantity: Decimal, instrument_id: str) -> None:
         msg = f"[PAPER_TRADING - STRATEGY] [ORDER] {side.name} {quantity} {instrument_id} (Market)"
