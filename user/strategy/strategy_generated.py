@@ -58,7 +58,6 @@ class LiveRandomStrategy(Strategy):
 
         # Roll the dice: generate a uniform random number between 0.0 and 1.0
         rn = self._get_random_number()
-        print(f"{rn}")
         if rn < self.config.signal_probability:
             print("[PAPER_TRADING - STRATEGY] passed the random number")
 
