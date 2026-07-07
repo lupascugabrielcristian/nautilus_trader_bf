@@ -1,3 +1,6 @@
+import os
+import subprocess
+
 import numpy as np
 from decimal import Decimal
 from nautilus_trader.config import StrategyConfig
@@ -21,6 +24,7 @@ class LiveRandomConfig(StrategyConfig):
     signal_probability: float  # e.g., 0.108 for ~10.8% chance per bar
     bar_suffix: str = "1-MINUTE-LAST-EXTERNAL"  # e.g. 5-MINUTE-LAST-EXTERNAL, 1-SECOND-LAST-EXTERNAL
     seed: int = 42
+    global_config: dict = {}
 
 class LiveRandomStrategy(Strategy):
     def __init__(self, config: LiveRandomConfig) -> None:
@@ -64,10 +68,14 @@ class LiveRandomStrategy(Strategy):
 
     def execute_order(self, side: OrderSide) -> None:
         instrument = self.cache.instrument(self.config.instrument_id)
+        quantity = instrument.make_qty(self.config.trade_size)
+
+        self._sendTelegramOrder(side, quantity, instrument.id)
+
         order = self.order_factory.market(
             instrument_id=self.config.instrument_id,
             order_side=side,
-            quantity=instrument.make_qty(self.config.trade_size),
+            quantity=quantity,
         )
         self.submit_order(order)
         self.order_in_flight = True
@@ -96,3 +104,12 @@ class LiveRandomStrategy(Strategy):
             f"Order canceled: {event.client_order_id} "
             f"(in_position unchanged={self.in_position})"
         )
+
+    def _sendTelegramOrder(self, side: OrderSide, quantity: Decimal, instrument_id: str) -> None:
+        msg = f"[PAPER_TRADING - STRATEGY] [ORDER] {side.name} {quantity} {instrument_id} (Market)"
+        self._sendTelegramNotification(msg)
+
+    def _sendTelegramNotification(self, message: str) -> None:
+        base_dir = self.config.global_config.get("base_working_dir", "/app/")
+        script_path = os.path.join(base_dir, "trading_tools", "telegram", "send_notification.py")
+        subprocess.run(["python", script_path, message])

@@ -91,12 +91,6 @@ def main() -> None:
     global_config = _load_global_config()
 
 
-    # TODO remove after connection is checked
-    print("[PAPER_TRADING] Checking keys")
-    e = os.getenv("BINANCE_ENV", "TESTNET").upper()
-    print(f"Got env name: {e}")
-
-
     parser = argparse.ArgumentParser(description="Run LiveRandomStrategy on Binance")
     parser.add_argument("symbol", type=str, help="Instrument symbol e.g. BTCUSDT-PERP or ETHUSDT")
     args = parser.parse_args()
@@ -200,6 +194,7 @@ def main() -> None:
             signal_probability=float(os.getenv("BINANCE_SIGNAL_PROBABILITY", "0.108")),
             bar_suffix="1-MINUTE-LAST-EXTERNAL",
             seed=int(os.getenv("BINANCE_SEED", "42")),
+            global_config=global_config,
         ),
     )
 
