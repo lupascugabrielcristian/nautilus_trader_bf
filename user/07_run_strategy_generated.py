@@ -106,7 +106,6 @@ def _telegram(format, *args):
 
 
 def main() -> None:
-    print("[PAPER_TRADING] Getting configs and symbol")
     global_config = _load_global_config()
 
     logging_port = global_config.get("services").get("logging").get("port")
@@ -150,10 +149,6 @@ def main() -> None:
     from nautilus_trader.adapters.binance.common.urls import get_http_base_url, get_ws_api_base_url
     resolved_http = get_http_base_url(account_type, environment, False)
     resolved_ws_api = get_ws_api_base_url(account_type, environment, False)
-    print(f"[PAPER_TRADING] env={env_name} account={account_type.value}")
-    print(f"[PAPER_TRADING] HTTP base_url={resolved_http}")
-    print(f"[PAPER_TRADING] WS API base_url={resolved_ws_api}")
-    print(f"[PAPER_TRADING] api_key={(api_key or '')[:8]}…")
 
     config_node = TradingNodeConfig(
         trader_id=TraderId(trader),
@@ -206,7 +201,6 @@ def main() -> None:
 #      - 1-SECOND-LAST-EXTERNAL
 
     trade_size = _resolve_trade_size(global_config)
-    print(f"[PAPER_TRADING] trade_size={trade_size} (LOT_SIZE from global_config={global_config.get('LOT_SIZE')})")
 
     strategy = LiveRandomStrategy(
         config=LiveRandomConfig(
