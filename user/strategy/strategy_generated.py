@@ -1,5 +1,6 @@
 import os
 import subprocess
+import urllib.request
 
 import numpy as np
 from decimal import Decimal
@@ -43,23 +44,23 @@ class LiveRandomStrategy(Strategy):
     def on_bar(self, bar: Bar) -> None:
         """Processes each live bar as it arrives in real time."""
 
-        print("[PAPER_TRADING - STRATEGY] on_bar")
-        print(f"[PAPER_TRADING - STRATEGY] H{bar.high}")
-        print(f"[PAPER_TRADING - STRATEGY]    |")
-        print(f"[PAPER_TRADING - STRATEGY] O{bar.open}")
-        print(f"[PAPER_TRADING - STRATEGY] C{bar.close}")
-        print(f"[PAPER_TRADING - STRATEGY]    |")
-        print(f"[PAPER_TRADING - STRATEGY] L{bar.low}")
-        print(" ")
+        self._log_message("[PAPER_TRADING - STRATEGY] on_bar")
+        self._log_message(f"[PAPER_TRADING - STRATEGY] H{bar.high}")
+        self._log_message(f"[PAPER_TRADING - STRATEGY]    |")
+        self._log_message(f"[PAPER_TRADING - STRATEGY] O{bar.open}")
+        self._log_message(f"[PAPER_TRADING - STRATEGY] C{bar.close}")
+        self._log_message(f"[PAPER_TRADING - STRATEGY]    |")
+        self._log_message(f"[PAPER_TRADING - STRATEGY] L{bar.low}")
+        self._log_message(" ")
 
         if self.order_in_flight:
-            print("[PAPER_TRADING - STRATEGY] order in flight, skipping bar")
+            self._log_message("[PAPER_TRADING - STRATEGY] order in flight, skipping bar")
             return
 
         # Roll the dice: generate a uniform random number between 0.0 and 1.0
         rn = self._get_random_number()
         if rn < self.config.signal_probability:
-            print("[PAPER_TRADING - STRATEGY] passed the random number")
+            self._log_message("[PAPER_TRADING - STRATEGY] passed the random number")
 
             # Alternating entry/exit logic (state is updated on fill/reject events)
             if not self.in_position:
@@ -117,6 +118,24 @@ class LiveRandomStrategy(Strategy):
         self._sendTelegramNotification(msg)
 
     def _sendTelegramNotification(self, message: str) -> None:
-        base_dir = self.config.global_config.get("base_working_dir", "/app/")
-        script_path = os.path.join(base_dir, "trading_tools", "telegram", "send_notification.py")
-        subprocess.run(["python", script_path, message])
+        TELEGRAM_PORT = int(os.environ['TELEGRAM_PORT'])
+        msg = format % message
+        url = f"http://localhost:{TELEGRAM_PORT}/service/telegram"
+        try:   
+            requests.post(url, data=msg, timeout=5)                                 
+        except requests.RequestException:
+          pass
+
+
+    def _log_message(self, format, *args):
+        logging_port = os.environ.get('LOGGING_PORT', '')
+        if not logging_port:
+            return
+        msg = format % args
+        url = f"http://localhost:{logging_port}/service/log"
+        try:
+            req = urllib.request.Request(url, data=msg.encode(), method='POST')
+            urllib.request.urlopen(req, timeout=5)
+        except Exception:
+            pass
+
