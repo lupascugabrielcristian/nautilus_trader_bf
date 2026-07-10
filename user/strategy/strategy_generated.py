@@ -72,9 +72,7 @@ class LiveRandomStrategy(Strategy):
         instrument = self.cache.instrument(self.config.instrument_id)
         quantity = instrument.make_qty(self.config.trade_size)
 
-        self._log_message("[PAPER_TRADING - STRATEGY] Sending notification")
         self._sendTelegramOrder(side, quantity, instrument.id)
-        self._log_message("[PAPER_TRADING - STRATEGY] Notification sent")
 
         order = self.order_factory.market(
             instrument_id=self.config.instrument_id,
@@ -121,12 +119,12 @@ class LiveRandomStrategy(Strategy):
 
     def _sendTelegramNotification(self, message: str) -> None:
         TELEGRAM_PORT = int(os.environ['TELEGRAM_PORT'])
-        msg = format % message
         url = f"http://localhost:{TELEGRAM_PORT}/service/telegram"
-        try:   
-            requests.post(url, data=msg, timeout=5)                                 
-        except requests.RequestException:
-          pass
+        try:
+            req = urllib.request.Request(url, data=message.encode(), method='POST')
+            urllib.request.urlopen(req, timeout=5)
+        except Exception:
+            pass
 
 
     def _log_message(self, format, *args):
