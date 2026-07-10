@@ -10,7 +10,7 @@ from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.events import OrderCanceled, OrderFilled, OrderRejected
 
-#   Examples of valid values:
+#   Examples of valid values for bar_suffix:
 #      - 1-MINUTE-LAST-EXTERNAL (default)
 #      - 5-MINUTE-LAST-EXTERNAL
 #      - 15-MINUTE-LAST-EXTERNAL
