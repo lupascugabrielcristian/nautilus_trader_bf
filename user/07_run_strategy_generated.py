@@ -86,9 +86,30 @@ def _resolve_trade_size(global_config: dict) -> Decimal:
     return Decimal(os.getenv("BINANCE_TRADE_SIZE") or global_config.get("LOT_SIZE", "0.2"))
 
 
+def _log_message(format, *args):                          
+    LOGGING_PORT = int(os.environ['LOGGING_PORT'])
+    msg = format % args
+    url = f"http://localhost:{LOGGING_PORT}/service/log"
+    try:   
+        requests.post(url, data=msg, timeout=5)                                 
+    except requests.RequestException:
+      pass
+
+def _telegram(format, *args):                          
+    LOGGING_PORT = int(os.environ['TELEGRAM_PORT'])
+    msg = format % args
+    url = f"http://localhost:{TELEGRAM_PORT}/service/telegram"
+    try:   
+        requests.post(url, data=msg, timeout=5)                                 
+    except requests.RequestException:
+      pass
+
+
 def main() -> None:
     print("[PAPER_TRADING] Getting configs and symbol")
     global_config = _load_global_config()
+
+    logging_port = global_config.get("services").get("logging").get("port")
 
 
     parser = argparse.ArgumentParser(description="Run LiveRandomStrategy on Binance")
