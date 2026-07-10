@@ -72,7 +72,9 @@ class LiveRandomStrategy(Strategy):
         instrument = self.cache.instrument(self.config.instrument_id)
         quantity = instrument.make_qty(self.config.trade_size)
 
+        self._log_message("[PAPER_TRADING - STRATEGY] Sending notification")
         self._sendTelegramOrder(side, quantity, instrument.id)
+        self._log_message("[PAPER_TRADING - STRATEGY] Notification sent")
 
         order = self.order_factory.market(
             instrument_id=self.config.instrument_id,

@@ -108,9 +108,6 @@ def _telegram(format, *args):
 def main() -> None:
     global_config = _load_global_config()
 
-    logging_port = global_config.get("services").get("logging").get("port")
-
-
     parser = argparse.ArgumentParser(description="Run LiveRandomStrategy on Binance")
     parser.add_argument("symbol", type=str, help="Instrument symbol e.g. BTCUSDT-PERP or ETHUSDT")
     args = parser.parse_args()
