@@ -86,8 +86,23 @@ def _resolve_trade_size(global_config: dict) -> Decimal:
     return Decimal(os.getenv("BINANCE_TRADE_SIZE") or global_config.get("LOT_SIZE", "0.2"))
 
 
+def _load_service_ports():
+    import json
+    try:
+        with open('/tmp/service_ports.json') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
 def _log_message(format, *args):                          
-    LOGGING_PORT = int(os.environ['LOGGING_PORT'])
+    LOGGING_PORT = os.environ.get('LOGGING_PORT', '')
+    if not LOGGING_PORT:
+        ports = _load_service_ports()
+        LOGGING_PORT = ports.get('LOGGING_PORT', '')
+    if not LOGGING_PORT:
+        return
+    LOGGING_PORT = int(LOGGING_PORT)
     msg = format % args
     url = f"http://localhost:{LOGGING_PORT}/service/log"
     try:   
@@ -96,7 +111,13 @@ def _log_message(format, *args):
       pass
 
 def _telegram(format, *args):                          
-    LOGGING_PORT = int(os.environ['TELEGRAM_PORT'])
+    TELEGRAM_PORT = os.environ.get('TELEGRAM_PORT', '')
+    if not TELEGRAM_PORT:
+        ports = _load_service_ports()
+        TELEGRAM_PORT = ports.get('TELEGRAM_PORT', '')
+    if not TELEGRAM_PORT:
+        return
+    TELEGRAM_PORT = int(TELEGRAM_PORT)
     msg = format % args
     url = f"http://localhost:{TELEGRAM_PORT}/service/telegram"
     try:   
