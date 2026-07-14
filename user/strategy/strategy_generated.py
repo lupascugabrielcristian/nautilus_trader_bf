@@ -117,8 +117,23 @@ class LiveRandomStrategy(Strategy):
         msg = f"[PAPER_TRADING - STRATEGY] [ORDER] {side.name} {quantity} {instrument_id} (Market)"
         self._sendTelegramNotification(msg)
 
+    @staticmethod
+    def _load_service_ports():
+        import json
+        try:
+            with open('/tmp/service_ports.json') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
     def _sendTelegramNotification(self, message: str) -> None:
-        TELEGRAM_PORT = int(os.environ['TELEGRAM_PORT'])
+        TELEGRAM_PORT = os.environ.get('TELEGRAM_PORT', '')
+        if not TELEGRAM_PORT:
+            ports = self._load_service_ports()
+            TELEGRAM_PORT = ports.get('TELEGRAM_PORT', '')
+        if not TELEGRAM_PORT:
+            return
+        TELEGRAM_PORT = int(TELEGRAM_PORT)
         url = f"http://localhost:{TELEGRAM_PORT}/service/telegram"
         try:
             req = urllib.request.Request(url, data=message.encode(), method='POST')
@@ -129,6 +144,9 @@ class LiveRandomStrategy(Strategy):
 
     def _log_message(self, format, *args):
         logging_port = os.environ.get('LOGGING_PORT', '')
+        if not logging_port:
+            ports = self._load_service_ports()
+            logging_port = ports.get('LOGGING_PORT', '')
         if not logging_port:
             return
         msg = format % args
