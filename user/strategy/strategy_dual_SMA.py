@@ -36,6 +36,8 @@ class DualSMAStrategy(Strategy):
             f"Dual SMA strategy started: fast={self.config.fast_period} "
             f"slow={self.config.slow_period}"
         )
+        self._log_message(f"Dual SMA strategy started: fast={self.config.fast_period} "
+            f"slow={self.config.slow_period}")
 
     def on_bar(self, bar: Bar) -> None:
         self._log_message("[PAPER_TRADING - STRATEGY] on_bar")
