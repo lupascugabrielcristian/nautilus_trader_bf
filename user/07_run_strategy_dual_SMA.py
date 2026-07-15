@@ -3,6 +3,7 @@ from decimal import Decimal
 import os
 import sys
 import yaml
+import requests
 
 from nautilus_trader.adapters.binance import BINANCE
 from nautilus_trader.adapters.binance import BinanceAccountType
@@ -209,7 +210,9 @@ def main() -> None:
         timeout_post_stop=5.0,
     )
 
+
     node = TradingNode(config=config_node)
+    _log_message("node is ready")
 
 #   Examples of valid values:
 #      - 1-MINUTE-LAST-EXTERNAL
