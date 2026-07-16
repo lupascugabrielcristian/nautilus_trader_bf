@@ -17,6 +17,7 @@ class DualSMAConfig(StrategyConfig):
     fast_period: int  # e.g., 10
     slow_period: int  # e.g., 50
     bar_suffix: str = "1-MINUTE-LAST-EXTERNAL"
+    cooldown_bars: int = 5
     global_config: dict = {}
 
 
@@ -27,6 +28,7 @@ class DualSMAStrategy(Strategy):
         self.slow_sma = SimpleMovingAverage(self.config.slow_period)
         self.in_position = False
         self.order_in_flight = False
+        self.bars_since_last_trade = 0
 
     def on_start(self) -> None:
         instrument = self.cache.instrument(self.config.instrument_id)
@@ -53,6 +55,7 @@ class DualSMAStrategy(Strategy):
             self._log_message("[PAPER_TRADING - STRATEGY] order in flight, skipping bar")
             return
 
+        self.bars_since_last_trade += 1
         self.fast_sma.handle_bar(bar)
         self.slow_sma.handle_bar(bar)
 
@@ -77,11 +80,19 @@ class DualSMAStrategy(Strategy):
         )
 
         if not self.in_position and fast_val > slow_val:
-            self._log_message("[PAPER_TRADING - STRATEGY] BUY signal: fast crossed above slow")
-            self.execute_order(OrderSide.BUY)
+            if self.bars_since_last_trade >= self.config.cooldown_bars:
+                self._log_message("[PAPER_TRADING - STRATEGY] BUY signal: fast crossed above slow")
+                self.execute_order(OrderSide.BUY)
+            else:
+                remaining = self.config.cooldown_bars - self.bars_since_last_trade
+                self._log_message(f"[PAPER_TRADING - STRATEGY] BUY signal ignored, cooldown ({remaining} bars left)")
         elif self.in_position and fast_val < slow_val:
-            self._log_message("[PAPER_TRADING - STRATEGY] SELL signal: fast crossed below slow")
-            self.execute_order(OrderSide.SELL)
+            if self.bars_since_last_trade >= self.config.cooldown_bars:
+                self._log_message("[PAPER_TRADING - STRATEGY] SELL signal: fast crossed below slow")
+                self.execute_order(OrderSide.SELL)
+            else:
+                remaining = self.config.cooldown_bars - self.bars_since_last_trade
+                self._log_message(f"[PAPER_TRADING - STRATEGY] SELL signal ignored, cooldown ({remaining} bars left)")
 
     def execute_order(self, side: OrderSide) -> None:
         instrument = self.cache.instrument(self.config.instrument_id)
@@ -103,6 +114,7 @@ class DualSMAStrategy(Strategy):
         if order is not None and order.is_closed:
             self.order_in_flight = False
             self.in_position = (order.side == OrderSide.BUY)
+            self.bars_since_last_trade = 0
             self.log.info(
                 f"Order filled & closed: side={order.side.name} "
                 f"in_position={self.in_position}"
