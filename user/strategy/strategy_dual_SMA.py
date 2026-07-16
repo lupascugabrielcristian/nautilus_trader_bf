@@ -57,7 +57,16 @@ class DualSMAStrategy(Strategy):
         self.slow_sma.handle_bar(bar)
 
         if not self.fast_sma.initialized or not self.slow_sma.initialized:
-            self._log_message("[PAPER_TRADING - STRATEGY] warming up indicators...")
+            fast_period = f"fast_need={self.config.fast_period}/{self.cache.bar_count(bar_type)} "
+            if self.fast_sma_initialized:
+                fast_period = 'fast_period OK'
+
+            slow_period = f"slow_need={self.config.slow_period}/{self.cache.bar_count(bar_type)}"
+            if self.slow_sma.initilized:
+                slow_period = 'slow_period OK'
+
+            bar_type = BarType.from_str(f"{self.config.instrument_id}-{self.config.bar_suffix}")
+            self._log_message(f"[PAPER_TRADING - STRATEGY] warming up indicators... {fast_period} {slow_period}")
             return
 
         fast_val = self.fast_sma.value
