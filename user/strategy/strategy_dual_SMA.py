@@ -19,6 +19,7 @@ class DualSMAConfig(StrategyConfig):
     bar_suffix: str = "1-MINUTE-LAST-EXTERNAL"
     cooldown_bars: int = 5
     global_config: dict = {}
+    telegram_active: bool = False
 
 
 class DualSMAStrategy(Strategy):
@@ -148,6 +149,8 @@ class DualSMAStrategy(Strategy):
             return {}
 
     def _sendTelegramNotification(self, message: str) -> None:
+        if not self.config.telegram_active:
+            return
         TELEGRAM_PORT = os.environ.get('TELEGRAM_PORT', '')
         if not TELEGRAM_PORT:
             ports = self._load_service_ports()
