@@ -1,17 +1,19 @@
 """
-Backtest the Dual SMA crossover strategy using synthetic 1-minute bar data.
+Backtest the Dual SMA crossover strategy using real market bar data.
 
 Usage:
     python user/backtesting/backtesting_dual_sma.py BTCUSDT
-    python user/backtesting/backtesting_dual_sma.py ETHUSDT --fast-period 10 --slow-period 50
-    python user/backtesting/backtesting_dual_sma.py SOLUSDT --fast-period 5 --slow-period 30 --bars 20000
+    python user/backtesting/backtesting_dual_sma.py ETHUSDT --fast-period 10 --slow-period 30
 """
 
 import sys
+import time
+import urllib.request
+import json
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -27,31 +29,74 @@ from nautilus_trader.model.data import BarType
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.identifiers import Venue
-from nautilus_trader.model.instruments import CryptoPerpetual
 from nautilus_trader.model.objects import Money
-from nautilus_trader.model.objects import Price
-from nautilus_trader.model.objects import Quantity
 from nautilus_trader.persistence.wranglers import BarDataWrangler
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 
 
-def _generate_bars(bar_type: BarType, instrument, n: int, seed: int = 42):
-    rng = np.random.default_rng(seed)
-    base_price = 50_000.0 if "BTC" in str(bar_type) else 3_000.0
-    price = base_price + np.cumsum(rng.normal(0, base_price * 0.0004, n))
-    spread = np.abs(rng.normal(0, base_price * 0.0003, n))
-    bars_df = pd.DataFrame(
-        {
-            "open": price,
-            "high": price + spread,
-            "low": price - spread,
-            "close": price + rng.normal(0, base_price * 0.00005, n),
-        },
-        index=pd.date_range("2024-01-01", periods=n, freq="1min", tz="UTC"),
-    )
-    bars_df["high"] = bars_df[["open", "high", "close"]].max(axis=1)
-    bars_df["low"] = bars_df[["open", "low", "close"]].min(axis=1)
-    return BarDataWrangler(bar_type, instrument).process(bars_df)
+DATA_DIR = Path(__file__).resolve().parent / "data"
+
+
+def _download_binance_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    """Download klines from Binance Futures API in paginated chunks."""
+    base_url = "https://fapi.binance.com/fapi/v1/klines"
+    all_rows = []
+    current_start = start_ms
+
+    while current_start < end_ms:
+        url = f"{base_url}?symbol={symbol}&interval={interval}&startTime={current_start}&endTime={end_ms}&limit=1500"
+        req = urllib.request.Request(url)
+        resp = urllib.request.urlopen(req, timeout=30)
+        data = json.loads(resp.read())
+
+        if not data:
+            break
+
+        all_rows.extend(data)
+        last_open_time = data[-1][0]
+        current_start = last_open_time + 1
+
+        if len(data) < 1500:
+            break
+
+        time.sleep(0.2)
+
+    df = pd.DataFrame(all_rows, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "trades", "taker_buy_volume",
+        "taker_buy_quote_volume", "ignore",
+    ])
+    df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype(float)
+    df = df.set_index("timestamp")
+    df = df[["open", "high", "low", "close", "volume"]]
+    df = df[~df.index.duplicated(keep="first")]
+    return df
+
+
+def _get_or_download_klines(symbol: str, days: int = 30) -> pd.DataFrame:
+    """Load cached CSV or download from Binance."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    csv_path = DATA_DIR / f"{symbol.lower()}_1m_{days}d.csv"
+
+    if csv_path.exists():
+        print(f"Loading cached data from {csv_path}")
+        df = pd.read_csv(csv_path)
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df = df.set_index("timestamp")
+        return df
+
+    print(f"Downloading {days} days of 1m klines for {symbol} from Binance Futures...")
+    end_dt = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=days)
+    start_ms = int(start_dt.timestamp() * 1000)
+    end_ms = int(end_dt.timestamp() * 1000)
+
+    df = _download_binance_klines(symbol, "1m", start_ms, end_ms)
+    df.to_csv(csv_path)
+    print(f"Downloaded {len(df)} bars, saved to {csv_path}")
+    return df
 
 
 def main() -> None:
@@ -59,21 +104,30 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Backtest Dual SMA strategy")
     parser.add_argument("symbol", type=str, help="Instrument symbol, e.g. BTCUSDT or ETHUSDT")
-    parser.add_argument("--fast-period", type=int, default=10, help="Fast SMA period (default: 10)")
-    parser.add_argument("--slow-period", type=int, default=50, help="Slow SMA period (default: 50)")
-    parser.add_argument("--bars", type=int, default=30_000, help="Number of synthetic 1-min bars (default: 30000)")
-    parser.add_argument("--trade-size", type=str, default="0.01", help="Trade size (default: 0.01)")
+    parser.add_argument("--fast-period", type=int, default=10, help="Fast EMA period (default: 10)")
+    parser.add_argument("--slow-period", type=int, default=30, help="Slow EMA period (default: 30)")
+    parser.add_argument("--trade-size", type=str, default=None, help="Trade size (default: 0.01 BTC / 0.5 ETH)")
+    parser.add_argument("--days", type=int, default=30, help="Days of historical data to download (default: 30)")
     parser.add_argument("--log-level", type=str, default="ERROR", help="Log level (default: ERROR)")
     args = parser.parse_args()
 
     symbol = args.symbol.upper()
 
-    instrument = TestInstrumentProvider.btcusdt_perp_binance() if symbol == "BTCUSDT" else TestInstrumentProvider.ethusdt_perp_binance()
-    instrument_id = instrument.id
+    if symbol == "BTCUSDT":
+        instrument = TestInstrumentProvider.btcusdt_perp_binance()
+    else:
+        instrument = TestInstrumentProvider.ethusdt_perp_binance()
 
+    instrument_id = instrument.id
     bar_type = BarType.from_str(f"{instrument_id}-1-MINUTE-LAST-EXTERNAL")
 
-    bars = _generate_bars(bar_type, instrument, args.bars)
+    bars_df = _get_or_download_klines(symbol, days=args.days)
+
+    wrangler = BarDataWrangler(bar_type, instrument)
+    bars = wrangler.process(bars_df)
+
+    default_size = "0.01" if symbol == "BTCUSDT" else "0.5"
+    trade_size = args.trade_size or default_size
 
     engine = BacktestEngine(
         config=BacktestEngineConfig(logging=LoggingConfig(log_level=args.log_level)),
@@ -95,11 +149,16 @@ def main() -> None:
     strategy = DualSMAStrategy(
         config=DualSMAConfig(
             instrument_id=instrument_id,
-            trade_size=Decimal(args.trade_size),
+            trade_size=Decimal(trade_size),
             fast_period=args.fast_period,
             slow_period=args.slow_period,
             bar_suffix="1-MINUTE-LAST-EXTERNAL",
-            telegram_active=False
+            cooldown_bars=10,
+            atr_period=14,
+            dm_period=14,
+            atr_sl_multiplier=1.5,
+            atr_tp_multiplier=3.0,
+            telegram_active=False,
         ),
     )
     engine.add_strategy(strategy)
@@ -118,13 +177,13 @@ def main() -> None:
         print("\n=== ORDER FILLS REPORT ===")
         print(order_fills_report)
 
-    out_dir = Path(__file__).resolve().parents[1]
+    project_root = Path(__file__).resolve().parents[1]
     if hasattr(account_report, "to_csv"):
-        account_report.to_csv(out_dir / "account_report_dual_sma.csv", index=False)
+        account_report.to_csv(project_root / "account_report_dual_sma.csv", index=False)
     if hasattr(positions_report, "to_csv"):
-        positions_report.to_csv(out_dir / "positions_report_dual_sma.csv", index=False)
+        positions_report.to_csv(project_root / "positions_report_dual_sma.csv", index=False)
     if hasattr(order_fills_report, "to_csv"):
-        order_fills_report.to_csv(out_dir / "order_fills_report_dual_sma.csv", index=False)
+        order_fills_report.to_csv(project_root / "order_fills_report_dual_sma.csv", index=False)
 
     engine.dispose()
 
@@ -133,9 +192,9 @@ def main() -> None:
 
         create_tearsheet(
             engine=engine,
-            output_path=str(out_dir / "backtest_results_dual_sma.html"),
+            output_path=str(project_root / "backtest_results_dual_sma.html"),
         )
-        print(f"\nTearsheet saved to {out_dir / 'backtest_results_dual_sma.html'}")
+        print(f"\nTearsheet saved to {project_root / 'backtest_results_dual_sma.html'}")
     except (ImportError, Exception) as e:
         print(f"\nTearsheet generation skipped: {e}")
 
