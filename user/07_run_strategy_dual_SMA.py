@@ -231,6 +231,7 @@ def main() -> None:
             slow_period=args.slow_period,
             bar_suffix="1-MINUTE-LAST-EXTERNAL",
             global_config=global_config,
+            telegram_active=True
         ),
     )
 

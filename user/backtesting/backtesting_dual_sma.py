@@ -99,6 +99,7 @@ def main() -> None:
             fast_period=args.fast_period,
             slow_period=args.slow_period,
             bar_suffix="1-MINUTE-LAST-EXTERNAL",
+            telegram_active=False
         ),
     )
     engine.add_strategy(strategy)
