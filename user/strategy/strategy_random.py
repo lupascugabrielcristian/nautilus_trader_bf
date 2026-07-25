@@ -113,10 +113,6 @@ class LiveRandomStrategy(Strategy):
         result = subprocess.check_output(["python", script_path])
         return float(result.strip())
 
-    def _sendTelegramOrder(self, side: OrderSide, quantity: Decimal, instrument_id: str) -> None:
-        msg = f"[PAPER_TRADING - STRATEGY] [ORDER] {side.name} {quantity} {instrument_id} (Market)"
-        self._sendTelegramNotification(msg)
-
     @staticmethod
     def _load_service_ports():
         import json
@@ -125,6 +121,10 @@ class LiveRandomStrategy(Strategy):
                 return json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             return {}
+
+    def _sendTelegramOrder(self, side: OrderSide, quantity: Decimal, instrument_id: str) -> None:
+        msg = f"[PAPER_TRADING - STRATEGY] [ORDER] {side.name} {quantity} {instrument_id} (Market)"
+        self._sendTelegramNotification(msg)
 
     def _sendTelegramNotification(self, message: str) -> None:
         TELEGRAM_PORT = os.environ.get('TELEGRAM_PORT', '')

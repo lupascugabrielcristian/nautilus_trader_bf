@@ -6,8 +6,10 @@ Usage:
     python user/backtesting/backtesting_dual_sma.py ETHUSDT --fast-period 10 --slow-period 30
 """
 
+import os
 import sys
 import time
+import urllib.error
 import urllib.request
 import json
 from datetime import datetime, timedelta, timezone
@@ -43,11 +45,22 @@ def _download_binance_klines(symbol: str, interval: str, start_ms: int, end_ms: 
     all_rows = []
     current_start = start_ms
 
+    max_retries = 5
     while current_start < end_ms:
         url = f"{base_url}?symbol={symbol}&interval={interval}&startTime={current_start}&endTime={end_ms}&limit=1500"
-        req = urllib.request.Request(url)
-        resp = urllib.request.urlopen(req, timeout=30)
-        data = json.loads(resp.read())
+        for attempt in range(max_retries):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                resp = urllib.request.urlopen(req, timeout=30)
+                data = json.loads(resp.read())
+                break
+            except urllib.error.HTTPError as e:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    print(f"HTTP {e.code} on attempt {attempt + 1}/{max_retries}, retrying in {wait}s...")
+                    time.sleep(wait)
+                else:
+                    raise
 
         if not data:
             break
@@ -81,13 +94,13 @@ def _get_or_download_klines(symbol: str, days: int = 30) -> pd.DataFrame:
     csv_path = DATA_DIR / f"{symbol.lower()}_1m_{days}d.csv"
 
     if csv_path.exists():
-        print(f"Loading cached data from {csv_path}")
+        _log_message("Loading cached data from %s", csv_path)
         df = pd.read_csv(csv_path)
         df["timestamp"] = pd.to_datetime(df["timestamp"])
         df = df.set_index("timestamp")
         return df
 
-    print(f"Downloading {days} days of 1m klines for {symbol} from Binance Futures...")
+    _log_message("Downloading %d days of 1m klines for %s from Binance Futures...", days, symbol)
     end_dt = datetime.now(timezone.utc)
     start_dt = end_dt - timedelta(days=days)
     start_ms = int(start_dt.timestamp() * 1000)
@@ -95,8 +108,33 @@ def _get_or_download_klines(symbol: str, days: int = 30) -> pd.DataFrame:
 
     df = _download_binance_klines(symbol, "1m", start_ms, end_ms)
     df.to_csv(csv_path)
-    print(f"Downloaded {len(df)} bars, saved to {csv_path}")
+    _log_message("Downloaded %d bars, saved to %s", len(df), csv_path)
     return df
+
+def _load_service_ports():    
+    import json    
+    try:    
+        with open('/tmp/service_ports.json') as f:    
+            return json.load(f)    
+    except (FileNotFoundError, json.JSONDecodeError):    
+        return {}
+
+
+
+def _log_message(format, *args):
+    logging_port = os.environ.get('LOGGING_PORT', '')
+    if not logging_port:
+        ports = _load_service_ports()
+        logging_port = ports.get('LOGGING_PORT', '')
+    if not logging_port:
+        return
+    msg = format % args
+    url = f"http://localhost:{logging_port}/service/log"
+    try:
+        req = urllib.request.Request(url, data=msg.encode(), method='POST')
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+      pass
 
 
 def main() -> None:
@@ -119,6 +157,7 @@ def main() -> None:
         instrument = TestInstrumentProvider.ethusdt_perp_binance()
 
     instrument_id = instrument.id
+    _log_message("instrument id is %s", instrument_id)
     bar_type = BarType.from_str(f"{instrument_id}-1-MINUTE-LAST-EXTERNAL")
 
     bars_df = _get_or_download_klines(symbol, days=args.days)
@@ -170,12 +209,12 @@ def main() -> None:
     order_fills_report = engine.trader.generate_order_fills_report()
 
     with pd.option_context("display.max_rows", 100, "display.max_columns", None, "display.width", 300):
-        print("\n=== ACCOUNT REPORT ===")
-        print(account_report)
-        print("\n=== POSITIONS REPORT ===")
-        print(positions_report)
-        print("\n=== ORDER FILLS REPORT ===")
-        print(order_fills_report)
+        _log_message("\n=== ACCOUNT REPORT ===")
+        _log_message("%s", account_report)
+        _log_message("\n=== POSITIONS REPORT ===")
+        _log_message("%s", positions_report)
+        _log_message("\n=== ORDER FILLS REPORT ===")
+        _log_message("%s", order_fills_report)
 
     project_root = Path(__file__).resolve().parents[1]
     if hasattr(account_report, "to_csv"):
@@ -194,9 +233,9 @@ def main() -> None:
             engine=engine,
             output_path=str(project_root / "backtest_results_dual_sma.html"),
         )
-        print(f"\nTearsheet saved to {project_root / 'backtest_results_dual_sma.html'}")
+        _log_message("\nTearsheet saved to %s", project_root / 'backtest_results_dual_sma.html')
     except (ImportError, Exception) as e:
-        print(f"\nTearsheet generation skipped: {e}")
+        _log_message("\nTearsheet generation skipped: %s", e)
 
 
 if __name__ == "__main__":
