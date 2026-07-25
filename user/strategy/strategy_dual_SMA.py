@@ -1,32 +1,42 @@
 import os
-import subprocess
 import urllib.request
 
 from decimal import Decimal
+
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.trading.strategy import Strategy
-from nautilus_trader.model.data import Bar, BarType
-from nautilus_trader.model.enums import OrderSide, TimeInForce
+from nautilus_trader.model.data import Bar
+from nautilus_trader.model.data import BarType
+from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.events import OrderCanceled, OrderFilled, OrderRejected
-from nautilus_trader.indicators import SimpleMovingAverage
+from nautilus_trader.indicators import AverageTrueRange
+from nautilus_trader.indicators import DirectionalMovement
+from nautilus_trader.indicators import ExponentialMovingAverage
 
 
 class DualSMAConfig(StrategyConfig):
     instrument_id: str
     trade_size: Decimal
-    fast_period: int  # e.g., 10
-    slow_period: int  # e.g., 50
+    fast_period: int = 10
+    slow_period: int = 50
     bar_suffix: str = "1-MINUTE-LAST-EXTERNAL"
     cooldown_bars: int = 5
-    global_config: dict = {}
+    atr_period: int = 14
+    dm_period: int = 14
+    atr_sl_multiplier: float = 1.5
+    atr_tp_multiplier: float = 3.0
     telegram_active: bool = False
+    global_config: dict = {}
 
 
 class DualSMAStrategy(Strategy):
     def __init__(self, config: DualSMAConfig) -> None:
         super().__init__(config)
-        self.fast_sma = SimpleMovingAverage(self.config.fast_period)
-        self.slow_sma = SimpleMovingAverage(self.config.slow_period)
+        self.fast_ema = ExponentialMovingAverage(self.config.fast_period)
+        self.slow_ema = ExponentialMovingAverage(self.config.slow_period)
+        self.atr = AverageTrueRange(self.config.atr_period)
+        self.dm = DirectionalMovement(self.config.dm_period)
         self.in_position = False
         self.order_in_flight = False
         self.bars_since_last_trade = 0
@@ -37,116 +47,131 @@ class DualSMAStrategy(Strategy):
         self.subscribe_bars(bar_type)
         self.log.info(
             f"Dual SMA strategy started: fast={self.config.fast_period} "
-            f"slow={self.config.slow_period}"
+            f"slow={self.config.slow_period} atr={self.config.atr_period} "
+            f"dm={self.config.dm_period}"
         )
-        self._log_message(f"Dual SMA strategy started: fast={self.config.fast_period} "
-            f"slow={self.config.slow_period}")
 
     def on_bar(self, bar: Bar) -> None:
-        self._log_message("[PAPER_TRADING - STRATEGY] on_bar")
-        self._log_message(f"[PAPER_TRADING - STRATEGY] H{bar.high}")
-        self._log_message(f"[PAPER_TRADING - STRATEGY]    |")
-        self._log_message(f"[PAPER_TRADING - STRATEGY] O{bar.open}")
-        self._log_message(f"[PAPER_TRADING - STRATEGY] C{bar.close}")
-        self._log_message(f"[PAPER_TRADING - STRATEGY]    |")
-        self._log_message(f"[PAPER_TRADING - STRATEGY] L{bar.low}")
-        self._log_message(" ")
-
         if self.order_in_flight:
-            self._log_message("[PAPER_TRADING - STRATEGY] order in flight, skipping bar")
             return
 
         self.bars_since_last_trade += 1
-        self.fast_sma.handle_bar(bar)
-        self.slow_sma.handle_bar(bar)
+        self.fast_ema.handle_bar(bar)
+        self.slow_ema.handle_bar(bar)
+        self.atr.handle_bar(bar)
+        self.dm.handle_bar(bar)
 
-        if not self.fast_sma.initialized or not self.slow_sma.initialized:
-            bar_type = BarType.from_str(f"{self.config.instrument_id}-{self.config.bar_suffix}")
-            fast_period = f"fast_need={self.config.fast_period}/{self.cache.bar_count(bar_type)} "
-            if self.fast_sma.initialized:
-                fast_period = 'fast_period OK'
-
-            slow_period = f"slow_need={self.config.slow_period}/{self.cache.bar_count(bar_type)}"
-            if self.slow_sma.initialized:
-                slow_period = 'slow_period OK'
-
-            self._log_message(f"[PAPER_TRADING - STRATEGY] warming up indicators... {fast_period} {slow_period}")
+        if not all([
+            self.fast_ema.initialized,
+            self.slow_ema.initialized,
+            self.atr.initialized,
+            self.dm.initialized,
+        ]):
             return
 
-        fast_val = self.fast_sma.value
-        slow_val = self.slow_sma.value
+        fast_val = self.fast_ema.value
+        slow_val = self.slow_ema.value
+        atr_val = self.atr.value
+        dm_pos = self.dm.pos
+        dm_neg = self.dm.neg
 
-        self._log_message(
-            f"[PAPER_TRADING - STRATEGY] fast_SMA={fast_val:.6f} slow_SMA={slow_val:.6f}"
-        )
+        is_uptrend = dm_pos > dm_neg
+        is_downtrend = dm_neg > dm_pos
 
-        if not self.in_position and fast_val > slow_val:
-            if self.bars_since_last_trade >= self.config.cooldown_bars:
-                self._log_message("[PAPER_TRADING - STRATEGY] BUY signal: fast crossed above slow")
-                self.execute_order(OrderSide.BUY)
-            else:
-                remaining = self.config.cooldown_bars - self.bars_since_last_trade
-                self._log_message(f"[PAPER_TRADING - STRATEGY] BUY signal ignored, cooldown ({remaining} bars left)")
-        elif self.in_position and fast_val < slow_val:
-            if self.bars_since_last_trade >= self.config.cooldown_bars:
-                self._log_message("[PAPER_TRADING - STRATEGY] SELL signal: fast crossed below slow")
-                self.execute_order(OrderSide.SELL)
-            else:
-                remaining = self.config.cooldown_bars - self.bars_since_last_trade
-                self._log_message(f"[PAPER_TRADING - STRATEGY] SELL signal ignored, cooldown ({remaining} bars left)")
+        current_side = self.portfolio.net_position(self.config.instrument_id)
 
-    def execute_order(self, side: OrderSide) -> None:
+        if current_side == 0:
+            if fast_val > slow_val and is_uptrend:
+                if self.bars_since_last_trade >= self.config.cooldown_bars:
+                    self.log.info(
+                        f"BUY signal: fast={fast_val:.2f} > slow={slow_val:.2f} "
+                        f"dm_pos={dm_pos:.2f} > dm_neg={dm_neg:.2f}"
+                    )
+                    self._enter_long(bar, atr_val)
+            elif fast_val < slow_val and is_downtrend:
+                if self.bars_since_last_trade >= self.config.cooldown_bars:
+                    self.log.info(
+                        f"SELL signal: fast={fast_val:.2f} < slow={slow_val:.2f} "
+                        f"dm_neg={dm_neg:.2f} > dm_pos={dm_pos:.2f}"
+                    )
+                    self._enter_short(bar, atr_val)
+        elif current_side > 0:
+            if fast_val < slow_val and is_downtrend:
+                if self.bars_since_last_trade >= self.config.cooldown_bars:
+                    self.log.info(f"CLOSE LONG + SELL SHORT: fast < slow, downtrend")
+                    self.close_all_positions(self.config.instrument_id)
+                    self.cancel_all_orders(self.config.instrument_id)
+                    self._enter_short(bar, atr_val)
+        elif current_side < 0:
+            if fast_val > slow_val and is_uptrend:
+                if self.bars_since_last_trade >= self.config.cooldown_bars:
+                    self.log.info(f"CLOSE SHORT + BUY LONG: fast > slow, uptrend")
+                    self.close_all_positions(self.config.instrument_id)
+                    self.cancel_all_orders(self.config.instrument_id)
+                    self._enter_long(bar, atr_val)
+
+    def _enter_long(self, bar: Bar, atr_val: float) -> None:
         instrument = self.cache.instrument(self.config.instrument_id)
         quantity = instrument.make_qty(self.config.trade_size)
+        close = bar.close.as_double()
+        sl_distance = self.config.atr_sl_multiplier * atr_val
+        tp_distance = self.config.atr_tp_multiplier * atr_val
 
-        self._sendTelegramOrder(side, quantity, instrument.id)
-
-        order = self.order_factory.market(
+        order_list = self.order_factory.bracket(
             instrument_id=self.config.instrument_id,
-            order_side=side,
+            order_side=OrderSide.BUY,
             quantity=quantity,
+            time_in_force=TimeInForce.GTC,
+            entry_price=instrument.make_price(close),
+            entry_trigger_price=instrument.make_price(close),
+            sl_trigger_price=instrument.make_price(close - sl_distance),
+            tp_price=instrument.make_price(close + tp_distance),
         )
-        self.submit_order(order)
+        self.submit_order_list(order_list)
         self.order_in_flight = True
-        self.log.info(f"Dual SMA Signal Triggered: {side.name}")
+        self.log.info(
+            f"LONG entry={close:.2f} SL={close - sl_distance:.2f} "
+            f"TP={close + tp_distance:.2f}"
+        )
+
+    def _enter_short(self, bar: Bar, atr_val: float) -> None:
+        instrument = self.cache.instrument(self.config.instrument_id)
+        quantity = instrument.make_qty(self.config.trade_size)
+        close = bar.close.as_double()
+        sl_distance = self.config.atr_sl_multiplier * atr_val
+        tp_distance = self.config.atr_tp_multiplier * atr_val
+
+        order_list = self.order_factory.bracket(
+            instrument_id=self.config.instrument_id,
+            order_side=OrderSide.SELL,
+            quantity=quantity,
+            time_in_force=TimeInForce.GTC,
+            entry_price=instrument.make_price(close),
+            entry_trigger_price=instrument.make_price(close),
+            sl_trigger_price=instrument.make_price(close + sl_distance),
+            tp_price=instrument.make_price(close - tp_distance),
+        )
+        self.submit_order_list(order_list)
+        self.order_in_flight = True
+        self.log.info(
+            f"SHORT entry={close:.2f} SL={close + sl_distance:.2f} "
+            f"TP={close - tp_distance:.2f}"
+        )
 
     def on_order_filled(self, event: OrderFilled) -> None:
         order = self.cache.order(event.client_order_id)
         if order is not None and order.is_closed:
             self.order_in_flight = False
-            self.in_position = (order.side == OrderSide.BUY)
             self.bars_since_last_trade = 0
-            self.log.info(
-                f"Order filled & closed: side={order.side.name} "
-                f"in_position={self.in_position}"
-            )
+            self.log.info(f"Order filled: side={order.side.name}")
 
     def on_order_rejected(self, event: OrderRejected) -> None:
         self.order_in_flight = False
-        self.log.warning(
-            f"Order rejected: {event.client_order_id} reason={event.reason} "
-            f"(in_position unchanged={self.in_position})"
-        )
+        self.log.warning(f"Order rejected: {event.client_order_id} reason={event.reason}")
 
     def on_order_canceled(self, event: OrderCanceled) -> None:
         self.order_in_flight = False
-        self.log.warning(
-            f"Order canceled: {event.client_order_id} "
-            f"(in_position unchanged={self.in_position})"
-        )
-
-    def _sendTelegramOrder(self, side: OrderSide, quantity: Decimal, instrument_id: str) -> None:
-        msg = f"[PAPER_TRADING - STRATEGY] [ORDER] {side.name} {quantity} {instrument_id} (Market)"
-        self._sendTelegramNotification(msg)
-
-    @staticmethod
-    def _load_service_ports():
-        import json
-        try:
-            with open('/tmp/service_ports.json') as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
+        self.log.warning(f"Order canceled: {event.client_order_id}")
 
     def _sendTelegramNotification(self, message: str) -> None:
         if not self.config.telegram_active:
@@ -157,13 +182,21 @@ class DualSMAStrategy(Strategy):
             TELEGRAM_PORT = ports.get('TELEGRAM_PORT', '')
         if not TELEGRAM_PORT:
             return
-        TELEGRAM_PORT = int(TELEGRAM_PORT)
-        url = f"http://localhost:{TELEGRAM_PORT}/service/telegram"
+        url = f"http://localhost:{int(TELEGRAM_PORT)}/service/telegram"
         try:
             req = urllib.request.Request(url, data=message.encode(), method='POST')
             urllib.request.urlopen(req, timeout=5)
         except Exception:
             pass
+
+    @staticmethod
+    def _load_service_ports():
+        import json
+        try:
+            with open('/tmp/service_ports.json') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
 
     def _log_message(self, format, *args):
         logging_port = os.environ.get('LOGGING_PORT', '')
@@ -172,7 +205,7 @@ class DualSMAStrategy(Strategy):
             logging_port = ports.get('LOGGING_PORT', '')
         if not logging_port:
             return
-        msg = format % args
+        msg = format % args if args else format
         url = f"http://localhost:{logging_port}/service/log"
         try:
             req = urllib.request.Request(url, data=msg.encode(), method='POST')
