@@ -1,8 +1,8 @@
 import argparse
 from decimal import Decimal
+import json
 import os
 import sys
-import yaml
 import requests
 
 from nautilus_trader.adapters.binance import BINANCE
@@ -23,6 +23,9 @@ from nautilus_trader.model.identifiers import TraderId
 
 from strategy.strategy_dual_SMA import DualSMAConfig
 from strategy.strategy_dual_SMA import DualSMAStrategy
+
+from tr_utils import global_config
+from tr_utils import log_message
 
 """
 Example usage:
@@ -64,19 +67,6 @@ def _validate_credentials(env_name: str, account_type: BinanceAccountType) -> No
     print("Credential environment variables found.")
 
 
-def _load_global_config() -> dict:
-    config_path = os.path.join(os.path.dirname(__file__), "..", "..", "trading_orchestrator", "global_config.yaml")
-    config_path = os.path.normpath(config_path)
-    if os.path.exists(config_path):
-        with open(config_path) as f:
-            data = yaml.safe_load(f)
-        if data and "steps" in data:
-            for step in data["steps"]:
-                if step.get("name") == "7_paper_trading":
-                    return step
-    return {}
-
-
 def _resolve_log_level(global_config: dict) -> str:
     return os.getenv("BINANCE_LOG_LEVEL") or global_config.get("BINANCE_LOG_LEVEL", "INFO")
 
@@ -85,48 +75,22 @@ def _resolve_trade_size(global_config: dict) -> Decimal:
     return Decimal(os.getenv("BINANCE_TRADE_SIZE") or global_config.get("LOT_SIZE", "0.2"))
 
 
-def _load_service_ports():
-    import json
-    try:
-        with open('/tmp/service_ports.json') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+def _load_step_config() -> dict:
+    raw = global_config()
+    if not raw:
         return {}
-
-
-def _log_message(format, *args):                          
-    LOGGING_PORT = os.environ.get('LOGGING_PORT', '')
-    if not LOGGING_PORT:
-        ports = _load_service_ports()
-        LOGGING_PORT = ports.get('LOGGING_PORT', '')
-    if not LOGGING_PORT:
-        return
-    LOGGING_PORT = int(LOGGING_PORT)
-    msg = format % args
-    url = f"http://localhost:{LOGGING_PORT}/service/log"
-    try:   
-        requests.post(url, data=msg, timeout=5)                                 
-    except requests.RequestException:
-      pass
-
-def _telegram(format, *args):                          
-    TELEGRAM_PORT = os.environ.get('TELEGRAM_PORT', '')
-    if not TELEGRAM_PORT:
-        ports = _load_service_ports()
-        TELEGRAM_PORT = ports.get('TELEGRAM_PORT', '')
-    if not TELEGRAM_PORT:
-        return
-    TELEGRAM_PORT = int(TELEGRAM_PORT)
-    msg = format % args
-    url = f"http://localhost:{TELEGRAM_PORT}/service/telegram"
-    try:   
-        requests.post(url, data=msg, timeout=5)                                 
-    except requests.RequestException:
-      pass
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    for step in data.get("steps", []):
+        if step.get("name") == "7_paper_trading":
+            return step
+    return {}
 
 
 def main() -> None:
-    global_config = _load_global_config()
+    global_config = _load_step_config()
 
     parser = argparse.ArgumentParser(description="Run DualSMAStrategy on Binance")
     parser.add_argument("symbol", type=str, help="Instrument symbol e.g. BTCUSDT-PERP or ETHUSDT")
@@ -212,7 +176,7 @@ def main() -> None:
 
 
     node = TradingNode(config=config_node)
-    _log_message("node is ready")
+    log_message("Trading node is ready")
 
 #   Examples of valid values:
 #      - 1-MINUTE-LAST-EXTERNAL
