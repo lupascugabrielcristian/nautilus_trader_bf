@@ -133,6 +133,10 @@ class DualSMAStrategy(Strategy):
             f"LONG entry={close:.2f} SL={close - sl_distance:.2f} "
             f"TP={close + tp_distance:.2f}"
         )
+        _sendTelegramNotification(
+            f"LONG entry={close:.2f} SL={close - sl_distance:.2f} "
+            f"TP={close + tp_distance:.2f}"
+        )
 
     def _enter_short(self, bar: Bar, atr_val: float) -> None:
         instrument = self.cache.instrument(self.config.instrument_id)
@@ -154,6 +158,10 @@ class DualSMAStrategy(Strategy):
         self.submit_order_list(order_list)
         self.order_in_flight = True
         log_message(
+            f"SHORT entry={close:.2f} SL={close + sl_distance:.2f} "
+            f"TP={close - tp_distance:.2f}"
+        )
+        _sendTelegramNotification(
             f"SHORT entry={close:.2f} SL={close + sl_distance:.2f} "
             f"TP={close - tp_distance:.2f}"
         )
