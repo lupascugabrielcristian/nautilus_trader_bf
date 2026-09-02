@@ -52,7 +52,10 @@ class DualSMAStrategy(Strategy):
         )
 
     def on_bar(self, bar: Bar) -> None:
+        log_message('on bar')
+
         if self.order_in_flight:
+            log_message('order in flight - cancelling')
             return
 
         self.bars_since_last_trade += 1
@@ -111,6 +114,7 @@ class DualSMAStrategy(Strategy):
                     self._enter_long(bar, atr_val)
 
     def _enter_long(self, bar: Bar, atr_val: float) -> None:
+        log_message('trying to enter long')
         instrument = self.cache.instrument(self.config.instrument_id)
         quantity = instrument.make_qty(self.config.trade_size)
         close = bar.close.as_double()
@@ -122,8 +126,6 @@ class DualSMAStrategy(Strategy):
             order_side=OrderSide.BUY,
             quantity=quantity,
             time_in_force=TimeInForce.GTC,
-            entry_price=instrument.make_price(close),
-            entry_trigger_price=instrument.make_price(close),
             sl_trigger_price=instrument.make_price(close - sl_distance),
             tp_price=instrument.make_price(close + tp_distance),
         )
@@ -133,12 +135,13 @@ class DualSMAStrategy(Strategy):
             f"LONG entry={close:.2f} SL={close - sl_distance:.2f} "
             f"TP={close + tp_distance:.2f}"
         )
-        _sendTelegramNotification(
+        self._sendTelegramNotification(
             f"LONG entry={close:.2f} SL={close - sl_distance:.2f} "
             f"TP={close + tp_distance:.2f}"
         )
 
     def _enter_short(self, bar: Bar, atr_val: float) -> None:
+        log_message('trying to enter short')
         instrument = self.cache.instrument(self.config.instrument_id)
         quantity = instrument.make_qty(self.config.trade_size)
         close = bar.close.as_double()
@@ -150,8 +153,6 @@ class DualSMAStrategy(Strategy):
             order_side=OrderSide.SELL,
             quantity=quantity,
             time_in_force=TimeInForce.GTC,
-            entry_price=instrument.make_price(close),
-            entry_trigger_price=instrument.make_price(close),
             sl_trigger_price=instrument.make_price(close + sl_distance),
             tp_price=instrument.make_price(close - tp_distance),
         )
@@ -161,7 +162,7 @@ class DualSMAStrategy(Strategy):
             f"SHORT entry={close:.2f} SL={close + sl_distance:.2f} "
             f"TP={close - tp_distance:.2f}"
         )
-        _sendTelegramNotification(
+        self._sendTelegramNotification(
             f"SHORT entry={close:.2f} SL={close + sl_distance:.2f} "
             f"TP={close - tp_distance:.2f}"
         )
