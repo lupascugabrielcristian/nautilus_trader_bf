@@ -17,13 +17,13 @@ use std::hash::{Hash, Hasher};
 
 use nautilus_core::{
     Params, UnixNanos,
-    correctness::{CorrectnessResult, CorrectnessResultExt, FAILED, check_equal_u8},
+    correctness::{CorrectnessResult, check_equal_u8},
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
-use super::{Instrument, any::InstrumentAny};
+use super::{Instrument, any::InstrumentAny, tick_scheme::check_tick_scheme};
 use crate::{
     enums::{AssetClass, InstrumentClass, OptionKind},
     identifiers::{InstrumentId, Symbol},
@@ -40,7 +40,7 @@ use crate::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -99,6 +99,8 @@ pub struct CryptoOption {
     pub max_price: Option<Price>,
     /// The minimum allowable quoted price.
     pub min_price: Option<Price>,
+    /// The registered variable tick scheme name.
+    pub tick_scheme: Option<Ustr>,
     /// Additional instrument metadata as a JSON-serializable dictionary.
     pub info: Option<Params>,
     /// UNIX timestamp (nanoseconds) when the data event occurred.
@@ -107,18 +109,10 @@ pub struct CryptoOption {
     pub ts_init: UnixNanos,
 }
 
+#[bon::bon]
 impl CryptoOption {
-    /// Creates a new [`CryptoOption`] instance with correctness checking.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any input validation fails.
-    ///
-    /// # Notes
-    ///
-    /// PyO3 requires a `Result` type for proper error handling and stacktrace printing in Python.
     #[expect(clippy::too_many_arguments)]
-    pub fn new_checked(
+    fn new_checked(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
         underlying: Currency,
@@ -145,6 +139,7 @@ impl CryptoOption {
         margin_maint: Option<Decimal>,
         maker_fee: Option<Decimal>,
         taker_fee: Option<Decimal>,
+        tick_scheme: Option<Ustr>,
         info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
@@ -162,7 +157,9 @@ impl CryptoOption {
             stringify!(size_increment.precision),
         )?;
         check_positive_price(price_increment, stringify!(price_increment))?;
+        check_positive_price(strike_price, stringify!(strike_price))?;
         check_positive_quantity(size_increment, stringify!(size_increment))?;
+        check_tick_scheme(tick_scheme)?;
 
         if let Some(multiplier) = multiplier {
             check_positive_quantity(multiplier, stringify!(multiplier))?;
@@ -199,20 +196,23 @@ impl CryptoOption {
             min_quantity: Some(min_quantity.unwrap_or(1.into())),
             max_price,
             min_price,
+            tick_scheme,
             info,
             ts_event,
             ts_init,
         })
     }
 
-    /// Creates a new [`CryptoOption`] instance.
+    /// Returns a fluent builder for a [`CryptoOption`] instance.
     ///
-    /// # Panics
+    /// Required fields are enforced at compile time; optional fields can be omitted and use the
+    /// same defaults as checked construction. The same correctness checks run on `build`.
     ///
-    /// Panics if any parameter is invalid (see `new_checked`).
-    #[expect(clippy::too_many_arguments)]
-    #[must_use]
-    pub fn new(
+    /// # Errors
+    ///
+    /// Returns an error if any input validation fails.
+    #[builder(start_fn = builder, finish_fn = build)]
+    pub fn build_checked(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
         underlying: Currency,
@@ -239,10 +239,11 @@ impl CryptoOption {
         margin_maint: Option<Decimal>,
         maker_fee: Option<Decimal>,
         taker_fee: Option<Decimal>,
+        tick_scheme: Option<Ustr>,
         info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
-    ) -> Self {
+    ) -> CorrectnessResult<Self> {
         Self::new_checked(
             instrument_id,
             raw_symbol,
@@ -270,11 +271,11 @@ impl CryptoOption {
             margin_maint,
             maker_fee,
             taker_fee,
+            tick_scheme,
             info,
             ts_event,
             ts_init,
         )
-        .expect_display(FAILED)
     }
 }
 
@@ -293,6 +294,9 @@ impl Hash for CryptoOption {
 }
 
 impl Instrument for CryptoOption {
+    fn tick_scheme(&self) -> Option<Ustr> {
+        self.tick_scheme
+    }
     fn into_any(self) -> InstrumentAny {
         InstrumentAny::CryptoOption(self)
     }
@@ -433,12 +437,13 @@ impl Instrument for CryptoOption {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use rust_decimal_macros::dec;
 
     use crate::{
         enums::{AssetClass, InstrumentClass, OptionKind},
         identifiers::{InstrumentId, Symbol},
         instruments::{CryptoOption, Instrument, stubs::*},
-        types::{Currency, Price, Quantity},
+        types::{Currency, Money, Price, Quantity},
     };
 
     #[rstest]
@@ -504,6 +509,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             0.into(),
             0.into(),
         );
@@ -540,6 +546,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             0.into(),
             0.into(),
         );
@@ -547,9 +554,130 @@ mod tests {
     }
 
     #[rstest]
+    #[case(Price::from("0"))]
+    #[case(Price::from("-1"))]
+    fn test_new_checked_rejects_non_positive_strike_price(#[case] strike_price: Price) {
+        let result = CryptoOption::new_checked(
+            InstrumentId::from("TEST.DERIBIT"),
+            Symbol::from("TEST"),
+            Currency::BTC(),
+            Currency::USD(),
+            Currency::BTC(),
+            false,
+            OptionKind::Call,
+            strike_price,
+            0.into(),
+            0.into(),
+            1,
+            1,
+            Price::from("0.1"),
+            Quantity::from("0.1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0.into(),
+            0.into(),
+        );
+
+        // Assert on the parameter name, not merely `is_err`: this constructor validates a
+        // dozen other fields, and a bare error check would pass if an unrelated one fired.
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("'strike_price' not positive")
+        );
+    }
+
+    #[rstest]
     fn test_serialization_roundtrip(crypto_option_btc_deribit: CryptoOption) {
         let json = serde_json::to_string(&crypto_option_btc_deribit).unwrap();
         let deserialized: CryptoOption = serde_json::from_str(&json).unwrap();
         assert_eq!(crypto_option_btc_deribit, deserialized);
+    }
+
+    #[rstest]
+    fn test_builder_matches_new_checked() {
+        let positional = CryptoOption::new_checked(
+            InstrumentId::from("BTC-13JAN23-16000-P.DERIBIT"),
+            Symbol::from("BTC-13JAN23-16000-P"),
+            Currency::BTC(),
+            Currency::USDC(),
+            Currency::USDT(),
+            false,
+            OptionKind::Put,
+            Price::from("16000.000"),
+            1.into(),
+            2.into(),
+            3,
+            1,
+            Price::from("0.001"),
+            Quantity::from("0.1"),
+            Some(Quantity::from("10")),
+            Some(Quantity::from("5")),
+            Some(Quantity::from("1000.0")),
+            Some(Quantity::from("0.1")),
+            Some(Money::new(1_000_000.0, Currency::USDC())),
+            Some(Money::new(10.0, Currency::USDC())),
+            Some(Price::from("99999.999")),
+            Some(Price::from("0.001")),
+            Some(dec!(0.01)),
+            Some(dec!(0.02)),
+            Some(dec!(0.0002)),
+            Some(dec!(0.0004)),
+            None,
+            None,
+            1.into(),
+            2.into(),
+        )
+        .unwrap();
+
+        let built = CryptoOption::builder()
+            .instrument_id(InstrumentId::from("BTC-13JAN23-16000-P.DERIBIT"))
+            .raw_symbol(Symbol::from("BTC-13JAN23-16000-P"))
+            .underlying(Currency::BTC())
+            .quote_currency(Currency::USDC())
+            .settlement_currency(Currency::USDT())
+            .is_inverse(false)
+            .option_kind(OptionKind::Put)
+            .strike_price(Price::from("16000.000"))
+            .activation_ns(1.into())
+            .expiration_ns(2.into())
+            .price_precision(3)
+            .size_precision(1)
+            .price_increment(Price::from("0.001"))
+            .size_increment(Quantity::from("0.1"))
+            .multiplier(Quantity::from("10"))
+            .lot_size(Quantity::from("5"))
+            .max_quantity(Quantity::from("1000.0"))
+            .min_quantity(Quantity::from("0.1"))
+            .max_notional(Money::new(1_000_000.0, Currency::USDC()))
+            .min_notional(Money::new(10.0, Currency::USDC()))
+            .max_price(Price::from("99999.999"))
+            .min_price(Price::from("0.001"))
+            .margin_init(dec!(0.01))
+            .margin_maint(dec!(0.02))
+            .maker_fee(dec!(0.0002))
+            .taker_fee(dec!(0.0004))
+            .ts_event(1.into())
+            .ts_init(2.into())
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&positional).unwrap(),
+            serde_json::to_value(&built).unwrap(),
+        );
     }
 }

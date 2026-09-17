@@ -26,7 +26,7 @@ use crate::indicator::{Indicator, MovingAverage};
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.indicators")
+    pyo3::pyclass(module = "nautilus_trader.indicators")
 )]
 #[cfg_attr(
     feature = "python",
@@ -60,8 +60,9 @@ impl Indicator for WilderMovingAverage {
         self.initialized
     }
 
-    fn handle_quote(&mut self, quote: &QuoteTick) {
-        self.update_raw(quote.extract_price(self.price_type).into());
+    fn handle_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
+        self.update_raw(quote.extract_price(self.price_type)?.into());
+        Ok(())
     }
 
     fn handle_trade(&mut self, t: &TradeTick) {
@@ -144,6 +145,7 @@ mod tests {
         average::rma::WilderMovingAverage,
         indicator::{Indicator, MovingAverage},
         stubs::*,
+        testing::assert_approx_equal,
     };
 
     #[rstest]
@@ -188,7 +190,7 @@ mod tests {
         assert!(rma.has_inputs());
         assert!(rma.initialized());
         assert_eq!(rma.count, 10);
-        assert_eq!(rma.value, 4.486_784_401);
+        assert_approx_equal(rma.value, 4.486_784_401);
     }
 
     #[rstest]
@@ -205,7 +207,7 @@ mod tests {
     #[rstest]
     fn test_handle_quote_tick_single(indicator_rma_10: WilderMovingAverage, stub_quote: QuoteTick) {
         let mut rma = indicator_rma_10;
-        rma.handle_quote(&stub_quote);
+        rma.handle_quote(&stub_quote).unwrap();
         assert!(rma.has_inputs());
         assert_eq!(rma.value, 1501.0);
     }
@@ -215,8 +217,8 @@ mod tests {
         let tick1 = stub_quote("1500.0", "1502.0");
         let tick2 = stub_quote("1502.0", "1504.0");
 
-        indicator_rma_10.handle_quote(&tick1);
-        indicator_rma_10.handle_quote(&tick2);
+        indicator_rma_10.handle_quote(&tick1).unwrap();
+        indicator_rma_10.handle_quote(&tick2).unwrap();
         assert_eq!(indicator_rma_10.count, 2);
         assert_eq!(indicator_rma_10.value, 1_501.2);
     }
@@ -270,8 +272,7 @@ mod tests {
 
         assert!(rma.initialized());
         assert_eq!(rma.count(), 10);
-        let expected = 4.486_784_401_f64;
-        assert!((rma.value() - expected).abs() < 1e-12);
+        assert_approx_equal(rma.value(), 4.486_784_401);
     }
 
     /// Period = 1 should act as a pure 1-tick MA (α = 1) and be initialized immediately.

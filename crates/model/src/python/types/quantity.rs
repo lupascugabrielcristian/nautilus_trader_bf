@@ -20,11 +20,17 @@ use std::{
     str::FromStr,
 };
 
-use nautilus_core::python::{get_pytype_name, to_pytype_err, to_pyvalue_err};
+use nautilus_core::python::{
+    correctness_error_to_pyvalue_err, get_pytype_name, to_pytype_err, to_pyvalue_err,
+};
 use pyo3::{basic::CompareOp, conversion::IntoPyObjectExt, prelude::*, types::PyFloat};
 use rust_decimal::{Decimal, RoundingStrategy};
 
-use crate::types::{Quantity, quantity::QuantityRaw};
+use super::fixed::{
+    ArithmeticError, ArithmeticOperation, FloatArithmetic, check_raw_scales,
+    extract_arithmetic_decimal,
+};
+use crate::types::{Quantity, fixed::raw_scale, quantity::QuantityRaw};
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
@@ -90,11 +96,19 @@ impl Quantity {
     fn __add__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
-            (self.as_f64() + other_float).into_py_any(py)
+            ArithmeticOperation::Add
+                .checked_f64(self.as_f64_checked()?, other_float)?
+                .into_py_any(py)
         } else if let Ok(other_qty) = other.extract::<Self>() {
-            (*self + other_qty).into_py_any(py)
-        } else if let Ok(other_dec) = other.extract::<Decimal>() {
-            (self.as_decimal() + other_dec).into_py_any(py)
+            check_raw_scales(self.precision, other_qty.precision)?;
+            (*self)
+                .checked_add(other_qty)
+                .ok_or(ArithmeticError::Overflow)?
+                .into_py_any(py)
+        } else if let Some(other_dec) = extract_arithmetic_decimal(other) {
+            ArithmeticOperation::Add
+                .checked_decimal(self.as_decimal(), other_dec)?
+                .into_py_any(py)
         } else {
             let pytype_name = get_pytype_name(other)?;
             Err(to_pytype_err(format!(
@@ -106,11 +120,19 @@ impl Quantity {
     fn __radd__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
-            (other_float + self.as_f64()).into_py_any(py)
+            ArithmeticOperation::Add
+                .checked_f64(other_float, self.as_f64_checked()?)?
+                .into_py_any(py)
         } else if let Ok(other_qty) = other.extract::<Self>() {
-            (other_qty + *self).into_py_any(py)
-        } else if let Ok(other_dec) = other.extract::<Decimal>() {
-            (other_dec + self.as_decimal()).into_py_any(py)
+            check_raw_scales(other_qty.precision, self.precision)?;
+            other_qty
+                .checked_add(*self)
+                .ok_or(ArithmeticError::Overflow)?
+                .into_py_any(py)
+        } else if let Some(other_dec) = extract_arithmetic_decimal(other) {
+            ArithmeticOperation::Add
+                .checked_decimal(other_dec, self.as_decimal())?
+                .into_py_any(py)
         } else {
             let pytype_name = get_pytype_name(other)?;
             Err(to_pytype_err(format!(
@@ -122,16 +144,24 @@ impl Quantity {
     fn __sub__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
-            (self.as_f64() - other_float).into_py_any(py)
+            ArithmeticOperation::Sub
+                .checked_f64(self.as_f64_checked()?, other_float)?
+                .into_py_any(py)
         } else if let Ok(other_qty) = other.extract::<Self>() {
+            check_raw_scales(self.precision, other_qty.precision)?;
             if other_qty.raw > self.raw {
                 return Err(to_pyvalue_err(format!(
                     "Quantity subtraction would result in negative value: {self} - {other_qty}"
                 )));
             }
-            (*self - other_qty).into_py_any(py)
-        } else if let Ok(other_dec) = other.extract::<Decimal>() {
-            (self.as_decimal() - other_dec).into_py_any(py)
+            (*self)
+                .checked_sub(other_qty)
+                .ok_or(ArithmeticError::Overflow)?
+                .into_py_any(py)
+        } else if let Some(other_dec) = extract_arithmetic_decimal(other) {
+            ArithmeticOperation::Sub
+                .checked_decimal(self.as_decimal(), other_dec)?
+                .into_py_any(py)
         } else {
             let pytype_name = get_pytype_name(other)?;
             Err(to_pytype_err(format!(
@@ -143,16 +173,24 @@ impl Quantity {
     fn __rsub__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
-            (other_float - self.as_f64()).into_py_any(py)
+            ArithmeticOperation::Sub
+                .checked_f64(other_float, self.as_f64_checked()?)?
+                .into_py_any(py)
         } else if let Ok(other_qty) = other.extract::<Self>() {
+            check_raw_scales(other_qty.precision, self.precision)?;
             if self.raw > other_qty.raw {
                 return Err(to_pyvalue_err(format!(
                     "Quantity subtraction would result in negative value: {other_qty} - {self}"
                 )));
             }
-            (other_qty - *self).into_py_any(py)
-        } else if let Ok(other_dec) = other.extract::<Decimal>() {
-            (other_dec - self.as_decimal()).into_py_any(py)
+            other_qty
+                .checked_sub(*self)
+                .ok_or(ArithmeticError::Overflow)?
+                .into_py_any(py)
+        } else if let Some(other_dec) = extract_arithmetic_decimal(other) {
+            ArithmeticOperation::Sub
+                .checked_decimal(other_dec, self.as_decimal())?
+                .into_py_any(py)
         } else {
             let pytype_name = get_pytype_name(other)?;
             Err(to_pytype_err(format!(
@@ -164,11 +202,17 @@ impl Quantity {
     fn __mul__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
-            (self.as_f64() * other_float).into_py_any(py)
+            ArithmeticOperation::Mul
+                .checked_f64(self.as_f64_checked()?, other_float)?
+                .into_py_any(py)
         } else if let Ok(other_qty) = other.extract::<Self>() {
-            (self.as_decimal() * other_qty.as_decimal()).into_py_any(py)
-        } else if let Ok(other_dec) = other.extract::<Decimal>() {
-            (self.as_decimal() * other_dec).into_py_any(py)
+            ArithmeticOperation::Mul
+                .checked_decimal(self.as_decimal(), other_qty.as_decimal())?
+                .into_py_any(py)
+        } else if let Some(other_dec) = extract_arithmetic_decimal(other) {
+            ArithmeticOperation::Mul
+                .checked_decimal(self.as_decimal(), other_dec)?
+                .into_py_any(py)
         } else {
             let pytype_name = get_pytype_name(other)?;
             Err(to_pytype_err(format!(
@@ -180,11 +224,17 @@ impl Quantity {
     fn __rmul__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
-            (other_float * self.as_f64()).into_py_any(py)
+            ArithmeticOperation::Mul
+                .checked_f64(other_float, self.as_f64_checked()?)?
+                .into_py_any(py)
         } else if let Ok(other_qty) = other.extract::<Self>() {
-            (other_qty.as_decimal() * self.as_decimal()).into_py_any(py)
-        } else if let Ok(other_dec) = other.extract::<Decimal>() {
-            (other_dec * self.as_decimal()).into_py_any(py)
+            ArithmeticOperation::Mul
+                .checked_decimal(other_qty.as_decimal(), self.as_decimal())?
+                .into_py_any(py)
+        } else if let Some(other_dec) = extract_arithmetic_decimal(other) {
+            ArithmeticOperation::Mul
+                .checked_decimal(other_dec, self.as_decimal())?
+                .into_py_any(py)
         } else {
             let pytype_name = get_pytype_name(other)?;
             Err(to_pytype_err(format!(
@@ -196,11 +246,17 @@ impl Quantity {
     fn __truediv__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
-            (self.as_f64() / other_float).into_py_any(py)
+            ArithmeticOperation::Div
+                .checked_f64(self.as_f64_checked()?, other_float)?
+                .into_py_any(py)
         } else if let Ok(other_qty) = other.extract::<Self>() {
-            (self.as_decimal() / other_qty.as_decimal()).into_py_any(py)
-        } else if let Ok(other_dec) = other.extract::<Decimal>() {
-            (self.as_decimal() / other_dec).into_py_any(py)
+            ArithmeticOperation::Div
+                .checked_decimal(self.as_decimal(), other_qty.as_decimal())?
+                .into_py_any(py)
+        } else if let Some(other_dec) = extract_arithmetic_decimal(other) {
+            ArithmeticOperation::Div
+                .checked_decimal(self.as_decimal(), other_dec)?
+                .into_py_any(py)
         } else {
             let pytype_name = get_pytype_name(other)?;
             Err(to_pytype_err(format!(
@@ -212,11 +268,17 @@ impl Quantity {
     fn __rtruediv__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
-            (other_float / self.as_f64()).into_py_any(py)
+            ArithmeticOperation::Div
+                .checked_f64(other_float, self.as_f64_checked()?)?
+                .into_py_any(py)
         } else if let Ok(other_qty) = other.extract::<Self>() {
-            (other_qty.as_decimal() / self.as_decimal()).into_py_any(py)
-        } else if let Ok(other_dec) = other.extract::<Decimal>() {
-            (other_dec / self.as_decimal()).into_py_any(py)
+            ArithmeticOperation::Div
+                .checked_decimal(other_qty.as_decimal(), self.as_decimal())?
+                .into_py_any(py)
+        } else if let Some(other_dec) = extract_arithmetic_decimal(other) {
+            ArithmeticOperation::Div
+                .checked_decimal(other_dec, self.as_decimal())?
+                .into_py_any(py)
         } else {
             let pytype_name = get_pytype_name(other)?;
             Err(to_pytype_err(format!(
@@ -228,13 +290,20 @@ impl Quantity {
     fn __floordiv__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
-            (self.as_f64() / other_float).floor().into_py_any(py)
-        } else if let Ok(other_qty) = other.extract::<Self>() {
-            (self.as_decimal() / other_qty.as_decimal())
+            ArithmeticOperation::Div
+                .checked_f64(self.as_f64_checked()?, other_float)?
                 .floor()
                 .into_py_any(py)
-        } else if let Ok(other_dec) = other.extract::<Decimal>() {
-            (self.as_decimal() / other_dec).floor().into_py_any(py)
+        } else if let Ok(other_qty) = other.extract::<Self>() {
+            ArithmeticOperation::Div
+                .checked_decimal(self.as_decimal(), other_qty.as_decimal())?
+                .floor()
+                .into_py_any(py)
+        } else if let Some(other_dec) = extract_arithmetic_decimal(other) {
+            ArithmeticOperation::Div
+                .checked_decimal(self.as_decimal(), other_dec)?
+                .floor()
+                .into_py_any(py)
         } else {
             let pytype_name = get_pytype_name(other)?;
             Err(to_pytype_err(format!(
@@ -246,13 +315,20 @@ impl Quantity {
     fn __rfloordiv__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
-            (other_float / self.as_f64()).floor().into_py_any(py)
-        } else if let Ok(other_qty) = other.extract::<Self>() {
-            (other_qty.as_decimal() / self.as_decimal())
+            ArithmeticOperation::Div
+                .checked_f64(other_float, self.as_f64_checked()?)?
                 .floor()
                 .into_py_any(py)
-        } else if let Ok(other_dec) = other.extract::<Decimal>() {
-            (other_dec / self.as_decimal()).floor().into_py_any(py)
+        } else if let Ok(other_qty) = other.extract::<Self>() {
+            ArithmeticOperation::Div
+                .checked_decimal(other_qty.as_decimal(), self.as_decimal())?
+                .floor()
+                .into_py_any(py)
+        } else if let Some(other_dec) = extract_arithmetic_decimal(other) {
+            ArithmeticOperation::Div
+                .checked_decimal(other_dec, self.as_decimal())?
+                .floor()
+                .into_py_any(py)
         } else {
             let pytype_name = get_pytype_name(other)?;
             Err(to_pytype_err(format!(
@@ -264,11 +340,17 @@ impl Quantity {
     fn __mod__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
-            (self.as_f64() % other_float).into_py_any(py)
+            ArithmeticOperation::Rem
+                .checked_f64(self.as_f64_checked()?, other_float)?
+                .into_py_any(py)
         } else if let Ok(other_qty) = other.extract::<Self>() {
-            (self.as_decimal() % other_qty.as_decimal()).into_py_any(py)
-        } else if let Ok(other_dec) = other.extract::<Decimal>() {
-            (self.as_decimal() % other_dec).into_py_any(py)
+            ArithmeticOperation::Rem
+                .checked_decimal(self.as_decimal(), other_qty.as_decimal())?
+                .into_py_any(py)
+        } else if let Some(other_dec) = extract_arithmetic_decimal(other) {
+            ArithmeticOperation::Rem
+                .checked_decimal(self.as_decimal(), other_dec)?
+                .into_py_any(py)
         } else {
             let pytype_name = get_pytype_name(other)?;
             Err(to_pytype_err(format!(
@@ -280,11 +362,17 @@ impl Quantity {
     fn __rmod__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
-            (other_float % self.as_f64()).into_py_any(py)
+            ArithmeticOperation::Rem
+                .checked_f64(other_float, self.as_f64_checked()?)?
+                .into_py_any(py)
         } else if let Ok(other_qty) = other.extract::<Self>() {
-            (other_qty.as_decimal() % self.as_decimal()).into_py_any(py)
-        } else if let Ok(other_dec) = other.extract::<Decimal>() {
-            (other_dec % self.as_decimal()).into_py_any(py)
+            ArithmeticOperation::Rem
+                .checked_decimal(other_qty.as_decimal(), self.as_decimal())?
+                .into_py_any(py)
+        } else if let Some(other_dec) = extract_arithmetic_decimal(other) {
+            ArithmeticOperation::Rem
+                .checked_decimal(other_dec, self.as_decimal())?
+                .into_py_any(py)
         } else {
             let pytype_name = get_pytype_name(other)?;
             Err(to_pytype_err(format!(
@@ -305,8 +393,10 @@ impl Quantity {
         *self
     }
 
-    fn __int__(&self) -> u64 {
-        self.as_f64() as u64
+    fn __int__(&self) -> QuantityRaw {
+        let scale = QuantityRaw::try_from(raw_scale(self.precision))
+            .expect("effective raw scale should fit in QuantityRaw");
+        self.raw / scale
     }
 
     fn __float__(&self) -> f64 {
@@ -340,8 +430,8 @@ impl Quantity {
     /// Creates a new `Quantity` instance from the given `raw` fixed-point value and `precision`.
     #[staticmethod]
     #[pyo3(name = "from_raw")]
-    fn py_from_raw(raw: QuantityRaw, precision: u8) -> Self {
-        Self::from_raw(raw, precision)
+    fn py_from_raw(raw: QuantityRaw, precision: u8) -> PyResult<Self> {
+        Self::from_raw_checked(raw, precision).map_err(correctness_error_to_pyvalue_err)
     }
 
     /// Creates a new `Quantity` instance with a value of zero with the given `precision`.
@@ -465,5 +555,62 @@ impl Quantity {
     #[pyo3(name = "checked_sub")]
     fn py_checked_sub(&self, other: Self) -> Option<Self> {
         self.checked_sub(other)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pyo3::Python;
+    use rstest::rstest;
+
+    use super::*;
+    use crate::types::{fixed::FIXED_PRECISION, quantity::QUANTITY_RAW_MAX};
+
+    #[rstest]
+    #[case("0", 0)]
+    #[case("0.000000001", 0)]
+    #[case("1.999999999", 1)]
+    #[case("50.25", 50)]
+    #[case("9007199253.999999999", 9_007_199_253)]
+    fn test_int_uses_exact_raw_value(#[case] value: &str, #[case] expected: u64) {
+        let quantity = Quantity::from_str(value).unwrap();
+
+        assert_eq!(quantity.__int__(), QuantityRaw::from(expected));
+    }
+
+    #[rstest]
+    fn test_int_preserves_domain_maximum() {
+        let expected: QuantityRaw = if cfg!(feature = "high-precision") {
+            34_028_236_692_093
+        } else {
+            18_446_744_073
+        };
+
+        assert_eq!(
+            Quantity::from_raw(QUANTITY_RAW_MAX, FIXED_PRECISION).__int__(),
+            expected
+        );
+    }
+
+    #[rstest]
+    #[cfg(feature = "defi")]
+    fn test_int_uses_defi_raw_scale() {
+        let quantity = Quantity::from_raw(1_999_999_999_999_999_999, crate::defi::WEI_PRECISION);
+
+        assert_eq!(quantity.__int__(), 1);
+    }
+
+    #[rstest]
+    fn test_py_from_raw_rejects_out_of_range_raw_value() {
+        Python::initialize();
+        Python::attach(|_| {
+            let raw = QUANTITY_RAW_MAX.saturating_add(1);
+            let error = Quantity::py_from_raw(raw, 0).unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                format!("ValueError: raw value {raw} exceeds QUANTITY_RAW_MAX={QUANTITY_RAW_MAX}")
+            );
+        });
     }
 }

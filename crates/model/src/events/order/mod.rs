@@ -13,6 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use indexmap::IndexMap;
 use nautilus_core::{UUID4, UnixNanos};
 use rust_decimal::Decimal;
 use ustr::Ustr;
@@ -36,8 +37,10 @@ pub mod cancel_rejected;
 pub mod canceled;
 pub mod canceled_batch;
 pub mod denied;
+pub mod denied_reason;
 pub mod emulated;
 pub mod expired;
+pub mod fill_voided;
 pub mod filled;
 pub mod initialized;
 pub mod modify_rejected;
@@ -51,9 +54,9 @@ pub mod submitted_batch;
 pub mod triggered;
 pub mod updated;
 
-#[cfg(any(test, feature = "stubs"))]
+#[cfg(any(test, feature = "test-support"))]
 pub mod spec;
-#[cfg(any(test, feature = "stubs"))]
+#[cfg(any(test, feature = "test-support"))]
 pub mod stubs;
 
 /// Represents a type of [`OrderEvent`].
@@ -76,6 +79,7 @@ pub enum OrderEventType {
     Updated,
     PartiallyFilled,
     Filled,
+    FillVoided,
 }
 
 pub trait OrderEvent: 'static + Send {
@@ -100,6 +104,7 @@ pub trait OrderEvent: 'static + Send {
     fn price(&self) -> Option<Price>;
     fn last_px(&self) -> Option<Price>;
     fn last_qty(&self) -> Option<Quantity>;
+    fn activation_price(&self) -> Option<Price>;
     fn trigger_price(&self) -> Option<Price>;
     fn trigger_type(&self) -> Option<TriggerType>;
     fn limit_offset(&self) -> Option<Decimal>;
@@ -114,7 +119,13 @@ pub trait OrderEvent: 'static + Send {
     fn linked_order_ids(&self) -> Option<Vec<ClientOrderId>>;
     fn parent_order_id(&self) -> Option<ClientOrderId>;
     fn exec_algorithm_id(&self) -> Option<ExecAlgorithmId>;
+    fn exec_algorithm_params(&self) -> Option<IndexMap<Ustr, Ustr>> {
+        None
+    }
     fn exec_spawn_id(&self) -> Option<ClientOrderId>;
+    fn tags(&self) -> Option<Vec<Ustr>> {
+        None
+    }
     fn venue_order_id(&self) -> Option<VenueOrderId>;
     fn account_id(&self) -> Option<AccountId>;
     fn position_id(&self) -> Option<PositionId>;

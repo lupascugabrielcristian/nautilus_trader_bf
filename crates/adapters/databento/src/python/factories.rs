@@ -17,33 +17,41 @@
 
 use std::path::PathBuf;
 
+use indexmap::IndexMap;
 use nautilus_core::{python::to_pyruntime_err, time::get_atomic_clock_realtime};
 use nautilus_model::identifiers::ClientId;
 use pyo3::prelude::*;
 
 use crate::{
-    data::DatabentoDataClient,
-    factories::{DatabentoDataClientFactory, DatabentoLiveClientConfig},
+    data::{DatabentoDataClient, DatabentoDataClientConfig},
+    factories::DatabentoDataClientFactory,
 };
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl DatabentoLiveClientConfig {
-    /// Configuration for Databento data clients used with `LiveNode`.
+impl DatabentoDataClientConfig {
+    /// Configuration for the Databento data client.
     #[new]
-    #[pyo3(signature = (api_key, publishers_filepath, use_exchange_as_venue=false, bars_timestamp_on_close=true))]
+    #[pyo3(signature = (api_key, publishers_filepath, use_exchange_as_venue=false, bars_timestamp_on_close=true, venue_dataset_map=None))]
     fn py_new(
         api_key: String,
-        publishers_filepath: std::path::PathBuf,
+        publishers_filepath: PathBuf,
         use_exchange_as_venue: bool,
         bars_timestamp_on_close: bool,
+        venue_dataset_map: Option<IndexMap<String, String>>,
     ) -> Self {
-        Self::new(
+        let mut config = Self::new(
             api_key,
             publishers_filepath,
             use_exchange_as_venue,
             bars_timestamp_on_close,
-        )
+        );
+
+        if let Some(venue_dataset_map) = venue_dataset_map {
+            config.venue_dataset_map = venue_dataset_map;
+        }
+
+        config
     }
 
     fn __repr__(&self) -> String {
@@ -66,7 +74,12 @@ impl DatabentoDataClientFactory {
     }
 
     /// Creates a new `DatabentoDataClient` instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client cannot be created or publisher configuration cannot be loaded.
     #[staticmethod]
+    #[pyo3(name = "create_live_data_client")]
     #[pyo3(signature = (client_id, api_key, publishers_filepath, use_exchange_as_venue = true, bars_timestamp_on_close = true))]
     pub fn py_create_live_data_client(
         client_id: ClientId,

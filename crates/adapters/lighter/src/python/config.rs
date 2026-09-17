@@ -15,12 +15,13 @@
 
 //! Python bindings for Lighter configuration.
 
-use nautilus_model::identifiers::{AccountId, TraderId};
+use nautilus_model::identifiers::{AccountId, Venue};
+use nautilus_network::websocket::TransportBackend;
 use pyo3::pymethods;
 
 use crate::{
-    common::enums::LighterEnvironment,
-    config::{LighterDataClientConfig, LighterExecClientConfig},
+    common::enums::{LighterDeployment, LighterEnvironment},
+    config::{LighterDataClientConfig, LighterExecutionClientConfig},
 };
 
 #[pymethods]
@@ -40,6 +41,9 @@ impl LighterDataClientConfig {
         ws_timeout_secs = None,
         update_instruments_interval_mins = None,
         rest_quota_per_min = None,
+        transport_backend = None,
+        deployment = None,
+        venue = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -54,42 +58,46 @@ impl LighterDataClientConfig {
         ws_timeout_secs: Option<u64>,
         update_instruments_interval_mins: Option<u64>,
         rest_quota_per_min: Option<u32>,
+        transport_backend: Option<TransportBackend>,
+        deployment: Option<LighterDeployment>,
+        venue: Option<Venue>,
     ) -> Self {
         let defaults = Self::default();
         Self {
-            base_url_http,
-            base_url_ws,
-            proxy_url,
             environment: environment.unwrap_or(defaults.environment),
+            deployment: deployment.unwrap_or(defaults.deployment),
+            venue,
             account_index,
             api_key_index,
             private_key,
+            base_url_http,
+            base_url_ws,
+            proxy_url,
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             ws_timeout_secs: ws_timeout_secs.unwrap_or(defaults.ws_timeout_secs),
             update_instruments_interval_mins: update_instruments_interval_mins
                 .unwrap_or(defaults.update_instruments_interval_mins),
             rest_quota_per_min,
-            transport_backend: defaults.transport_backend,
+            transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
         }
     }
 
     #[getter]
-    fn proxy_url(&self) -> Option<String> {
-        self.proxy_url.clone()
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
     }
 
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(LighterDataClientConfig).to_string()
     }
 }
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl LighterExecClientConfig {
+impl LighterExecutionClientConfig {
     /// Configuration for the Lighter live execution client.
     #[new]
     #[pyo3(signature = (
-        trader_id,
         account_id,
         account_index = None,
         api_key_index = None,
@@ -100,14 +108,15 @@ impl LighterExecClientConfig {
         environment = None,
         http_timeout_secs = None,
         ws_timeout_secs = None,
-        active_markets = None,
         market_order_slippage_bps = None,
         rest_quota_per_min = None,
         sendtx_quota_per_min = None,
+        transport_backend = None,
+        deployment = None,
+        venue = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
-        trader_id: TraderId,
         account_id: AccountId,
         account_index: Option<u64>,
         api_key_index: Option<u8>,
@@ -118,17 +127,18 @@ impl LighterExecClientConfig {
         environment: Option<LighterEnvironment>,
         http_timeout_secs: Option<u64>,
         ws_timeout_secs: Option<u64>,
-        active_markets: Option<Vec<i16>>,
         market_order_slippage_bps: Option<u32>,
         rest_quota_per_min: Option<u32>,
         sendtx_quota_per_min: Option<u32>,
+        transport_backend: Option<TransportBackend>,
+        deployment: Option<LighterDeployment>,
+        venue: Option<Venue>,
     ) -> Self {
-        let defaults = Self::builder()
-            .trader_id(trader_id)
-            .account_id(account_id)
-            .build();
+        let defaults = Self::default();
         Self {
-            trader_id,
+            environment: environment.unwrap_or(defaults.environment),
+            deployment: deployment.unwrap_or(defaults.deployment),
+            venue,
             account_id,
             account_index,
             api_key_index,
@@ -136,24 +146,22 @@ impl LighterExecClientConfig {
             base_url_http,
             base_url_ws,
             proxy_url,
-            environment: environment.unwrap_or(defaults.environment),
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             ws_timeout_secs: ws_timeout_secs.unwrap_or(defaults.ws_timeout_secs),
-            active_markets: active_markets.unwrap_or(defaults.active_markets),
             market_order_slippage_bps: market_order_slippage_bps
                 .unwrap_or(defaults.market_order_slippage_bps),
             rest_quota_per_min,
             sendtx_quota_per_min,
-            transport_backend: defaults.transport_backend,
+            transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
         }
     }
 
     #[getter]
-    fn proxy_url(&self) -> Option<String> {
-        self.proxy_url.clone()
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
     }
 
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(LighterExecutionClientConfig).to_string()
     }
 }

@@ -16,7 +16,6 @@
 use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
-    str::FromStr,
 };
 
 use nautilus_core::{
@@ -32,87 +31,12 @@ use nautilus_core::{
 };
 use pyo3::{IntoPyObjectExt, basic::CompareOp, prelude::*, types::PyDict};
 
-use super::data_to_pycapsule;
 use crate::{
-    data::{BookOrder, Data, NULL_ORDER, OrderBookDelta, order::OrderId},
-    enums::{BookAction, FromU8, OrderSide},
+    data::{BookOrder, OrderBookDelta},
+    enums::BookAction,
     identifiers::InstrumentId,
     python::common::PY_MODULE_MODEL,
-    types::{
-        price::{Price, PriceRaw},
-        quantity::{Quantity, QuantityRaw},
-    },
 };
-
-impl OrderBookDelta {
-    /// Creates a new [`OrderBookDelta`] from a Python object.
-    ///
-    /// # Panics
-    ///
-    /// Panics if converting `instrument_id` from string or `action` from u8 fails.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `PyErr` if extracting any attribute or converting types fails.
-    pub fn from_pyobject(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
-        // Fast path: avoid property getters that trigger enum type deadlocks
-        if let Ok(delta) = obj.cast::<Self>() {
-            return Ok(*delta.borrow());
-        }
-
-        let instrument_id_obj: Bound<'_, PyAny> = obj.getattr("instrument_id")?.extract()?;
-        let instrument_id_str: String = instrument_id_obj.getattr("value")?.extract()?;
-        let instrument_id = InstrumentId::from_str(instrument_id_str.as_str())
-            .map_err(to_pyvalue_err)
-            .unwrap();
-
-        let action_obj: Bound<'_, PyAny> = obj.getattr("action")?.extract()?;
-        let action_u8 = action_obj.getattr("value")?.extract()?;
-        let action = BookAction::from_u8(action_u8).unwrap();
-
-        let flags: u8 = obj.getattr("flags")?.extract()?;
-        let sequence: u64 = obj.getattr("sequence")?.extract()?;
-        let ts_event: u64 = obj.getattr("ts_event")?.extract()?;
-        let ts_init: u64 = obj.getattr("ts_init")?.extract()?;
-
-        let order_pyobject = obj.getattr("order")?;
-        let order: BookOrder = if order_pyobject.is_none() {
-            NULL_ORDER
-        } else {
-            let side_obj: Bound<'_, PyAny> = order_pyobject.getattr("side")?.extract()?;
-            let side_u8 = side_obj.getattr("value")?.extract()?;
-            let side = OrderSide::from_u8(side_u8).unwrap();
-
-            let price_py: Bound<'_, PyAny> = order_pyobject.getattr("price")?;
-            let price_raw: PriceRaw = price_py.getattr("raw")?.extract()?;
-            let price_prec: u8 = price_py.getattr("precision")?.extract()?;
-            let price = Price::from_raw(price_raw, price_prec);
-
-            let size_py: Bound<'_, PyAny> = order_pyobject.getattr("size")?;
-            let size_raw: QuantityRaw = size_py.getattr("raw")?.extract()?;
-            let size_prec: u8 = size_py.getattr("precision")?.extract()?;
-            let size = Quantity::from_raw(size_raw, size_prec);
-
-            let order_id: OrderId = order_pyobject.getattr("order_id")?.extract()?;
-            BookOrder {
-                side,
-                price,
-                size,
-                order_id,
-            }
-        };
-
-        Ok(Self::new(
-            instrument_id,
-            action,
-            order,
-            flags,
-            sequence,
-            ts_event.into(),
-            ts_init.into(),
-        ))
-    }
-}
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
@@ -138,6 +62,13 @@ impl OrderBookDelta {
             ts_init.into(),
         )
         .map_err(to_pyvalue_err)
+    }
+
+    /// Creates a new `OrderBookDelta` instance with a `Clear` action and NULL order.
+    #[staticmethod]
+    #[pyo3(name = "clear")]
+    fn py_clear(instrument_id: InstrumentId, sequence: u64, ts_event: u64, ts_init: u64) -> Self {
+        Self::clear(instrument_id, sequence, ts_event.into(), ts_init.into())
     }
 
     fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
@@ -240,26 +171,6 @@ impl OrderBookDelta {
         from_dict_pyo3(py, values)
     }
 
-    /// Creates a `PyCapsule` containing a raw pointer to a `Data::Delta` object.
-    ///
-    /// This function takes the current object (assumed to be of a type that can be represented as
-    /// `Data::Delta`), and encapsulates a raw pointer to it within a `PyCapsule`.
-    ///
-    /// # Safety
-    ///
-    /// This function is safe as long as the following conditions are met:
-    /// - The `Data::Delta` object pointed to by the capsule must remain valid for the lifetime of the capsule.
-    /// - The consumer of the capsule must ensure proper handling to avoid dereferencing a dangling pointer.
-    ///
-    /// # Panics
-    ///
-    /// The function will panic if the `PyCapsule` creation fails, which can occur if the
-    /// `Data::Delta` object cannot be converted into a raw pointer.
-    #[pyo3(name = "as_pycapsule")]
-    fn py_as_pycapsule(&self, py: Python<'_>) -> Py<PyAny> {
-        data_to_pycapsule(py, Data::Delta(*self))
-    }
-
     /// Return a dictionary representation of the object.
     #[pyo3(name = "to_dict")]
     fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
@@ -268,14 +179,18 @@ impl OrderBookDelta {
 
     /// Return JSON encoded bytes representation of the object.
     #[pyo3(name = "to_json_bytes")]
-    fn py_to_json_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        self.to_json_bytes().unwrap().into_py_any_unwrap(py)
+    fn py_to_json_bytes(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.to_json_bytes()
+            .map_err(to_pyvalue_err)?
+            .into_py_any(py)
     }
 
     /// Return `MsgPack` encoded bytes representation of the object.
     #[pyo3(name = "to_msgpack_bytes")]
-    fn py_to_msgpack_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        self.to_msgpack_bytes().unwrap().into_py_any_unwrap(py)
+    fn py_to_msgpack_bytes(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.to_msgpack_bytes()
+            .map_err(to_pyvalue_err)?
+            .into_py_any(py)
     }
 
     fn __reduce__(&self, py: Python) -> PyResult<Py<PyAny>> {
@@ -302,10 +217,15 @@ impl OrderBookDelta {
 
 #[cfg(test)]
 mod tests {
+
     use rstest::rstest;
 
     use super::*;
-    use crate::data::stubs::*;
+    use crate::{
+        data::stubs::*,
+        enums::OrderSide,
+        types::{Price, Quantity},
+    };
 
     #[rstest]
     fn test_order_book_delta_py_new_with_zero_size_returns_error() {
@@ -358,18 +278,6 @@ mod tests {
             let dict = delta.py_to_dict(py).unwrap();
             let parsed = OrderBookDelta::py_from_dict(py, dict).unwrap();
             assert_eq!(parsed, delta);
-        });
-    }
-
-    #[rstest]
-    fn test_from_pyobject(stub_delta: OrderBookDelta) {
-        let delta = stub_delta;
-
-        Python::initialize();
-        Python::attach(|py| {
-            let delta_pyobject = delta.into_py_any_unwrap(py);
-            let parsed_delta = OrderBookDelta::from_pyobject(delta_pyobject.bind(py)).unwrap();
-            assert_eq!(parsed_delta, delta);
         });
     }
 }

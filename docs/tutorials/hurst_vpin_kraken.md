@@ -146,30 +146,25 @@ use nautilus_model::{
 };
 use rust_decimal_macros::dec;
 
-let instrument = CryptoPerpetual::new(
-    InstrumentId::from("PF_XBTUSD.KRAKEN"),
-    Symbol::from("PF_XBTUSD"),
-    Currency::BTC(),      // base
-    Currency::USD(),      // quote
-    Currency::USD(),      // settlement (linear)
-    false,                // is_inverse
-    1,                    // price_precision
-    4,                    // size_precision
-    Price::from("0.5"),
-    Quantity::from("0.0001"),
-    None,                 // multiplier
-    None,                 // lot_size
-    None, None,           // max/min quantity
-    None, None,           // max/min notional
-    None, None,           // max/min price
-    Some(dec!(0.02)),     // margin_init
-    Some(dec!(0.01)),     // margin_maint
-    Some(dec!(0.0002)),   // maker_fee
-    Some(dec!(0.0005)),   // taker_fee
-    None,                 // info
-    0.into(),             // ts_event
-    0.into(),             // ts_init
-);
+let instrument = CryptoPerpetual::builder()
+    .instrument_id(InstrumentId::from("PF_XBTUSD.KRAKEN"))
+    .raw_symbol(Symbol::from("PF_XBTUSD"))
+    .base_currency(Currency::BTC())       // base
+    .quote_currency(Currency::USD())      // quote
+    .settlement_currency(Currency::USD()) // settlement (linear)
+    .is_inverse(false)
+    .price_precision(1)
+    .size_precision(4)
+    .price_increment(Price::from("0.5"))
+    .size_increment(Quantity::from("0.0001"))
+    .margin_init(dec!(0.02))
+    .margin_maint(dec!(0.01))
+    .maker_fee(dec!(0.0002))
+    .taker_fee(dec!(0.0005))
+    .ts_event(0.into())
+    .ts_init(0.into())
+    .build()
+    .unwrap();
 ```
 
 Fees and margin are explicit backtest assumptions. Check the
@@ -316,16 +311,16 @@ when aggressor side was not directly observable.
 
 ### Configuration
 
-| Parameter          | Value            | Description                                          |
-| ------------------ | ---------------- | ---------------------------------------------------- |
-| `bar_type`         | `2M-VALUE-LAST`  | Dollar bars closing every USD 2,000,000 of notional. |
-| `trade_size`       | `0.0100`         | 0.0100 XBT per trade (matches instrument precision). |
-| `hurst_window`     | `128`            | Rolling window of dollar bar log returns.            |
-| `hurst_lags`       | `[4, 8, 16, 32]` | Lag set used in the R/S regression.                  |
-| `hurst_enter`      | `0.55`           | Above this, the regime is treated as trending.       |
-| `hurst_exit`       | `0.50`           | Below this, open positions are flattened.            |
-| `vpin_window`      | `50`             | Completed volume buckets averaged for VPIN.          |
-| `vpin_threshold`   | `0.30`           | Minimum VPIN for flow to be considered informed.     |
+| Parameter          | Value            | Description                                                       |
+| ------------------ | ---------------- | ----------------------------------------------------------------- |
+| `bar_type`         | `2M-VALUE-LAST`  | Dollar bars closing every USD 2,000,000 of notional.              |
+| `trade_size`       | `0.0100`         | 0.0100 XBT per trade (matches instrument precision).              |
+| `hurst_window`     | `128`            | Rolling window of dollar bar log returns.                         |
+| `hurst_lags`       | `[4, 8, 16, 32]` | Lag set used in the R/S regression.                               |
+| `hurst_enter`      | `0.55`           | Above this, the regime is treated as trending.                    |
+| `hurst_exit`       | `0.50`           | Below this, open positions are flattened.                         |
+| `vpin_window`      | `50`             | Completed volume buckets averaged for VPIN.                       |
+| `vpin_threshold`   | `0.30`           | Minimum VPIN for flow to be considered informed.                  |
 | `max_holding_secs` | `1800`           | Seconds a position may be held (default `3600`; overridden here). |
 
 :::tip
@@ -360,7 +355,7 @@ engine.add_venue(
         .account_type(AccountType::Margin)
         .book_type(BookType::L1_MBP)
         .starting_balances(vec![Money::from("100_000 USD")])
-        .build(),
+        .build()?,
 )?;
 
 engine.add_instrument(&InstrumentAny::CryptoPerpetual(instrument))?;
@@ -382,12 +377,12 @@ use nautilus_trading::examples::strategies::{
     HurstVpinDirectional, HurstVpinDirectionalConfig,
 };
 
-let config = HurstVpinDirectionalConfig::new(
-    instrument_id,
-    bar_type,
-    Quantity::from("0.0100"),  // match instrument size_precision
-)
-.with_max_holding_secs(1800);
+let config = HurstVpinDirectionalConfig::builder()
+    .instrument_id(instrument_id)
+    .bar_type(bar_type)
+    .trade_size(Quantity::from("0.0100")) // match instrument size_precision
+    .max_holding_secs(1800)
+    .build();
 
 engine.add_strategy(HurstVpinDirectional::new(config))?;
 ```
@@ -483,7 +478,7 @@ static PNGs via Plotly's Kaleido exporter.
 ## Further reading
 
 - [`HurstVpinDirectional` strategy source](https://github.com/nautechsystems/nautilus_trader/tree/develop/crates/trading/src/examples/strategies/hurst_vpin_directional)
-- [Data concepts: bar types and aggregation](../concepts/data.md)
+- [Data concepts: bar types and aggregation](../concepts/data/)
 - [Tardis integration guide](../integrations/tardis.md)
 - [Kraken integration guide](../integrations/kraken.md)
 - [Kraken Futures documentation](https://docs.kraken.com/api/docs/futures-api)

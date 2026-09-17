@@ -20,12 +20,16 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
-use nautilus_common::live::get_runtime;
+use nautilus_live::{
+    SocketControl,
+    task::{TaskJoinOutcome, TaskSlot, finish_task},
+};
 use nautilus_network::{
+    SocketStateSink,
     mode::ConnectionMode,
     websocket::{
         AuthTracker, SubscriptionState, TransportBackend, WebSocketClient, WebSocketConfig,
-        channel_message_handler,
+        channel_epoch_message_handler, proxy::ProxyUrl,
     },
 };
 
@@ -38,23 +42,22 @@ use crate::common::{
     urls::{clob_ws_market_url, clob_ws_user_url},
 };
 
-const POLYMARKET_HEARTBEAT_SECS: u64 = 30;
+// The venue counts only the `PING` text frame, not protocol ping frames, and
+// closes with `1008 no ping received` otherwise. Cadence per venue docs:
+// https://docs.polymarket.com/api-reference/wss/market
+pub(super) const POLYMARKET_HEARTBEAT_SECS: u64 = 10;
+pub(super) const POLYMARKET_HEARTBEAT_PAYLOAD: &str = "PING";
+
+// Prediction markets go quiet for long stretches, so liveness is the venue
+// still sending frames, not data arriving. A data-silence timer cannot serve:
+// `PONG` is a text frame and refreshes it. Tear down after three cycles.
+const POLYMARKET_HEARTBEAT_TIMEOUT_SECS: u64 = POLYMARKET_HEARTBEAT_SECS * 3;
 
 /// Polymarket WebSocket channel: market data or authenticated user data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WsChannel {
     Market,
     User,
-}
-
-// Market channel streams continuously; user channel can legitimately be quiet
-// when no orders or fills exist, so give it a longer window before treating
-// silence as a zombie connection.
-fn idle_timeout_ms_for(channel: WsChannel) -> u64 {
-    match channel {
-        WsChannel::Market => 60_000,
-        WsChannel::User => 300_000,
-    }
 }
 
 /// Lightweight handle for subscribing/unsubscribing to market data.
@@ -110,13 +113,28 @@ pub struct PolymarketWebSocketClient {
     out_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PolymarketWsMessage>>,
     credential: Option<Credential>,
     subscriptions: SubscriptionState,
+    discovery_subscribed: Arc<AtomicBool>,
     auth_tracker: AuthTracker,
     // Survives disconnect() so that connect() can replay a prior subscribe_user() call.
     // Arc<AtomicBool> allows mutation from &self in subscribe_user().
     user_subscribed: Arc<AtomicBool>,
-    task_handle: Option<tokio::task::JoinHandle<()>>,
+    task_handle: TaskSlot<()>,
     subscribe_new_markets: bool,
     transport_backend: TransportBackend,
+    proxy_url: Option<ProxyUrl>,
+    socket_sink: Option<SocketStateSink>,
+    socket_control: Option<SocketControl>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PolymarketWebSocketShutdownHandle {
+    signal: Arc<AtomicBool>,
+}
+
+impl PolymarketWebSocketShutdownHandle {
+    pub(crate) fn begin_shutdown(&self) {
+        self.signal.store(true, Ordering::Relaxed);
+    }
 }
 
 impl PolymarketWebSocketClient {
@@ -129,6 +147,17 @@ impl PolymarketWebSocketClient {
         subscribe_new_markets: bool,
         transport_backend: TransportBackend,
     ) -> Self {
+        Self::new_market_with_proxy(base_url, subscribe_new_markets, transport_backend, None)
+    }
+
+    /// Creates a new market-channel client with an optional validated proxy URL.
+    #[must_use]
+    pub fn new_market_with_proxy(
+        base_url: Option<String>,
+        subscribe_new_markets: bool,
+        transport_backend: TransportBackend,
+        proxy_url: Option<ProxyUrl>,
+    ) -> Self {
         let url = base_url.unwrap_or_else(|| clob_ws_market_url().to_string());
         Self::new_inner(
             WsChannel::Market,
@@ -136,6 +165,7 @@ impl PolymarketWebSocketClient {
             None,
             subscribe_new_markets,
             transport_backend,
+            proxy_url,
         )
     }
 
@@ -148,6 +178,17 @@ impl PolymarketWebSocketClient {
         credential: Credential,
         transport_backend: TransportBackend,
     ) -> Self {
+        Self::new_user_with_proxy(base_url, credential, transport_backend, None)
+    }
+
+    /// Creates a new user-channel client with an optional validated proxy URL.
+    #[must_use]
+    pub fn new_user_with_proxy(
+        base_url: Option<String>,
+        credential: Credential,
+        transport_backend: TransportBackend,
+        proxy_url: Option<ProxyUrl>,
+    ) -> Self {
         let url = base_url.unwrap_or_else(|| clob_ws_user_url().to_string());
         Self::new_inner(
             WsChannel::User,
@@ -155,6 +196,7 @@ impl PolymarketWebSocketClient {
             Some(credential),
             false,
             transport_backend,
+            proxy_url,
         )
     }
 
@@ -164,6 +206,7 @@ impl PolymarketWebSocketClient {
         credential: Option<Credential>,
         subscribe_new_markets: bool,
         transport_backend: TransportBackend,
+        proxy_url: Option<ProxyUrl>,
     ) -> Self {
         let (placeholder_tx, _) = tokio::sync::mpsc::unbounded_channel();
         Self {
@@ -175,18 +218,38 @@ impl PolymarketWebSocketClient {
             out_rx: None,
             credential,
             subscriptions: SubscriptionState::new(':'),
+            discovery_subscribed: Arc::new(AtomicBool::new(false)),
             auth_tracker: AuthTracker::new(),
             user_subscribed: Arc::new(AtomicBool::new(false)),
-            task_handle: None,
+            task_handle: TaskSlot::new(),
             subscribe_new_markets,
             transport_backend,
+            proxy_url,
+            socket_sink: None,
+            socket_control: None,
         }
     }
 
+    /// Configures socket state reporting for the underlying transport.
+    #[must_use]
+    pub fn with_state_sink(mut self, state_sink: SocketStateSink) -> Self {
+        self.socket_sink = Some(state_sink);
+        self
+    }
+
+    /// Configures state reporting and reconnect control for the underlying transport.
+    #[must_use]
+    pub(crate) fn with_socket_control(mut self, control: SocketControl) -> Self {
+        self.socket_control = Some(control);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn proxy_url(&self) -> Option<&ProxyUrl> {
+        self.proxy_url.as_ref()
+    }
+
     /// Establishes the WebSocket connection and spawns the message handler.
-    ///
-    /// # Errors
-    ///
     pub async fn connect(&mut self) -> anyhow::Result<()> {
         let mode = ConnectionMode::from_atomic(&self.connection_mode);
         if mode.is_active() || mode.is_reconnect() {
@@ -194,25 +257,30 @@ impl PolymarketWebSocketClient {
             return Ok(());
         }
 
-        let (message_handler, raw_rx) = channel_message_handler();
-        let cfg = WebSocketConfig {
-            url: self.url.clone(),
-            headers: vec![],
-            heartbeat: Some(POLYMARKET_HEARTBEAT_SECS),
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(15_000),
-            reconnect_delay_initial_ms: Some(250),
-            reconnect_delay_max_ms: Some(5_000),
-            reconnect_backoff_factor: Some(2.0),
-            reconnect_jitter_ms: Some(200),
-            reconnect_max_attempts: None,
-            idle_timeout_ms: Some(idle_timeout_ms_for(self.channel)),
-            backend: self.transport_backend,
-            proxy_url: None,
-        };
+        if self.task_handle.is_some() {
+            self.disconnect().await?;
+        }
 
-        let client =
-            WebSocketClient::connect(cfg, Some(message_handler), None, None, vec![], None).await?;
+        let (message_handler, raw_rx) = channel_epoch_message_handler();
+        let cfg = self.websocket_config();
+
+        let client = WebSocketClient::epoch_builder()
+            .config(cfg)
+            .epoch_handler(message_handler)
+            .maybe_state_sink(
+                self.socket_control
+                    .as_ref()
+                    .map(SocketControl::sink)
+                    .or_else(|| self.socket_sink.clone()),
+            )
+            .connect()
+            .await?;
+
+        if let Some(control) = &self.socket_control {
+            let handle = client.reconnect_handle();
+            control.register(move || handle.request_reconnect());
+        }
+        let connection_epoch = client.connection_epoch();
 
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
         let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<PolymarketWsMessage>();
@@ -223,55 +291,56 @@ impl PolymarketWebSocketClient {
         let client_mode = client.connection_mode_atomic();
         self.connection_mode = client_mode;
 
-        log::info!("Polymarket WebSocket connected: {}", self.url);
-
-        cmd_tx
-            .send(HandlerCommand::SetClient(client))
-            .map_err(|e| anyhow::anyhow!("Failed to send SetClient: {e}"))?;
+        log::debug!("Polymarket WebSocket connected: {}", self.url);
 
         // Replay retained state onto the new session. Unlike the RECONNECTED sentinel
-        // path, a fresh connect() never fires resubscribe_all() inside the handler, so
-        // we must queue the commands here before the handler task is even spawned.
-        match self.channel {
+        // path, a fresh connect() never fires resubscribe_all() inside the handler.
+        let initial_market_replay = match self.channel {
             WsChannel::Market => {
-                let topics = self.subscriptions.all_topics();
-                if !topics.is_empty() {
-                    log::info!(
-                        "Replaying {} market subscription(s) onto new session",
-                        topics.len()
+                let topics = self.subscriptions.reset_after_reconnect();
+                if !topics.is_empty() || self.discovery_subscribed.load(Ordering::Relaxed) {
+                    log::debug!(
+                        "Replaying market subscription state onto new session: assets={}, discovery={}",
+                        topics.len(),
+                        self.discovery_subscribed.load(Ordering::Relaxed),
                     );
-                    cmd_tx
-                        .send(HandlerCommand::SubscribeMarket(topics))
-                        .map_err(|e| anyhow::anyhow!("Failed to replay SubscribeMarket: {e}"))?;
+                    Some((topics, connection_epoch))
+                } else {
+                    None
                 }
             }
             WsChannel::User => {
                 if self.user_subscribed.load(Ordering::Relaxed) {
-                    log::info!("Replaying user subscribe onto new session");
+                    log::debug!("Replaying user subscribe onto new session");
                     cmd_tx
                         .send(HandlerCommand::SubscribeUser)
                         .map_err(|e| anyhow::anyhow!("Failed to replay SubscribeUser: {e}"))?;
                 }
+                None
             }
-        }
+        };
 
         let signal = Arc::clone(&self.signal);
         let channel = self.channel;
         let credential = self.credential.clone();
         let subscriptions = self.subscriptions.clone();
+        let discovery_subscribed = Arc::clone(&self.discovery_subscribed);
         let auth_tracker = self.auth_tracker.clone();
         let user_subscribed = self.user_subscribed.load(Ordering::Relaxed);
         let subscribe_new_markets = self.subscribe_new_markets;
 
-        let stream_handle = get_runtime().spawn(async move {
+        if let Err(e) = self.task_handle.spawn(async move {
             let mut handler = FeedHandler::new(
                 signal,
                 channel,
+                Some(client),
                 cmd_rx,
                 raw_rx,
                 out_tx,
                 credential,
                 subscriptions,
+                discovery_subscribed,
+                initial_market_replay,
                 auth_tracker,
                 user_subscribed,
                 subscribe_new_markets,
@@ -281,6 +350,15 @@ impl PolymarketWebSocketClient {
                 match handler.next().await {
                     Some(PolymarketWsMessage::Reconnected) => {
                         log::info!("Polymarket WebSocket reconnected");
+
+                        if handler.send(PolymarketWsMessage::Reconnected).is_err() {
+                            if handler.is_stopped() {
+                                log::debug!("Output channel closed, stopping handler");
+                            } else {
+                                log::error!("Output channel closed, stopping handler");
+                            }
+                            break;
+                        }
                     }
                     Some(msg) => {
                         if handler.send(msg).is_err() {
@@ -303,60 +381,104 @@ impl PolymarketWebSocketClient {
                 }
             }
             log::debug!("Polymarket WebSocket handler task completed");
-        });
-        self.task_handle = Some(stream_handle);
+        }) {
+            self.out_rx = None;
+            anyhow::bail!("Failed to start Polymarket WebSocket handler task: {e}");
+        }
         Ok(())
     }
 
-    /// Force-close fallback for the sync `stop()` path.
-    /// Prefer `disconnect()` for graceful shutdown.
-    pub(crate) fn abort(&mut self) {
+    fn websocket_config(&self) -> WebSocketConfig {
+        // The market endpoint rejects text PING before its initial subscription. Protocol pings
+        // keep an idle socket alive until FeedHandler starts the required text heartbeat.
+        let heartbeat_payload = match self.channel {
+            WsChannel::Market => None,
+            WsChannel::User => Some(POLYMARKET_HEARTBEAT_PAYLOAD.to_string()),
+        };
+
+        WebSocketConfig {
+            url: self.url.clone(),
+            headers: vec![],
+            heartbeat_interval_secs: Some(POLYMARKET_HEARTBEAT_SECS),
+            heartbeat_payload,
+            connect_timeout_ms: Some(15_000),
+            reconnect_delay_initial_ms: Some(250),
+            reconnect_delay_max_ms: Some(5_000),
+            reconnect_backoff_factor: Some(2.0),
+            reconnect_jitter_ms: Some(200),
+            reconnect_max_attempts: None,
+            heartbeat_timeout_secs: Some(POLYMARKET_HEARTBEAT_TIMEOUT_SECS),
+            idle_timeout_ms: None,
+            backend: self.transport_backend,
+            proxy_url: self.proxy_url.as_ref().map(|url| url.expose().to_string()),
+        }
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
         self.signal.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn shutdown_handle(&self) -> PolymarketWebSocketShutdownHandle {
+        PolymarketWebSocketShutdownHandle {
+            signal: Arc::clone(&self.signal),
+        }
+    }
+
+    pub(crate) fn abort(&mut self) {
+        self.begin_shutdown();
         self.connection_mode
             .store(ConnectionMode::Closed.as_u8(), Ordering::SeqCst);
-
-        if let Some(handle) = self.task_handle.take() {
-            handle.abort();
-        }
+        self.task_handle.abort();
         self.auth_tracker.invalidate();
+
+        if let Some(control) = &self.socket_control {
+            control.deregister();
+        }
     }
 
     /// Disconnects the WebSocket connection.
     pub async fn disconnect(&mut self) -> anyhow::Result<()> {
-        log::info!("Disconnecting Polymarket WebSocket");
+        log::debug!("Disconnecting Polymarket WebSocket");
         self.signal.store(true, Ordering::Relaxed);
 
         if let Err(e) = self.cmd_tx.read().await.send(HandlerCommand::Disconnect) {
             log::debug!("Failed to send disconnect (handler may already be shut down): {e}");
         }
 
-        if let Some(handle) = self.task_handle.take() {
-            let abort_handle = handle.abort_handle();
-            tokio::select! {
-                result = handle => {
-                    match result {
-                        Ok(()) => log::debug!("Handler task completed"),
-                        Err(e) if e.is_cancelled() => log::debug!("Handler task was cancelled"),
-                        Err(e) => log::error!("Handler task error: {e:?}"),
-                    }
-                }
-                () = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {
-                    log::warn!("Timeout waiting for handler task, aborting");
-                    abort_handle.abort();
-                }
-            }
-        }
+        let task_result = match finish_task(
+            &mut self.task_handle,
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        {
+            None | Some(TaskJoinOutcome::Completed(()) | TaskJoinOutcome::Aborted) => Ok(()),
+            Some(TaskJoinOutcome::Failed(error)) => Err(anyhow::anyhow!(
+                "Polymarket WebSocket handler failed: {error}"
+            )),
+            Some(TaskJoinOutcome::Incomplete) => Err(anyhow::anyhow!(
+                "Polymarket WebSocket handler did not stop after abort"
+            )),
+        };
         // Invalidate after the task has stopped so any in-flight auth_tracker.succeed()
         // calls from the handler cannot race with and survive the invalidation.
         self.auth_tracker.invalidate();
+
+        if let Some(control) = &self.socket_control {
+            control.deregister();
+        }
         log::debug!("Polymarket WebSocket disconnected");
-        Ok(())
+        task_result
     }
 
     /// Returns `true` if the WebSocket is actively connected.
     #[must_use]
     pub fn is_active(&self) -> bool {
         ConnectionMode::from_atomic(&self.connection_mode).is_active()
+    }
+
+    pub(crate) fn has_task(&self) -> bool {
+        self.task_handle.is_some()
     }
 
     /// Returns the URL this client connects to.
@@ -377,6 +499,7 @@ impl PolymarketWebSocketClient {
     /// clean slate rather than replaying a previous generation's topics.
     pub(crate) fn clear_reconnect_state(&self) {
         self.subscriptions.clear();
+        self.discovery_subscribed.store(false, Ordering::Relaxed);
         self.user_subscribed.store(false, Ordering::Relaxed);
         self.auth_tracker.invalidate();
     }
@@ -484,16 +607,170 @@ impl PolymarketWebSocketClient {
     }
 }
 
+impl Drop for PolymarketWebSocketClient {
+    fn drop(&mut self) {
+        self.signal.store(true, Ordering::Relaxed);
+
+        if let Some(handle) = self.task_handle.as_ref() {
+            handle.abort();
+        }
+
+        if let Some(control) = &self.socket_control {
+            control.deregister();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
+    use axum::{
+        Router,
+        extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
+        response::Response,
+        routing::get,
+    };
+    use nautilus_network::{
+        RECONNECTED,
+        websocket::{TransportBackend, WebSocketConfig, proxy::ProxyUrl},
+    };
     use rstest::rstest;
 
-    use super::{WsChannel, idle_timeout_ms_for};
+    use super::*;
+
+    async fn handle_upgrade(ws: WebSocketUpgrade) -> Response {
+        ws.on_upgrade(handle_socket)
+    }
+
+    async fn handle_socket(mut socket: WebSocket) {
+        let _ = socket
+            .send(AxumWsMessage::Text(RECONNECTED.to_string().into()))
+            .await;
+    }
+
+    async fn start_test_server() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test websocket server");
+        let addr = listener.local_addr().expect("test websocket address");
+        let router = Router::new().route("/ws", get(handle_upgrade));
+
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("test websocket server failed");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        addr
+    }
+
+    #[tokio::test]
+    async fn cancelled_disconnect_retains_handler_task() {
+        let mut client = PolymarketWebSocketClient::new_market(
+            Some("ws://127.0.0.1:0".to_string()),
+            false,
+            TransportBackend::default(),
+        );
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        client.cmd_tx = Arc::new(tokio::sync::RwLock::new(cmd_tx));
+        client
+            .task_handle
+            .insert(tokio::spawn(std::future::pending()));
+
+        {
+            let disconnect = client.disconnect();
+            tokio::pin!(disconnect);
+            tokio::select! {
+                result = &mut disconnect => panic!("disconnect completed unexpectedly: {result:?}"),
+                command = cmd_rx.recv() => assert!(command.is_some()),
+            }
+        }
+
+        assert!(client.task_handle.is_some());
+    }
 
     #[rstest]
-    #[case::market(WsChannel::Market, 60_000)]
-    #[case::user(WsChannel::User, 300_000)]
-    fn test_idle_timeout_ms_for_channel(#[case] channel: WsChannel, #[case] expected: u64) {
-        assert_eq!(idle_timeout_ms_for(channel), expected);
+    #[tokio::test]
+    async fn connect_forwards_reconnected_message_to_receiver() {
+        let addr = start_test_server().await;
+        let mut client = PolymarketWebSocketClient::new_market(
+            Some(format!("ws://{addr}/ws")),
+            false,
+            TransportBackend::default(),
+        );
+
+        client.connect().await.expect("connect websocket client");
+
+        let message =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), client.next_message())
+                .await
+                .expect("wait for websocket message");
+
+        assert!(matches!(
+            message,
+            Some(super::super::messages::PolymarketWsMessage::Reconnected)
+        ));
+
+        client
+            .disconnect()
+            .await
+            .expect("disconnect websocket client");
+    }
+
+    #[rstest]
+    fn proxy_url_is_retained_for_market_and_user_clients() {
+        const MARKET_PROXY: &str = "http://market-user:market-proxy-secret@127.0.0.1:18086";
+        const USER_PROXY: &str = "https://user-user:user-proxy-secret@127.0.0.1:18087";
+        let market = PolymarketWebSocketClient::new_market_with_proxy(
+            Some("ws://market.example/ws".to_string()),
+            false,
+            TransportBackend::Tungstenite,
+            Some(ProxyUrl::parse(MARKET_PROXY).unwrap()),
+        );
+        let credential = crate::common::credential::Credential::new(
+            "fixture-key",
+            "Zml4dHVyZQ==",
+            "fixture-passphrase".to_string(),
+        )
+        .unwrap();
+        let user = PolymarketWebSocketClient::new_user_with_proxy(
+            Some("ws://user.example/ws".to_string()),
+            credential,
+            TransportBackend::Tungstenite,
+            Some(ProxyUrl::parse(USER_PROXY).unwrap()),
+        );
+        let market_config = market.websocket_config();
+        let user_config = user.websocket_config();
+        let market_debug = format!("{market:?}");
+        let user_debug = format!("{user:?}");
+        let assert_common = |config: &WebSocketConfig| {
+            assert_eq!(config.headers, Vec::<(String, String)>::new());
+            assert_eq!(config.heartbeat_interval_secs, Some(10));
+            assert_eq!(config.connect_timeout_ms, Some(15_000));
+            assert_eq!(config.reconnect_delay_initial_ms, Some(250));
+            assert_eq!(config.reconnect_delay_max_ms, Some(5_000));
+            assert_eq!(config.reconnect_backoff_factor, Some(2.0));
+            assert_eq!(config.reconnect_jitter_ms, Some(200));
+            assert_eq!(config.reconnect_max_attempts, None);
+            // No data-silence timer: `PONG` arrives as a text frame and would
+            // refresh it, so liveness rests on the heartbeat timeout instead.
+            assert_eq!(config.idle_timeout_ms, None);
+            assert_eq!(config.backend, TransportBackend::Tungstenite);
+        };
+
+        assert_eq!(market.proxy_url.as_ref().unwrap().expose(), MARKET_PROXY);
+        assert_eq!(user.proxy_url.as_ref().unwrap().expose(), USER_PROXY);
+        assert_eq!(market_config.url, "ws://market.example/ws");
+        assert_eq!(user_config.url, "ws://user.example/ws");
+        assert_eq!(market_config.proxy_url.as_deref(), Some(MARKET_PROXY));
+        assert_eq!(user_config.proxy_url.as_deref(), Some(USER_PROXY));
+        assert_eq!(market_config.heartbeat_payload, None);
+        assert_eq!(user_config.heartbeat_payload.as_deref(), Some("PING"));
+        assert_common(&market_config);
+        assert_common(&user_config);
+        assert!(!market_debug.contains("market-proxy-secret"));
+        assert!(!user_debug.contains("user-proxy-secret"));
     }
 }

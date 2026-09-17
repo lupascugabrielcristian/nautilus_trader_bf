@@ -30,7 +30,7 @@ use crate::{
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.indicators", unsendable)
+    pyo3::pyclass(module = "nautilus_trader.indicators", unsendable)
 )]
 #[cfg_attr(
     feature = "python",
@@ -67,8 +67,9 @@ impl Indicator for VariableIndexDynamicAverage {
         self.initialized
     }
 
-    fn handle_quote(&mut self, quote: &QuoteTick) {
-        self.update_raw(quote.extract_price(self.price_type).into());
+    fn handle_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
+        self.update_raw(quote.extract_price(self.price_type)?.into());
+        Ok(())
     }
 
     fn handle_trade(&mut self, trade: &TradeTick) {
@@ -156,6 +157,7 @@ mod tests {
         average::{sma::SimpleMovingAverage, vidya::VariableIndexDynamicAverage},
         indicator::{Indicator, MovingAverage},
         stubs::*,
+        testing::assert_approx_equal,
     };
 
     #[rstest]
@@ -210,7 +212,7 @@ mod tests {
         indicator_vidya_10.update_raw(1.00020);
         indicator_vidya_10.update_raw(1.00010);
         indicator_vidya_10.update_raw(1.00000);
-        assert_eq!(indicator_vidya_10.value, 0.046_813_474_863_949_87);
+        assert_approx_equal(indicator_vidya_10.value, 0.0468134748639);
     }
 
     #[rstest]
@@ -218,7 +220,7 @@ mod tests {
         mut indicator_vidya_10: VariableIndexDynamicAverage,
         stub_quote: QuoteTick,
     ) {
-        indicator_vidya_10.handle_quote(&stub_quote);
+        indicator_vidya_10.handle_quote(&stub_quote).unwrap();
         assert_eq!(indicator_vidya_10.value, 0.0);
     }
 

@@ -24,6 +24,9 @@ from nautilus_trader.model.identifiers import TraderId
 from strategy.strategy_dual_SMA import DualSMAConfig
 from strategy.strategy_dual_SMA import DualSMAStrategy
 
+from tr_utils import global_config
+from tr_utils import log_message
+
 """
 Example usage:
   python 07_run_strategy_dual_SMA.py BTCUSDT-PERP
@@ -85,12 +88,13 @@ def _resolve_trade_size(global_config: dict) -> Decimal:
     return Decimal(os.getenv("BINANCE_TRADE_SIZE") or global_config.get("LOT_SIZE", "0.2"))
 
 
-def _load_service_ports():
-    import json
+def _load_step_config() -> dict:
+    raw = global_config()
+    if not raw:
+        return {}
     try:
-        with open('/tmp/service_ports.json') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
         return {}
 
 
@@ -127,11 +131,65 @@ def _telegram(format, *args):
 
 def main() -> None:
     global_config = _load_global_config()
+=======
+def _load_step_config() -> dict:
+    raw = global_config()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    for step in data.get("steps", []):
+        if step.get("name") == "7_paper_trading":
+            return step
+    return {}
+
+
+def _load_global_config() -> dict:
+    raw = global_config()
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+_INTERVAL_MAP = {
+    "s": "SECOND",
+    "m": "MINUTE",
+    "h": "HOUR",
+    "d": "DAY",
+    "w": "WEEK",
+}
+
+
+def _resolve_bar_suffix(interval: str) -> str:
+    suffix = "LAST-EXTERNAL"
+    if not interval:
+        return f"1-MINUTE-{suffix}"
+    interval = interval.strip().lower()
+    if len(interval) < 2:
+        return f"1-MINUTE-{suffix}"
+    num_part = interval[:-1]
+    unit_part = interval[-1]
+    if not num_part.isdigit() or unit_part not in _INTERVAL_MAP:
+        return f"1-MINUTE-{suffix}"
+    step = int(num_part)
+    unit = _INTERVAL_MAP[unit_part]
+    return f"{step}-{unit}-{suffix}"
+
+
+def main() -> None:
+    global_config = _load_step_config()
+>>>>>>> 743189f1b4438457cb48cd1c5aa414b3b097ddc8
 
     parser = argparse.ArgumentParser(description="Run DualSMAStrategy on Binance")
     parser.add_argument("symbol", type=str, help="Instrument symbol e.g. BTCUSDT-PERP or ETHUSDT")
     parser.add_argument("--fast-period", type=int, default=10, help="Fast SMA period")
     parser.add_argument("--slow-period", type=int, default=50, help="Slow SMA period")
+    parser.add_argument("--bar-suffix", type=str, default=None, help="Bar suffix e.g. 15-MINUTE-LAST-EXTERNAL. Overrides interval from global config.")
     args = parser.parse_args()
 
     env_name = os.getenv("BINANCE_ENV", "TESTNET").upper()
@@ -212,7 +270,7 @@ def main() -> None:
 
 
     node = TradingNode(config=config_node)
-    _log_message("node is ready")
+    log_message("Trading node is ready")
 
 #   Examples of valid values:
 #      - 1-MINUTE-LAST-EXTERNAL
@@ -223,13 +281,17 @@ def main() -> None:
 
     trade_size = _resolve_trade_size(global_config)
 
+    bar_suffix = args.bar_suffix or _resolve_bar_suffix(
+        _load_global_config().get("global", {}).get("interval", "1m"),
+    )
+
     strategy = DualSMAStrategy(
         config=DualSMAConfig(
             instrument_id=instrument_id,
             trade_size=trade_size,
             fast_period=args.fast_period,
             slow_period=args.slow_period,
-            bar_suffix="1-MINUTE-LAST-EXTERNAL",
+            bar_suffix=bar_suffix,
             global_config=global_config,
             telegram_active=True
         ),

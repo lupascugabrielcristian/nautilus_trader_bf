@@ -19,7 +19,13 @@
 //! driven by a [`ParquetDataCatalog`] through [`BacktestNode`]. Synthetic quote
 //! data is written to a temporary catalog, then loaded and streamed by the node.
 //!
+//! Edit the constants below to change the venue, starting balance, trade size,
+//! EMA periods, chunk size, and run id.
+//!
 //! Run with: `cargo run -p nautilus-backtest --features examples,streaming --example node-ema-cross`
+
+#[cfg(feature = "mimalloc")]
+mod allocator;
 
 use nautilus_backtest::{
     config::{BacktestDataConfig, BacktestRunConfig, BacktestVenueConfig, NautilusDataType},
@@ -36,6 +42,14 @@ use nautilus_persistence::backend::catalog::ParquetDataCatalog;
 use nautilus_trading::examples::strategies::EmaCross;
 use tempfile::TempDir;
 use ustr::Ustr;
+
+const VENUE: &str = "SIM";
+const STARTING_BALANCE: &str = "1_000_000 USD";
+const TRADE_SIZE: &str = "100000";
+const EMA_FAST_PERIOD: usize = 10;
+const EMA_SLOW_PERIOD: usize = 20;
+const CHUNK_SIZE: usize = 100;
+const RUN_ID: &str = "ema-cross-run";
 
 fn generate_quotes(instrument_id: InstrumentId) -> Vec<QuoteTick> {
     let spread = 0.00020;
@@ -59,7 +73,7 @@ fn generate_quotes(instrument_id: InstrumentId) -> Vec<QuoteTick> {
         tick += 1;
     };
 
-    // Flat initialization — both EMAs converge around 0.65000
+    // Flat initialization - both EMAs converge around 0.65000
     for _ in 0..25 {
         add(0.65000);
     }
@@ -69,12 +83,12 @@ fn generate_quotes(instrument_id: InstrumentId) -> Vec<QuoteTick> {
     for cycle in 0..cycles {
         let base = 0.65000 + (cycle as f64 * 0.00100);
 
-        // Ramp up — fast EMA crosses above slow -> BUY signal
+        // Ramp up - fast EMA crosses above slow -> BUY signal
         for i in 0..40 {
             add(base + (i as f64 * 0.00050));
         }
 
-        // Ramp down — fast EMA crosses below slow -> SELL signal
+        // Ramp down - fast EMA crosses below slow -> SELL signal
         for i in 0..80 {
             let peak = base + 39.0 * 0.00050;
             add(peak - (i as f64 * 0.00050));
@@ -85,6 +99,9 @@ fn generate_quotes(instrument_id: InstrumentId) -> Vec<QuoteTick> {
 }
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(feature = "mimalloc")]
+    allocator::register();
+
     // Write synthetic data to a temporary parquet catalog
     let instrument = InstrumentAny::CurrencyPair(audusd_sim());
     let instrument_id = instrument.id();
@@ -95,42 +112,42 @@ fn main() -> anyhow::Result<()> {
     let catalog_path = temp_dir.path().to_str().unwrap().to_string();
     let catalog = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);
     catalog.write_instruments(vec![instrument])?;
-    catalog.write_to_parquet(quotes, None, None, None)?;
+    catalog.write_to_parquet(&quotes, None, None, None)?;
 
     println!("Wrote {num_quotes} quotes to catalog: {catalog_path}");
 
     // Configure the backtest run
     let venue_config = BacktestVenueConfig::builder()
-        .name(Ustr::from("SIM"))
+        .name(Ustr::from(VENUE))
         .oms_type(OmsType::Hedging)
         .account_type(AccountType::Margin)
         .book_type(BookType::L1_MBP)
-        .starting_balances(vec!["1_000_000 USD".to_string()])
-        .build();
+        .starting_balances(vec![STARTING_BALANCE.to_string()])
+        .build()?;
 
     let data_config = BacktestDataConfig::builder()
         .data_type(NautilusDataType::QuoteTick)
         .catalog_path(catalog_path)
         .instrument_id(instrument_id)
-        .build();
+        .build()?;
 
     let run_config = BacktestRunConfig::builder()
-        .id("ema-cross-run".to_string())
+        .id(RUN_ID.to_string())
         .venues(vec![venue_config])
         .data(vec![data_config])
-        .chunk_size(100) // Stream in chunks of 100
-        .build();
+        .chunk_size(CHUNK_SIZE)
+        .build()?;
 
     // Build and run the backtest
     let mut node = BacktestNode::new(vec![run_config])?;
     node.build()?;
 
-    let engine = node.get_engine_mut("ema-cross-run").unwrap();
+    let engine = node.get_engine_mut(RUN_ID).unwrap();
     engine.add_strategy(EmaCross::new(
         instrument_id,
-        Quantity::from("100000"),
-        10,
-        20,
+        Quantity::from(TRADE_SIZE),
+        EMA_FAST_PERIOD,
+        EMA_SLOW_PERIOD,
     ))?;
 
     node.run()?;

@@ -37,7 +37,7 @@
 //! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
 //! - `arrow`: Enables Apache Arrow schema and `RecordBatch` registries for custom data.
 //! - `python-arrow`: Enables Python bindings together with `PyArrow` `RecordBatch` bridging.
-//! - `stubs`: Enables type stubs for use in testing scenarios.
+//! - `test-support`: Enables test fixtures, builders, specs, and defaults.
 //! - `high-precision`: Enables [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation#precision-mode) to use 128-bit value types.
 //! - `defi`: Enables the DeFi (Decentralized Finance) domain model.
 //! - `extension-module`: Builds the crate as a Python extension module.
@@ -59,10 +59,6 @@
 #![allow(
     clippy::manual_let_else,
     reason = "match can be clearer than let-else for some patterns"
-)]
-#![allow(
-    clippy::redundant_closure_for_method_calls,
-    reason = "causes clippy ICE on Rust 1.94; matches the workaround in workspace Cargo.toml"
 )]
 #![allow(
     clippy::float_cmp,
@@ -107,6 +103,13 @@
     clippy::large_types_passed_by_value,
     reason = "PyO3 methods require owned values extracted from Python objects"
 )]
+#![allow(
+    clippy::assert_is_empty,
+    reason = "`assert!(x.is_empty())` is clearer than comparing against an empty value"
+)]
+// pyo3's `from_py_object` generates `.clone()` on `Copy` fields that clippy flags from the
+// macro expansion; an item-level `allow` cannot reach the expansion
+#![allow(clippy::clone_on_copy)]
 
 pub mod accounts;
 pub mod currencies;
@@ -131,7 +134,7 @@ pub mod ffi;
 #[cfg(feature = "python")]
 pub mod python;
 
-#[cfg(any(test, feature = "stubs"))]
+#[cfg(any(test, feature = "test-support"))]
 pub mod stubs;
 
 #[cfg(feature = "defi")]

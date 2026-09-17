@@ -15,6 +15,7 @@
 
 use std::fmt::{Debug, Display};
 
+use indexmap::IndexMap;
 use nautilus_core::{UUID4, UnixNanos};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -22,8 +23,8 @@ use ustr::Ustr;
 
 use crate::{
     enums::{
-        ContingencyType, LiquiditySide, OrderSide, OrderSideSpecified, OrderType, TimeInForce,
-        TrailingOffsetType, TriggerType,
+        ContingencyType, LiquiditySide, OrderSide, OrderType, TimeInForce, TrailingOffsetType,
+        TriggerType,
     },
     events::OrderEvent,
     identifiers::{
@@ -34,11 +35,11 @@ use crate::{
 };
 
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -82,6 +83,8 @@ pub struct OrderFilled {
     pub position_id: Option<PositionId>,
     /// The commission generated from this execution.
     pub commission: Option<Money>,
+    /// Additional fill metadata (venue/adapter specific).
+    pub info: Option<IndexMap<Ustr, Ustr>>,
     /// The causation ID associated with the event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub causation_id: Option<UUID4>,
@@ -111,6 +114,7 @@ impl OrderFilled {
         reconciliation: bool,
         position_id: Option<PositionId>,
         commission: Option<Money>,
+        info: Option<IndexMap<Ustr, Ustr>>,
     ) -> Self {
         Self {
             trader_id,
@@ -132,13 +136,9 @@ impl OrderFilled {
             reconciliation,
             position_id,
             commission,
+            info,
             causation_id: None,
         }
-    }
-
-    #[must_use]
-    pub fn specified_side(&self) -> OrderSideSpecified {
-        self.order_side.as_specified()
     }
 
     #[must_use]
@@ -149,6 +149,54 @@ impl OrderFilled {
     #[must_use]
     pub fn is_sell(&self) -> bool {
         self.order_side == OrderSide::Sell
+    }
+
+    /// Splits an overfill into the fragment which closes the current position and the
+    /// fragment which opens the flipped position.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `closing_qty` is zero, is not smaller than the fill quantity,
+    /// or the proportional commission cannot be represented.
+    pub fn split_for_position_flip(
+        &self,
+        closing_qty: Quantity,
+        opening_position_id: Option<PositionId>,
+        opening_event_id: UUID4,
+    ) -> anyhow::Result<(Self, Self)> {
+        anyhow::ensure!(!closing_qty.is_zero(), "closing quantity was zero");
+        anyhow::ensure!(
+            closing_qty.raw < self.last_qty.raw,
+            "closing quantity {closing_qty} must be smaller than fill quantity {}",
+            self.last_qty,
+        );
+
+        let opening_qty =
+            Quantity::from_raw(self.last_qty.raw - closing_qty.raw, closing_qty.precision);
+        let closing_fraction = closing_qty.as_decimal() / self.last_qty.as_decimal();
+        let (closing_commission, opening_commission) = match self.commission {
+            Some(commission) => {
+                let closing = Money::from_decimal(
+                    commission.as_decimal() * closing_fraction,
+                    commission.currency,
+                )?;
+                (Some(closing), Some(commission - closing))
+            }
+            None => (None, None),
+        };
+
+        let mut closing = self.clone();
+        closing.last_qty = closing_qty;
+        closing.commission = closing_commission;
+
+        let mut opening = self.clone();
+        opening.last_qty = opening_qty;
+        opening.position_id = opening_position_id;
+        opening.commission = opening_commission;
+        opening.event_id = opening_event_id;
+        opening.causation_id = Some(self.event_id);
+
+        Ok((closing, opening))
     }
 }
 
@@ -328,6 +376,10 @@ impl OrderEvent for OrderFilled {
         Some(self.last_qty)
     }
 
+    fn activation_price(&self) -> Option<Price> {
+        None
+    }
+
     fn trigger_price(&self) -> Option<Price> {
         None
     }
@@ -420,7 +472,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        enums::{OrderSide, OrderSideSpecified},
+        enums::OrderSide,
         events::order::stubs::*,
         identifiers::PositionId,
         types::{Currency, Money, Price, Quantity},
@@ -447,6 +499,7 @@ mod tests {
             false,
             Some(PositionId::from("P-001")),
             Some(Money::new(2.5, Currency::USD())),
+            None,
         )
     }
 
@@ -469,6 +522,23 @@ mod tests {
     }
 
     #[rstest]
+    fn test_order_filled_info_round_trips_through_serde(order_filled: OrderFilled) {
+        let mut info = IndexMap::new();
+        info.insert(Ustr::from("liquidation"), Ustr::from("true"));
+        info.insert(Ustr::from("maker_order_id"), Ustr::from("ABC-123"));
+        let original = OrderFilled {
+            info: Some(info),
+            ..order_filled
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: OrderFilled = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.info, original.info);
+        assert_eq!(deserialized, original);
+    }
+
+    #[rstest]
     fn test_order_filled_is_sell() {
         let mut order_filled = create_test_order_filled();
         order_filled.order_side = OrderSide::Sell;
@@ -478,13 +548,32 @@ mod tests {
     }
 
     #[rstest]
-    fn test_order_filled_specified_side() {
-        let buy_order = create_test_order_filled();
-        assert_eq!(buy_order.specified_side(), OrderSideSpecified::Buy);
+    fn test_split_for_position_flip_preserves_provenance_and_commission() {
+        let mut fill = create_test_order_filled();
+        fill.last_qty = Quantity::from(100);
+        fill.commission = Some(Money::new(2.5, Currency::USD()));
+        let source_event_id = fill.event_id;
+        let opening_event_id = UUID4::new();
+        let opening_position_id = PositionId::from("P-FLIPPED");
 
-        let mut sell_order = create_test_order_filled();
-        sell_order.order_side = OrderSide::Sell;
-        assert_eq!(sell_order.specified_side(), OrderSideSpecified::Sell);
+        let (closing, opening) = fill
+            .split_for_position_flip(
+                Quantity::from(40),
+                Some(opening_position_id),
+                opening_event_id,
+            )
+            .expect("split fill");
+
+        assert_eq!(closing.last_qty, Quantity::from(40));
+        assert_eq!(closing.position_id, fill.position_id);
+        assert_eq!(closing.event_id, source_event_id);
+        assert_eq!(closing.causation_id, fill.causation_id);
+        assert_eq!(closing.commission, Some(Money::new(1.0, Currency::USD())));
+        assert_eq!(opening.last_qty, Quantity::from(60));
+        assert_eq!(opening.position_id, Some(opening_position_id));
+        assert_eq!(opening.event_id, opening_event_id);
+        assert_eq!(opening.causation_id, Some(source_event_id));
+        assert_eq!(opening.commission, Some(Money::new(1.5, Currency::USD())));
     }
 
     #[rstest]

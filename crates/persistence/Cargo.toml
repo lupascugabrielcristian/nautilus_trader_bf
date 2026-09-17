@@ -18,7 +18,7 @@ workspace = true
 
 [lib]
 name = "nautilus_persistence"
-crate-type = ["rlib", "staticlib"]
+crate-type = ["rlib"]
 
 [features]
 default = []
@@ -36,12 +36,9 @@ extension-module = [
   "python",
   "pyo3/extension-module",
 ]
-ffi = ["nautilus-core/ffi", "nautilus-model/ffi"]
 python = [
   "nautilus-common/python",
-  "nautilus-core/ffi",
   "nautilus-core/python",
-  "nautilus-model/ffi",
   "nautilus-model/python",
   "nautilus-serialization/python",
   "pyo3",
@@ -55,13 +52,14 @@ high-precision = [
 ]
 
 [package.metadata.docs.rs]
-all-features = true
+# Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
+features = ["cloud", "defi", "high-precision"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 nautilus-common = { workspace = true, features = ["live"] }
-nautilus-core = { workspace = true, features = ["ffi"] }
-nautilus-model = { workspace = true, features = ["stubs"] }
+nautilus-core = { workspace = true }
+nautilus-model = { workspace = true, features = ["test-support"] }
 nautilus-persistence-macros = { workspace = true }
 nautilus-serialization = { workspace = true, features = ["arrow"] }
 
@@ -69,17 +67,16 @@ ahash = { workspace = true }
 anyhow = { workspace = true }
 arrow = { workspace = true }
 arrow-row = { workspace = true }
-chrono = { workspace = true }
-chrono-tz = { workspace = true }
 datafusion = { workspace = true }
 futures = { workspace = true }
 indexmap = { workspace = true }
-itertools = { workspace = true }
+jiff = { workspace = true }
 log = { workspace = true }
 object_store = { workspace = true }
 parquet = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 unbounded-interval-tree = { workspace = true }
 url = { workspace = true }
@@ -88,7 +85,9 @@ pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
-nautilus-testkit = { workspace = true }
+nautilus-testkit = { workspace = true, default-features = false, features = [
+  "datasets",
+] }
 
 criterion = { workspace = true }
 pretty_assertions = { workspace = true }

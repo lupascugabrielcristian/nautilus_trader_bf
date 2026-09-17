@@ -17,16 +17,13 @@ use std::hash::{Hash, Hasher};
 
 use nautilus_core::{
     Params, UnixNanos,
-    correctness::{
-        CorrectnessResult, CorrectnessResultExt, FAILED, check_equal_u8,
-        check_valid_string_ascii_optional,
-    },
+    correctness::{CorrectnessResult, check_equal_u8, check_valid_string_ascii_optional},
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
-use super::{Instrument, any::InstrumentAny};
+use super::{Instrument, any::InstrumentAny, tick_scheme::check_tick_scheme};
 use crate::{
     enums::{AssetClass, InstrumentClass, OptionKind},
     identifiers::{InstrumentId, Symbol},
@@ -47,7 +44,7 @@ use crate::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -98,6 +95,8 @@ pub struct TokenizedAsset {
     pub max_price: Option<Price>,
     /// The minimum allowable quoted price.
     pub min_price: Option<Price>,
+    /// The registered variable tick scheme name.
+    pub tick_scheme: Option<Ustr>,
     /// Additional instrument metadata as a JSON-serializable dictionary.
     pub info: Option<Params>,
     /// UNIX timestamp (nanoseconds) when the data event occurred.
@@ -106,18 +105,10 @@ pub struct TokenizedAsset {
     pub ts_init: UnixNanos,
 }
 
+#[bon::bon]
 impl TokenizedAsset {
-    /// Creates a new [`TokenizedAsset`] instance with correctness checking.
-    ///
-    /// # Notes
-    ///
-    /// PyO3 requires a `Result` type for proper error handling and stacktrace printing in Python.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any input validation fails.
     #[expect(clippy::too_many_arguments)]
-    pub fn new_checked(
+    fn new_checked(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
         asset_class: AssetClass,
@@ -140,6 +131,7 @@ impl TokenizedAsset {
         margin_maint: Option<Decimal>,
         maker_fee: Option<Decimal>,
         taker_fee: Option<Decimal>,
+        tick_scheme: Option<Ustr>,
         info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
@@ -159,6 +151,7 @@ impl TokenizedAsset {
         )?;
         check_positive_price(price_increment, stringify!(price_increment))?;
         check_positive_quantity(size_increment, stringify!(size_increment))?;
+        check_tick_scheme(tick_scheme)?;
 
         if let Some(multiplier) = multiplier {
             check_positive_quantity(multiplier, stringify!(multiplier))?;
@@ -191,20 +184,23 @@ impl TokenizedAsset {
             margin_maint: margin_maint.unwrap_or_default(),
             maker_fee: maker_fee.unwrap_or_default(),
             taker_fee: taker_fee.unwrap_or_default(),
+            tick_scheme,
             info,
             ts_event,
             ts_init,
         })
     }
 
-    /// Creates a new [`TokenizedAsset`] instance.
+    /// Returns a fluent builder for a [`TokenizedAsset`] instance.
     ///
-    /// # Panics
+    /// Required fields are enforced at compile time; optional fields can be omitted and use the
+    /// same defaults as checked construction. The same correctness checks run on `build`.
     ///
-    /// Panics if any input parameter is invalid (see `new_checked`).
-    #[expect(clippy::too_many_arguments)]
-    #[must_use]
-    pub fn new(
+    /// # Errors
+    ///
+    /// Returns an error if any input validation fails.
+    #[builder(start_fn = builder, finish_fn = build)]
+    pub fn build_checked(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
         asset_class: AssetClass,
@@ -227,10 +223,11 @@ impl TokenizedAsset {
         margin_maint: Option<Decimal>,
         maker_fee: Option<Decimal>,
         taker_fee: Option<Decimal>,
+        tick_scheme: Option<Ustr>,
         info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
-    ) -> Self {
+    ) -> CorrectnessResult<Self> {
         Self::new_checked(
             instrument_id,
             raw_symbol,
@@ -254,11 +251,11 @@ impl TokenizedAsset {
             margin_maint,
             maker_fee,
             taker_fee,
+            tick_scheme,
             info,
             ts_event,
             ts_init,
         )
-        .expect_display(FAILED)
     }
 }
 
@@ -277,6 +274,9 @@ impl Hash for TokenizedAsset {
 }
 
 impl Instrument for TokenizedAsset {
+    fn tick_scheme(&self) -> Option<Ustr> {
+        self.tick_scheme
+    }
     fn into_any(self) -> InstrumentAny {
         InstrumentAny::TokenizedAsset(self)
     }
@@ -417,12 +417,14 @@ impl Instrument for TokenizedAsset {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use rust_decimal_macros::dec;
+    use ustr::Ustr;
 
     use crate::{
         enums::{AssetClass, InstrumentClass},
         identifiers::{InstrumentId, Symbol},
         instruments::{Instrument, TokenizedAsset, stubs::*},
-        types::{Currency, Price, Quantity},
+        types::{Currency, Money, Price, Quantity},
     };
 
     #[rstest]
@@ -468,6 +470,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             0.into(),
             0.into(),
         );
@@ -487,6 +490,7 @@ mod tests {
             4,
             Price::from("0.01"),
             Quantity::from("0.0001"),
+            None,
             None,
             None,
             None,
@@ -538,6 +542,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             0.into(),
             0.into(),
         );
@@ -550,5 +555,71 @@ mod tests {
         let json = serde_json::to_string(&tokenized_asset_aaplx).unwrap();
         let deserialized: TokenizedAsset = serde_json::from_str(&json).unwrap();
         assert_eq!(tokenized_asset_aaplx, deserialized);
+    }
+
+    #[rstest]
+    fn test_builder_matches_new_checked() {
+        let positional = TokenizedAsset::new_checked(
+            InstrumentId::from("AAPLx/USD.KRAKEN"),
+            Symbol::from("AAPLxUSD"),
+            AssetClass::Equity,
+            Currency::BTC(),
+            Currency::USD(),
+            Some(Ustr::from("US0378331005")),
+            2,
+            4,
+            Price::from("0.01"),
+            Quantity::from("0.0001"),
+            Some(Quantity::from("10")),
+            Some(Quantity::from("5")),
+            Some(Quantity::from("100")),
+            Some(Quantity::from("0.0001")),
+            Some(Money::new(1000.0, Currency::USD())),
+            Some(Money::new(10.0, Currency::USD())),
+            Some(Price::from("999.99")),
+            Some(Price::from("0.01")),
+            Some(dec!(0.01)),
+            Some(dec!(0.02)),
+            Some(dec!(0.0002)),
+            Some(dec!(0.0004)),
+            None,
+            None,
+            1.into(),
+            2.into(),
+        )
+        .unwrap();
+
+        let built = TokenizedAsset::builder()
+            .instrument_id(InstrumentId::from("AAPLx/USD.KRAKEN"))
+            .raw_symbol(Symbol::from("AAPLxUSD"))
+            .asset_class(AssetClass::Equity)
+            .base_currency(Currency::BTC())
+            .quote_currency(Currency::USD())
+            .isin(Ustr::from("US0378331005"))
+            .price_precision(2)
+            .size_precision(4)
+            .price_increment(Price::from("0.01"))
+            .size_increment(Quantity::from("0.0001"))
+            .multiplier(Quantity::from("10"))
+            .lot_size(Quantity::from("5"))
+            .max_quantity(Quantity::from("100"))
+            .min_quantity(Quantity::from("0.0001"))
+            .max_notional(Money::new(1000.0, Currency::USD()))
+            .min_notional(Money::new(10.0, Currency::USD()))
+            .max_price(Price::from("999.99"))
+            .min_price(Price::from("0.01"))
+            .margin_init(dec!(0.01))
+            .margin_maint(dec!(0.02))
+            .maker_fee(dec!(0.0002))
+            .taker_fee(dec!(0.0004))
+            .ts_event(1.into())
+            .ts_init(2.into())
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&positional).unwrap(),
+            serde_json::to_value(&built).unwrap(),
+        );
     }
 }

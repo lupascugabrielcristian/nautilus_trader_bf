@@ -21,44 +21,17 @@ use nautilus_model::{
         Bar, Data, IndexPriceUpdate, InstrumentStatus, MarkPriceUpdate, OptionGreeks,
         OrderBookDelta, OrderBookDepth10, QuoteTick, TradeTick, close::InstrumentClose,
     },
-    python::instruments::{instrument_any_to_pyobject, pyobject_to_instrument_any},
+    python::{
+        data::data_to_pyobject,
+        instruments::{instrument_any_to_pyobject, pyobject_to_instrument_any},
+    },
 };
 use pyo3::{exceptions::PyIOError, prelude::*, types::PyList};
 
 use crate::backend::catalog::ParquetDataCatalog;
 
-/// Converts a single `Data` variant into a Python object for returning from catalog methods.
-#[allow(
-    clippy::match_wildcard_for_single_variants,
-    reason = "Data::Defi appears through nautilus-model feature unification"
-)]
-fn data_to_pyobject(py: Python<'_>, item: Data) -> PyResult<Py<PyAny>> {
-    match item {
-        Data::Quote(quote) => Py::new(py, quote).map(pyo3::Py::into_any),
-        Data::Trade(trade) => Py::new(py, trade).map(pyo3::Py::into_any),
-        Data::Bar(bar) => Py::new(py, bar).map(pyo3::Py::into_any),
-        Data::Delta(delta) => Py::new(py, delta).map(pyo3::Py::into_any),
-        Data::Deltas(deltas) => Py::new(py, (*deltas).clone()).map(pyo3::Py::into_any),
-        Data::Depth10(depth) => Py::new(py, *depth).map(pyo3::Py::into_any),
-        Data::IndexPriceUpdate(price) => Py::new(py, price).map(pyo3::Py::into_any),
-        Data::MarkPriceUpdate(price) => Py::new(py, price).map(pyo3::Py::into_any),
-        Data::FundingRateUpdate(funding) => Py::new(py, funding).map(pyo3::Py::into_any),
-        Data::InstrumentStatus(status) => Py::new(py, status).map(pyo3::Py::into_any),
-        Data::OptionGreeks(greeks) => Py::new(py, greeks).map(pyo3::Py::into_any),
-        Data::InstrumentClose(close) => Py::new(py, close).map(pyo3::Py::into_any),
-        Data::Custom(custom) => Py::new(py, custom).map(pyo3::Py::into_any),
-        #[cfg(feature = "defi")]
-        Data::Defi(_) => Err(to_pytype_err("Unsupported Data::Defi variant")),
-        #[allow(unreachable_patterns)]
-        _ => Err(to_pytype_err("Unsupported Data variant")),
-    }
-}
-
 /// A catalog for writing data to Parquet files.
-#[pyclass(
-    name = "ParquetDataCatalog",
-    module = "nautilus_trader.core.nautilus_pyo3.persistence"
-)]
+#[pyclass(name = "ParquetDataCatalog", module = "nautilus_trader.persistence")]
 #[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.persistence")]
 pub struct PyParquetDataCatalog {
     inner: ParquetDataCatalog,
@@ -77,19 +50,18 @@ impl PyParquetDataCatalog {
     /// - `compression`: Optional compression type (0=UNCOMPRESSED, 1=SNAPPY, 2=GZIP, 3=LZO, 4=BROTLI, 5=LZ4, 6=ZSTD)
     /// - `max_row_group_size`: Optional maximum row group size (default: 5000)
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the underlying [`ParquetDataCatalog`] cannot be created.
+    /// Returns an error if the underlying [`ParquetDataCatalog`] cannot be created.
     #[new]
     #[pyo3(signature = (base_path, storage_options=None, batch_size=None, compression=None, max_row_group_size=None))]
-    #[must_use]
-    pub fn new(
+    pub fn py_new(
         base_path: &str,
         storage_options: Option<HashMap<String, String>>,
         batch_size: Option<usize>,
         compression: Option<u8>,
         max_row_group_size: Option<usize>,
-    ) -> Self {
+    ) -> PyResult<Self> {
         let compression = compression.map(|c| match c {
             0 => parquet::basic::Compression::UNCOMPRESSED,
             // For GZIP, LZO, BROTLI, LZ4, ZSTD we need to use the default level
@@ -114,7 +86,7 @@ impl PyParquetDataCatalog {
         // Convert HashMap to AHashMap for internal use
         let storage_options = storage_options.map(|m| m.into_iter().collect());
 
-        Self {
+        Ok(Self {
             inner: ParquetDataCatalog::from_uri(
                 base_path,
                 storage_options,
@@ -122,8 +94,8 @@ impl PyParquetDataCatalog {
                 compression,
                 max_row_group_size,
             )
-            .expect("Failed to create ParquetDataCatalog"),
-        }
+            .map_err(|e| PyIOError::new_err(format!("Failed to create ParquetDataCatalog: {e}")))?,
+        })
     }
 
     // TODO: Cannot pass mixed data across pyo3 as a single type
@@ -150,9 +122,15 @@ impl PyParquetDataCatalog {
     ) -> PyResult<String> {
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
 
         self.inner
-            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write quote ticks: {e}")))
     }
@@ -178,9 +156,15 @@ impl PyParquetDataCatalog {
     ) -> PyResult<String> {
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
 
         self.inner
-            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write trade ticks: {e}")))
     }
@@ -206,9 +190,15 @@ impl PyParquetDataCatalog {
     ) -> PyResult<String> {
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
 
         self.inner
-            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write order book deltas: {e}")))
     }
@@ -234,9 +224,15 @@ impl PyParquetDataCatalog {
     ) -> PyResult<String> {
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
 
         self.inner
-            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write bars: {e}")))
     }
@@ -262,9 +258,15 @@ impl PyParquetDataCatalog {
     ) -> PyResult<String> {
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
 
         self.inner
-            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write order book depths: {e}")))
     }
@@ -290,9 +292,15 @@ impl PyParquetDataCatalog {
     ) -> PyResult<String> {
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
 
         self.inner
-            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write mark price updates: {e}")))
     }
@@ -318,9 +326,15 @@ impl PyParquetDataCatalog {
     ) -> PyResult<String> {
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
 
         self.inner
-            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write index price updates: {e}")))
     }
@@ -346,9 +360,15 @@ impl PyParquetDataCatalog {
     ) -> PyResult<String> {
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
 
         self.inner
-            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write option greeks: {e}")))
     }
@@ -979,20 +999,6 @@ impl PyParquetDataCatalog {
                     .map_err(|e| PyIOError::new_err(format!("Query failed: {e}")))?;
                 prices.into_iter().map(Data::from).collect()
             }
-            "instrument_status" => {
-                let statuses = self
-                    .inner
-                    .query_typed_data::<InstrumentStatus>(
-                        identifiers,
-                        start_nanos,
-                        end_nanos,
-                        where_clause,
-                        files,
-                        optimize_file_loading,
-                    )
-                    .map_err(|e| PyIOError::new_err(format!("Query failed: {e}")))?;
-                statuses.into_iter().map(Data::from).collect()
-            }
             "option_greeks" => {
                 let greeks = self
                     .inner
@@ -1006,6 +1012,20 @@ impl PyParquetDataCatalog {
                     )
                     .map_err(|e| PyIOError::new_err(format!("Query failed: {e}")))?;
                 greeks.into_iter().map(Data::from).collect()
+            }
+            "instrument_status" => {
+                let statuses = self
+                    .inner
+                    .query_typed_data::<InstrumentStatus>(
+                        identifiers,
+                        start_nanos,
+                        end_nanos,
+                        where_clause,
+                        files,
+                        optimize_file_loading,
+                    )
+                    .map_err(|e| PyIOError::new_err(format!("Query failed: {e}")))?;
+                statuses.into_iter().map(Data::from).collect()
             }
             "instrument_closes" => {
                 let closes = self

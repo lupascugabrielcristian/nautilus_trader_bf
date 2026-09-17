@@ -15,14 +15,15 @@
 
 //! Wire-format types for the Kraken WebSocket v2 `level3` channel.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
+use rust_decimal::Decimal;
 use serde::Deserialize;
 
 /// A JSON decimal number that preserves the original wire-format string for checksum computation.
 #[derive(Debug, Clone)]
 pub struct RawDecimal {
     /// Parsed numeric value.
-    pub value: f64,
+    pub value: Decimal,
     /// Exact JSON representation (e.g. `"79754.0"` or `"0.00040000"`).
     pub raw: String,
 }
@@ -30,7 +31,7 @@ pub struct RawDecimal {
 impl Default for RawDecimal {
     fn default() -> Self {
         Self {
-            value: 0.0,
+            value: Decimal::ZERO,
             raw: "0".to_string(),
         }
     }
@@ -48,7 +49,7 @@ impl<'de> Deserialize<'de> for RawDecimal {
         } else {
             s.to_string()
         };
-        let value: f64 = raw_decimal.parse().map_err(serde::de::Error::custom)?;
+        let value: Decimal = raw_decimal.parse().map_err(serde::de::Error::custom)?;
         Ok(Self {
             value,
             raw: raw_decimal,
@@ -66,7 +67,7 @@ pub struct KrakenL3Order {
     /// Remaining quantity of the order; preserves the exact JSON string for checksum computation.
     pub order_qty: RawDecimal,
     /// Timestamp when the order was placed or last updated.
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
 }
 
 /// Full order book snapshot from the `level3` channel.
@@ -81,7 +82,7 @@ pub struct KrakenL3Snapshot {
     /// CRC32 checksum of the top-10 aggregated price levels.
     pub checksum: u32,
     /// Timestamp of the snapshot.
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
 }
 
 /// Event type for an individual order in a `level3` update.
@@ -107,11 +108,11 @@ pub struct KrakenL3OrderEvent {
     pub order_id: String,
     /// Limit price for this event; preserves the exact JSON string for checksum computation.
     pub limit_price: RawDecimal,
-    /// Order quantity; absent for delete events — defaults to zero.
+    /// Order quantity; absent for delete events - defaults to zero.
     #[serde(default)]
     pub order_qty: RawDecimal,
     /// Timestamp of the event.
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
 }
 
 /// Incremental update data from the `level3` channel.
@@ -126,7 +127,7 @@ pub struct KrakenL3UpdateData {
     /// CRC32 checksum of the top-10 aggregated price levels after applying this update.
     pub checksum: u32,
     /// Timestamp of the update.
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
 }
 
 /// Typed output from the L3 WebSocket handler.
@@ -141,6 +142,7 @@ pub(crate) enum KrakenL3WsMessage {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use rust_decimal_macros::dec;
 
     use super::*;
 
@@ -148,7 +150,7 @@ mod tests {
     fn test_raw_decimal_deserializes_json_string_without_quotes_in_raw() {
         let decimal: RawDecimal = serde_json::from_str(r#""0.01000000""#).unwrap();
 
-        assert_eq!(decimal.value, 0.01);
+        assert_eq!(decimal.value, dec!(0.01));
         assert_eq!(decimal.raw, "0.01000000");
     }
 
@@ -156,7 +158,7 @@ mod tests {
     fn test_raw_decimal_preserves_numeric_wire_precision() {
         let decimal: RawDecimal = serde_json::from_str("42000.50000").unwrap();
 
-        assert_eq!(decimal.value, 42000.5);
+        assert_eq!(decimal.value, dec!(42000.5));
         assert_eq!(decimal.raw, "42000.50000");
     }
 }

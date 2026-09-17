@@ -26,7 +26,7 @@ const MAX_PERIOD: usize = 16_384;
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.indicators")
+    pyo3::pyclass(module = "nautilus_trader.indicators")
 )]
 #[cfg_attr(
     feature = "python",
@@ -129,7 +129,7 @@ impl LinearRegression {
     ///
     /// # Panics
     ///
-    /// Panics if called with an empty window – this is protected against by the logic
+    /// Panics if called with an empty window - this is protected against by the logic
     /// that returns early until enough samples have been collected.
     pub fn update_raw(&mut self, close: f64) {
         if self.inputs.len() == self.period {

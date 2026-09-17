@@ -24,6 +24,7 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
+use jiff::Timestamp;
 use nautilus_common::testing::wait_until_async;
 use nautilus_core::UnixNanos;
 use nautilus_dydx::{
@@ -42,7 +43,7 @@ use nautilus_model::{
     identifiers::AccountId,
     instruments::{Instrument, InstrumentAny},
 };
-use nautilus_network::http::HttpClient;
+use nautilus_network::{http::HttpClient, retry::RetryConfig};
 use rstest::rstest;
 use rust_decimal_macros::dec;
 use serde_json::{Value, json};
@@ -73,10 +74,20 @@ struct QueryCaptureState {
     fills_params: Arc<tokio::sync::Mutex<Option<HashMap<String, String>>>>,
 }
 
+fn fast_test_retry_config(max_retries: u32) -> RetryConfig {
+    RetryConfig {
+        max_retries,
+        initial_delay_ms: 1,
+        max_delay_ms: 1,
+        backoff_factor: 1.0,
+        jitter_ms: 0,
+        ..Default::default()
+    }
+}
+
 async fn wait_for_server(addr: SocketAddr, path: &str) {
     let health_url = format!("http://{addr}{path}");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    let http_client = HttpClient::builder().build().unwrap();
     wait_until_async(
         || {
             let url = health_url.clone();
@@ -249,7 +260,7 @@ fn create_test_fill() -> Fill {
         price: dec!(50000),
         size: dec!(0.05),
         fee: dec!(2.50),
-        created_at: chrono::Utc::now(),
+        created_at: jiff::Timestamp::now(),
         created_at_height: 12345,
         order_id: "order-123".to_string(),
         client_metadata: 0,
@@ -269,7 +280,7 @@ async fn test_parse_order_status_report_buy_limit() {
     assert_eq!(report.account_id, account_id);
     assert_eq!(report.instrument_id, instrument.id());
     assert_eq!(report.venue_order_id.as_str(), "order-123");
-    assert_eq!(report.order_side, OrderSide::Buy);
+    assert_eq!(report.order_side, Some(OrderSide::Buy));
     assert_eq!(report.order_type, OrderType::Limit);
     assert_eq!(report.time_in_force, TimeInForce::Gtc);
     assert_eq!(report.order_status, OrderStatus::PartiallyFilled);
@@ -296,7 +307,7 @@ async fn test_parse_order_status_report_sell_filled() {
 
     let report = parse_order_status_report(&order, &instrument, account_id, ts_init).unwrap();
 
-    assert_eq!(report.order_side, OrderSide::Sell);
+    assert_eq!(report.order_side, Some(OrderSide::Sell));
     assert_eq!(report.time_in_force, TimeInForce::Ioc);
     assert_eq!(report.order_status, OrderStatus::Filled);
     assert_eq!(report.quantity.as_f64(), 0.2);
@@ -571,8 +582,14 @@ async fn test_http_error_handling_500() {
     wait_for_server(addr, "/v4/orders").await;
 
     let base_url = format!("http://{addr}");
-    let client =
-        DydxRawHttpClient::new(Some(base_url), 5, None, DydxNetwork::Mainnet, None).unwrap();
+    let client = DydxRawHttpClient::new(
+        Some(base_url),
+        5,
+        None,
+        DydxNetwork::Mainnet,
+        Some(fast_test_retry_config(0)),
+    )
+    .unwrap();
 
     let result = client.get_orders("dydx1test", 0, None, None).await;
     assert!(result.is_err());
@@ -633,7 +650,6 @@ async fn test_empty_fills_response() {
 #[rstest]
 #[tokio::test]
 async fn test_parse_block_height_websocket_message() {
-    use chrono::Utc;
     use nautilus_dydx::websocket::messages::{
         DydxBlockHeightChannelContents, DydxWsBlockHeightChannelData,
     };
@@ -646,7 +662,7 @@ async fn test_parse_block_height_websocket_message() {
         version: "4.0.0".to_string(),
         contents: DydxBlockHeightChannelContents {
             block_height: test_block_height.to_string(),
-            time: Utc::now(),
+            time: Timestamp::now(),
         },
     };
 

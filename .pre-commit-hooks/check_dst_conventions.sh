@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 # Enforces deterministic simulation testing (DST) path bans in the in-scope crates.
 #
-# Rules (all applied to production code in the 16 in-scope crates):
-#   1. No direct std::time::Instant::now(), std::time::SystemTime::now(), or
-#      chrono::Utc::now() reads
+# Rules (all applied to production code in the 17 in-scope crates):
+#   1. No direct std::time::Instant::now(), std::time::SystemTime::now(),
+#      jiff::Timestamp::now(), or jiff::Zoned::now() reads
 #   2. No raw RNG entries (rand::thread_rng, rand::rng(), fastrand::,
 #      getrandom::, OsRng, uuid::Uuid::new_v4) without cfg gating
 #   3. No unbiased tokio::select! (must have `biased;` as first token in block)
 #   4. No raw thread spawning (std::thread::spawn, std::thread::Builder::spawn,
 #      tokio::task::spawn_blocking) without cfg gating
-#   5. No AHashMap / AHashSet in crates/live/src/manager.rs or
-#      crates/execution/src/matching_engine/engine.rs
+#   5. No AHashMap / AHashSet in crates/live/src/execution/manager.rs or
+#      crates/execution/src/matching_engine/mod.rs
 #   6. No direct tokio::net::TcpStream::connect / tokio::net::TcpListener::bind
 #      reaches that bypass the nautilus_network::net seam (the seam swaps to
 #      turmoil::net under the `turmoil` feature)
+#   7. No raw tokio::{time,task,runtime,signal} paths that bypass the madsim
+#      facade on production DST paths
 #
 # Use '// dst-ok' inline comment to allow specific exceptions.
 # Test modules (files under tests/, matching *_tests.rs, or lines inside an
@@ -33,9 +35,9 @@ NC='\033[0m'
 VIOLATIONS=0
 ALLOW_MARKER="dst-ok"
 
-# The 16 in-scope crates per phase3 upstream closure plan.
+# The 17 in-scope crates per phase3 upstream closure plan.
 IN_SCOPE_CRATES=(
-  "analysis" "common" "core" "cryptography" "data" "execution"
+  "analysis" "backtest" "common" "core" "cryptography" "data" "execution"
   "indicators" "live" "model" "network" "persistence" "portfolio"
   "risk" "serialization" "system" "trading"
 )
@@ -70,6 +72,7 @@ is_test_path() {
   local file
   file=$(normalize_path "$1")
   [[ "$file" =~ /tests/ ]] && return 0
+  [[ "$file" =~ /tests\.rs$ ]] && return 0
   [[ "$file" =~ _test\.rs$ ]] && return 0
   [[ "$file" =~ _tests\.rs$ ]] && return 0
   [[ "$file" =~ /python/ ]] && return 0
@@ -132,15 +135,29 @@ file_imports_std_system_time() {
     "$1" 2> /dev/null
 }
 
-# Detect whether a file imports `Utc` from the chrono crate so bare
-# `Utc::now()` calls can be flagged. Covers single, brace-list, and aliased
+# Detect whether a file imports `Timestamp` from Jiff so bare
+# `Timestamp::now()` calls can be flagged. Covers single, brace-list, and aliased
 # forms:
-#   - `use chrono::Utc;`
-#   - `use chrono::{..., Utc, ...};`
-#   - `use chrono::Utc as _;`
-file_imports_chrono_utc() {
-  rg -qU 'use\s+chrono::(Utc\b|\{[^}]*\bUtc\b)' \
+#   - `use jiff::Timestamp;`
+#   - `use jiff::{..., Timestamp, ...};`
+#   - `use jiff::Timestamp as _;`
+file_imports_jiff_timestamp() {
+  rg -qU 'use\s+jiff::(Timestamp\b|\{[^}]*\bTimestamp\b)' \
     "$1" 2> /dev/null
+}
+
+file_imports_jiff_zoned() {
+  rg -qU 'use\s+jiff::(Zoned\b|\{[^}]*\bZoned\b)' \
+    "$1" 2> /dev/null
+}
+
+# Extract aliases such as `use jiff::{Timestamp as Ts, Zoned as Z};` so renamed
+# imports cannot bypass Rule 1.
+jiff_clock_aliases() {
+  rg -oU 'use\s+jiff::[^;]*;' "$1" 2> /dev/null |
+    rg -o '\b(Timestamp|Zoned)[[:space:]]+as[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' 2> /dev/null |
+    sed -E 's/.*[[:space:]]as[[:space:]]+//' |
+    rg -v '^_$' || true
 }
 
 # Return 0 if any of the 15 lines preceding `line_num` in `file` carry a cfg
@@ -205,7 +222,7 @@ while IFS=: read -r file line_num content; do
   check_rule1_hit "$file" "$line_num" "$content"
 done < <(rg -n --no-heading \
   'std::time::Instant::now\(\)|std::time::SystemTime::now\(\)' \
-  "${GLOBS[@]}" --type rust 2> /dev/null || true)
+  "${GLOBS[@]}" --type rust crates 2> /dev/null || true)
 
 # Bare `Instant::now()` counts only when the file imports std::time::Instant.
 while IFS=: read -r file line_num content; do
@@ -215,7 +232,7 @@ while IFS=: read -r file line_num content; do
   check_rule1_hit "$file" "$line_num" "$content"
 done < <(rg -n --no-heading \
   '\bInstant::now\(\)' \
-  "${GLOBS[@]}" --type rust 2> /dev/null || true)
+  "${GLOBS[@]}" --type rust crates 2> /dev/null || true)
 
 # Bare `SystemTime::now()` counts only when the file imports std::time::SystemTime.
 while IFS=: read -r file line_num content; do
@@ -225,23 +242,42 @@ while IFS=: read -r file line_num content; do
   check_rule1_hit "$file" "$line_num" "$content"
 done < <(rg -n --no-heading \
   '\bSystemTime::now\(\)' \
-  "${GLOBS[@]}" --type rust 2> /dev/null || true)
+  "${GLOBS[@]}" --type rust crates 2> /dev/null || true)
 
-# Fully-qualified `chrono::Utc::now()` is always caught.
+# Fully-qualified Jiff wall-clock reads are always caught.
 while IFS=: read -r file line_num content; do
   check_rule1_hit "$file" "$line_num" "$content"
 done < <(rg -n --no-heading \
-  'chrono::Utc::now\(\)' \
-  "${GLOBS[@]}" --type rust 2> /dev/null || true)
+  'jiff::(Timestamp|Zoned)::now\(\)' \
+  "${GLOBS[@]}" --type rust crates 2> /dev/null || true)
 
-# Bare `Utc::now()` counts only when the file imports chrono::Utc.
+# Bare `Timestamp::now()` counts only when the file imports jiff::Timestamp.
 while IFS=: read -r file line_num content; do
   [[ -z "$file" ]] && continue
-  file_imports_chrono_utc "$file" || continue
+  file_imports_jiff_timestamp "$file" || continue
   check_rule1_hit "$file" "$line_num" "$content"
 done < <(rg -n --no-heading \
-  '\bUtc::now\(\)' \
-  "${GLOBS[@]}" --type rust 2> /dev/null || true)
+  '\bTimestamp::now\(\)' \
+  "${GLOBS[@]}" --type rust crates 2> /dev/null || true)
+
+# Bare `Zoned::now()` counts only when the file imports jiff::Zoned.
+while IFS=: read -r file line_num content; do
+  [[ -z "$file" ]] && continue
+  file_imports_jiff_zoned "$file" || continue
+  check_rule1_hit "$file" "$line_num" "$content"
+done < <(rg -n --no-heading \
+  '\bZoned::now\(\)' \
+  "${GLOBS[@]}" --type rust crates 2> /dev/null || true)
+
+# Renamed Timestamp/Zoned imports must not bypass the bare-call checks above.
+while IFS= read -r file; do
+  while IFS= read -r alias; do
+    [[ -z "$alias" ]] && continue
+    while IFS=: read -r hit_file line_num content; do
+      check_rule1_hit "$hit_file" "$line_num" "$content"
+    done < <(rg -n --no-heading "\\b${alias}::now\\(\\)" "$file" 2> /dev/null || true)
+  done < <(jiff_clock_aliases "$file")
+done < <(rg --files "${GLOBS[@]}" --type rust crates 2> /dev/null || true)
 
 ################################################################################
 # Rule 2: raw RNG imports
@@ -262,7 +298,7 @@ while IFS=: read -r file line_num content; do
     "Route RNG through a seeded source; madsim::rand under cfg(madsim)"
 done < <(rg -n --no-heading \
   '(?:^|[^:])rand::thread_rng|(?:^|[^:])rand::rng\(\)|fastrand::|getrandom::|\bOsRng\b|\bUuid::new_v4\(\)' \
-  "${GLOBS[@]}" --type rust 2> /dev/null || true)
+  "${GLOBS[@]}" --type rust crates 2> /dev/null || true)
 
 ################################################################################
 # Rule 3: unbiased tokio::select!
@@ -287,7 +323,7 @@ while IFS=: read -r file line_num content; do
     "Add 'biased;' as the first token inside the select! block"
 done < <(rg -n --no-heading \
   'tokio::select!\s*\{' \
-  "${GLOBS[@]}" --type rust 2> /dev/null || true)
+  "${GLOBS[@]}" --type rust crates 2> /dev/null || true)
 
 ################################################################################
 # Rule 4: raw thread spawning outside cfg(test) and cfg(not(madsim))
@@ -308,20 +344,28 @@ while IFS=: read -r file line_num content; do
     "Wrap the spawn in #[cfg(not(all(feature = \"simulation\", madsim)))] or add '// dst-ok'"
 done < <(rg -n --no-heading \
   'std::thread::spawn\b|std::thread::Builder::new\(\)|tokio::task::spawn_blocking' \
-  "${GLOBS[@]}" --type rust 2> /dev/null || true)
+  "${GLOBS[@]}" --type rust crates 2> /dev/null || true)
 
 ################################################################################
 # Rule 5: AHashMap / AHashSet in reconciliation manager and matching engine
 ################################################################################
 
 RULE5_FILES=(
-  "crates/live/src/manager.rs"
-  "crates/execution/src/matching_engine/engine.rs"
+  "crates/live/src/execution/manager.rs"
+  "crates/execution/src/matching_engine/mod.rs"
 )
 
 for rule5_file in "${RULE5_FILES[@]}"; do
   echo "Checking AHashMap / AHashSet in $rule5_file..."
-  [[ -f "$rule5_file" ]] || continue
+
+  # A missing entry is itself a violation: silently skipping a moved file
+  # disarms the determinism guard (this happened when the reconciliation
+  # manager moved from crates/live/src/manager.rs).
+  if [[ ! -f "$rule5_file" ]]; then
+    report "rule5" "$rule5_file" "0" "(file not found)" \
+      "Update RULE5_FILES to the file's new location"
+    continue
+  fi
 
   while IFS=: read -r file line_num content; do
     [[ -z "$file" ]] && continue
@@ -398,7 +442,7 @@ while IFS=: read -r file line_num content; do
   check_rule6_hit "$file" "$line_num" "$content"
 done < <(rg -n --no-heading \
   'tokio::net::TcpStream::connect\b|tokio::net::TcpListener::bind\b' \
-  "${GLOBS[@]}" --type rust 2> /dev/null || true)
+  "${GLOBS[@]}" --type rust crates 2> /dev/null || true)
 
 # Bare `TcpStream::connect` / `TcpListener::bind` count only when the file
 # pulls in the `tokio::net` module above the call site. The `use` line itself
@@ -410,7 +454,108 @@ while IFS=: read -r file line_num content; do
   check_rule6_hit "$file" "$line_num" "$content"
 done < <(rg -n --no-heading \
   '\bTcpStream::connect\b|\bTcpListener::bind\b' \
-  "${GLOBS[@]}" --type rust 2> /dev/null || true)
+  "${GLOBS[@]}" --type rust crates 2> /dev/null || true)
+
+echo "Checking raw Tokio facade bypasses..."
+
+# Only these crates participate in the madsim build path that imports
+# `nautilus_common::live::dst`. Network and persistence own separate runtime
+# and transport seams, so the four-module facade does not apply to them.
+RULE7_CRATES=(
+  "common" "core" "data" "execution" "live" "portfolio" "risk" "system" "trading"
+)
+RULE7_GLOBS=()
+for c in "${RULE7_CRATES[@]}"; do
+  RULE7_GLOBS+=(--glob "crates/$c/src/**/*.rs")
+done
+
+# The facade and the process-wide real Tokio runtime define the seam and are
+# therefore allowed to name Tokio directly. `testing.rs` is test infrastructure
+# compiled as part of the library rather than production DST behavior.
+RULE7_ALLOWLIST=(
+  "crates/common/src/live/dst.rs"
+  "crates/common/src/live/runtime.rs"
+  "crates/common/src/testing.rs"
+)
+
+is_in_rule7_allowlist() {
+  local file
+  file=$(normalize_path "$1")
+  local entry
+  for entry in "${RULE7_ALLOWLIST[@]}"; do
+    [[ "$file" == "$entry" ]] && return 0
+  done
+  return 1
+}
+
+# Print the start line and normalized text for Tokio use statements that
+# import one of the facade modules, including rustfmt's merged multiline form.
+find_raw_tokio_facade_imports() {
+  awk '
+    function check_statement() {
+      normalized = statement
+      gsub(/[[:space:]]+/, " ", normalized)
+      direct = "tokio::[[:space:]]*(time|task|runtime|signal)(::|[[:space:]]*(;|as[[:space:]]))"
+      merged = "tokio::[[:space:]]*\\{([^;]*[^[:alnum:]_])?(time|task|runtime|signal)([^[:alnum:]_]|$)"
+      if (normalized ~ direct || normalized ~ merged) {
+        print start_line ":" normalized
+      }
+      in_statement = 0
+      statement = ""
+    }
+
+    /^[[:space:]]*(pub[[:space:]]+)?use[[:space:]]+tokio::/ {
+      in_statement = 1
+      start_line = NR
+      statement = $0
+      if ($0 ~ /;/) {
+        check_statement()
+      }
+      next
+    }
+
+    in_statement {
+      statement = statement " " $0
+      if ($0 ~ /;/) {
+        check_statement()
+      }
+    }
+  ' "$1"
+}
+
+while IFS=: read -r file line_num content; do
+  [[ -z "$file" ]] && continue
+  is_test_path "$file" && continue
+  is_in_test_module "$file" "$line_num" && continue
+  is_doc_comment "$content" && continue
+  [[ "$content" =~ $ALLOW_MARKER ]] && continue
+  is_in_rule7_allowlist "$file" && continue
+  [[ "$content" =~ ^[[:space:]]*(pub[[:space:]]+)?use[[:space:]] ]] && continue
+
+  has_preceding_dst_cfg "$file" "$line_num" && continue
+
+  report "rule7" "$file" "$line_num" "$content" \
+    "Route time, task, runtime, and signal calls through nautilus_common::live::dst or cfg-gate the site"
+done < <(rg -n --no-heading \
+  'tokio::(time|task|runtime|signal)::|\btokio::spawn\s*\(' \
+  "${RULE7_GLOBS[@]}" --type rust crates 2> /dev/null || true)
+
+for c in "${RULE7_CRATES[@]}"; do
+  while IFS= read -r file; do
+    while IFS=: read -r line_num content; do
+      [[ -z "$line_num" ]] && continue
+      is_test_path "$file" && continue
+      is_in_test_module "$file" "$line_num" && continue
+      [[ "$content" =~ $ALLOW_MARKER ]] && continue
+      is_in_rule7_allowlist "$file" && continue
+
+      has_preceding_dst_cfg "$file" "$line_num" && continue
+
+      report "rule7" "$file" "$line_num" "$content" \
+        "Import time, task, runtime, and signal through nautilus_common::live::dst or cfg-gate the site"
+    done < <(find_raw_tokio_facade_imports "$file")
+  done < <(rg --files --type rust "crates/$c/src")
+done
 
 ################################################################################
 # Summary

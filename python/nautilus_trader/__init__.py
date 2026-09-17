@@ -13,15 +13,22 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 """
-NautilusTrader (https://nautilustrader.io) is an open-source, production-grade, Rust-native
-engine for multi-asset, multi-venue trading systems.
+Open-source, production-grade, Rust-native engine for multi-asset, multi-venue trading.
 
-The system spans research, deterministic simulation, and live execution within a single
-event-driven architecture, with Python serving as the control plane for strategy logic,
-configuration, and orchestration.
+NautilusTrader (https://nautilustrader.io) spans research, deterministic simulation, and live
+execution within a single event-driven architecture, with Python serving as the control plane
+for strategy logic, configuration, and orchestration.
+
 """
+
+import importlib.metadata as _metadata
 
 from nautilus_trader._libnautilus import *  # noqa: F403 (undefined-local-with-import-star)
 
 
-__version__ = "2.0.0-dev"
+# Derive the version from installed distribution metadata so it always matches the built
+# wheel. `_metadata` is underscore-aliased so the star import above cannot shadow it.
+try:
+    __version__ = _metadata.version("nautilus-trader")
+except _metadata.PackageNotFoundError:  # pragma: no cover
+    __version__ = "unknown"

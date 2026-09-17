@@ -29,12 +29,13 @@ use std::{
     ffi::{CStr, CString, c_char},
 };
 
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use ustr::Ustr;
 
 use crate::{
     ffi::{abort_on_panic, string::cstr_as_str},
-    string::parsing::{min_increment_precision_from_str, precision_from_str},
+    string::parsing::min_increment_precision_from_str,
 };
 
 /// Convert a C bytes pointer into an owned `Vec<String>`.
@@ -97,18 +98,8 @@ pub fn string_vec_to_bytes(strings: &[String]) -> *const c_char {
 /// Panics if `ptr` is not null but contains invalid UTF-8 or JSON.
 #[must_use]
 pub unsafe fn optional_bytes_to_json(ptr: *const c_char) -> Option<HashMap<String, Value>> {
-    if ptr.is_null() {
-        None
-    } else {
-        // SAFETY: Caller guarantees ptr is valid per function contract
-        let c_str = unsafe { CStr::from_ptr(ptr) };
-        let bytes = c_str.to_bytes();
-
-        let json_string = std::str::from_utf8(bytes).expect("C string contains invalid UTF-8");
-        let result = serde_json::from_str(json_string).expect("C string contains invalid JSON");
-
-        Some(result)
-    }
+    // SAFETY: A non-null pointer is valid under the caller's contract
+    unsafe { optional_json_from_cstr(ptr) }
 }
 
 /// Convert a C bytes pointer into an owned `Option<HashMap<Ustr, Ustr>>`.
@@ -122,18 +113,8 @@ pub unsafe fn optional_bytes_to_json(ptr: *const c_char) -> Option<HashMap<Strin
 /// Panics if `ptr` is not null but contains invalid UTF-8 or JSON.
 #[must_use]
 pub unsafe fn optional_bytes_to_str_map(ptr: *const c_char) -> Option<HashMap<Ustr, Ustr>> {
-    if ptr.is_null() {
-        None
-    } else {
-        // SAFETY: Caller guarantees ptr is valid per function contract
-        let c_str = unsafe { CStr::from_ptr(ptr) };
-        let bytes = c_str.to_bytes();
-
-        let json_string = std::str::from_utf8(bytes).expect("C string contains invalid UTF-8");
-        let result = serde_json::from_str(json_string).expect("C string contains invalid JSON");
-
-        Some(result)
-    }
+    // SAFETY: A non-null pointer is valid under the caller's contract
+    unsafe { optional_json_from_cstr(ptr) }
 }
 
 /// Convert a C bytes pointer into an owned `Option<Vec<String>>`.
@@ -147,18 +128,26 @@ pub unsafe fn optional_bytes_to_str_map(ptr: *const c_char) -> Option<HashMap<Us
 /// Panics if `ptr` is not null but contains invalid UTF-8 or JSON.
 #[must_use]
 pub unsafe fn optional_bytes_to_str_vec(ptr: *const c_char) -> Option<Vec<String>> {
+    // SAFETY: A non-null pointer is valid under the caller's contract
+    unsafe { optional_json_from_cstr(ptr) }
+}
+
+/// # Safety
+///
+/// If `ptr` is non-null, it must reference a valid, null-terminated UTF-8 C string that remains
+/// unchanged for the duration of this call.
+unsafe fn optional_json_from_cstr<T>(ptr: *const c_char) -> Option<T>
+where
+    T: DeserializeOwned,
+{
     if ptr.is_null() {
-        None
-    } else {
-        // SAFETY: Caller guarantees ptr is valid per function contract
-        let c_str = unsafe { CStr::from_ptr(ptr) };
-        let bytes = c_str.to_bytes();
-
-        let json_string = std::str::from_utf8(bytes).expect("C string contains invalid UTF-8");
-        let result = serde_json::from_str(json_string).expect("C string contains invalid JSON");
-
-        Some(result)
+        return None;
     }
+
+    // SAFETY: A non-null pointer is valid under the caller's contract
+    let json = unsafe { cstr_as_str(ptr) };
+    let result = serde_json::from_str(json).expect("C string contains invalid JSON");
+    Some(result)
 }
 
 /// Return the decimal precision inferred from the given C string.
@@ -176,7 +165,7 @@ pub unsafe extern "C" fn precision_from_cstr(ptr: *const c_char) -> u8 {
         assert!(!ptr.is_null(), "`ptr` was NULL");
         // SAFETY: Caller guarantees ptr is valid per function contract
         let s = unsafe { cstr_as_str(ptr) };
-        precision_from_str(s)
+        precision_from_v1_str(s)
     })
 }
 
@@ -196,6 +185,37 @@ pub unsafe extern "C" fn min_increment_precision_from_cstr(ptr: *const c_char) -
         // SAFETY: Caller guarantees ptr is valid per function contract
         let s = unsafe { cstr_as_str(ptr) };
         min_increment_precision_from_str(s)
+    })
+}
+
+// TODO: Remove this temporary parser when v1 drops its legacy source-text precision contract
+fn precision_from_v1_str(value: &str) -> u8 {
+    let value = value.trim().to_ascii_lowercase();
+
+    if value.contains("e-") {
+        let exponent = value
+            .split("e-")
+            .nth(1)
+            .expect("Invalid scientific notation format: missing exponent after 'e-'");
+
+        if let Ok(exponent) = exponent.parse::<u64>() {
+            return u8::try_from(exponent).unwrap_or(u8::MAX);
+        }
+
+        assert!(
+            !exponent.is_empty(),
+            "Invalid scientific notation format: missing exponent after 'e-'"
+        );
+
+        if exponent.chars().all(|c| c.is_ascii_digit()) {
+            return u8::MAX;
+        }
+
+        panic!("Invalid scientific notation exponent '{exponent}': must be a valid number");
+    }
+
+    value.split_once('.').map_or(0, |(_, decimal)| {
+        u8::try_from(decimal.len()).unwrap_or(u8::MAX)
     })
 }
 
@@ -287,6 +307,31 @@ mod tests {
     }
 
     #[rstest]
+    fn test_optional_bytes_to_str_map_valid() {
+        let json_str = CString::new(r#"{"key1": "value1", "key2": "value2"}"#).unwrap();
+        let ptr = json_str.as_ptr().cast::<c_char>();
+        let result = unsafe { optional_bytes_to_str_map(ptr) };
+        let expected_map = HashMap::from([
+            (Ustr::from("key1"), Ustr::from("value1")),
+            (Ustr::from("key2"), Ustr::from("value2")),
+        ]);
+        assert_eq!(result, Some(expected_map));
+    }
+
+    #[rstest]
+    fn test_optional_bytes_to_str_vec_valid() {
+        let json_str = CString::new(r#"["value1", "value2", "value3"]"#).unwrap();
+        let ptr = json_str.as_ptr().cast::<c_char>();
+        let result = unsafe { optional_bytes_to_str_vec(ptr) };
+        let expected_vec = vec![
+            "value1".to_string(),
+            "value2".to_string(),
+            "value3".to_string(),
+        ];
+        assert_eq!(result, Some(expected_vec));
+    }
+
+    #[rstest]
     #[should_panic(expected = "C string contains invalid JSON")]
     fn test_optional_bytes_to_json_invalid() {
         let json_str = CString::new(r#"{"key1": "value1", "key2": }"#).unwrap();
@@ -299,6 +344,8 @@ mod tests {
     #[case("123", 0)]
     #[case("123.45", 2)]
     #[case("123.456789", 6)]
+    #[case("2.5e4", 3)]
+    #[case("7.89E1", 4)]
     #[case("1.23456789e-2", 2)]
     #[case("1.23456789e-12", 12)]
     fn test_precision_from_cstr(#[case] input: &str, #[case] expected: u8) {

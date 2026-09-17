@@ -37,7 +37,7 @@ release_verification_failure_is_retryable() {
 
   retryable_terms="invalid log entry|checkpoint|signature[[:space:]]+not[[:space:]]+found|rekor|tuf|sigstore|consisten|transparency[[:space:]]+log|inclusion"
   retryable_terms="${retryable_terms}|timeout|timed out|connection reset|connection refused|temporarily unavailable|too many requests|rate limit"
-  retryable_terms="${retryable_terms}|failed to fetch|could not fetch|service unavailable|internal server error|HTTP[[:space:]]+(429|5[0-9][0-9])|status[[:space:]]+(429|5[0-9][0-9])"
+  retryable_terms="${retryable_terms}|failed to fetch|could not fetch|service unavailable|internal server error|HTTP[[:space:]]+(404|429|5[0-9][0-9])|status[[:space:]]+(404|429|5[0-9][0-9])|returned error:[[:space:]]+404"
   grep -Eiq "$retryable_terms" "$output_file"
 }
 
@@ -56,10 +56,11 @@ run_release_verification_with_retry() {
   output_file="$(mktemp "${TMPDIR:-/tmp}/release-verification.XXXXXX")"
 
   local attempt delay_seconds status
+  attempt=1
   delay_seconds="$initial_delay_seconds"
   status=0
 
-  for attempt in $(seq 1 "$attempts"); do
+  while [[ "$attempt" -le "$attempts" ]]; do
     : > "$output_file"
 
     if "$@" > "$output_file" 2>&1; then
@@ -90,6 +91,8 @@ run_release_verification_with_retry() {
         delay_seconds="$max_delay_seconds"
       fi
     fi
+
+    attempt=$((attempt + 1))
   done
 
   cat "$output_file" >&2

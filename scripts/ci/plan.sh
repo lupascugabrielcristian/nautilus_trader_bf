@@ -5,7 +5,7 @@ set -euo pipefail
 #
 # Outputs (to $GITHUB_OUTPUT):
 #   run_tests       - true if any non-docs code changed
-#   run_rust_tests  - true if Rust/Cython code changed
+#   run_rust_tests  - true if Rust code changed
 #
 # Required env vars:
 #   EVENT_NAME   - github.event_name (push or pull_request)
@@ -57,7 +57,8 @@ else
   # the merge-base against the current base branch head so the diff reflects
   # only what this PR actually changes relative to where it will land.
   if [[ -z "${BASE_REF:-}" ]]; then
-    run_all "BASE_REF not set: running all jobs"
+    echo "::error::BASE_REF is required for pull_request events" >&2
+    exit 1
   fi
   if ! merge_base="$(git merge-base "origin/${BASE_REF}" HEAD 2> /dev/null)"; then
     run_all "Failed to compute merge-base against origin/${BASE_REF}: running all jobs"
@@ -83,8 +84,8 @@ while IFS= read -r file; do
     continue
   fi
   code_changed=1
-  # Rust, Cython, cargo config, or build infrastructure means full Rust tests
-  [[ "$file" =~ \.(rs|pyx|pxd)$ ]] && rust_changed=1
+  # Rust, Cargo config, or build infrastructure means full Rust tests
+  [[ "$file" =~ \.rs$ ]] && rust_changed=1
   [[ "$file" =~ Cargo\.(toml|lock)$ ]] && rust_changed=1
   [[ "$file" == "rust-toolchain.toml" ]] && rust_changed=1
   [[ "$file" =~ ^\.cargo/ ]] && rust_changed=1
@@ -100,7 +101,7 @@ if [[ $code_changed -eq 0 ]]; then
 elif [[ $rust_changed -eq 1 ]]; then
   echo "run_tests=true" >> "$GITHUB_OUTPUT"
   echo "run_rust_tests=true" >> "$GITHUB_OUTPUT"
-  echo "Rust/Cython changes detected: running all jobs"
+  echo "Rust changes detected: running all jobs"
 else
   echo "run_tests=true" >> "$GITHUB_OUTPUT"
   echo "run_rust_tests=false" >> "$GITHUB_OUTPUT"

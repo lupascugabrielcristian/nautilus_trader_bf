@@ -14,9 +14,12 @@
 // -------------------------------------------------------------------------------------------------
 
 use ahash::{AHashMap, AHashSet};
-use nautilus_model::identifiers::{
-    AccountId, ClientId, ClientOrderId, ComponentId, ExecAlgorithmId, InstrumentId, PositionId,
-    StrategyId, Venue, VenueOrderId,
+use nautilus_model::{
+    enums::OmsType,
+    identifiers::{
+        AccountId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, PositionId, StrategyId,
+        Venue, VenueOrderId,
+    },
 };
 
 /// A key-value lookup index for a `Cache`.
@@ -31,6 +34,7 @@ pub(super) struct CacheIndex {
     pub(crate) order_strategy: AHashMap<ClientOrderId, StrategyId>,
     pub(crate) order_client: AHashMap<ClientOrderId, ClientId>,
     pub(crate) position_strategy: AHashMap<PositionId, StrategyId>,
+    pub(crate) position_oms: AHashMap<PositionId, OmsType>,
     pub(crate) position_orders: AHashMap<PositionId, AHashSet<ClientOrderId>>,
     pub(crate) instrument_orders: AHashMap<InstrumentId, AHashSet<ClientOrderId>>,
     pub(crate) instrument_positions: AHashMap<InstrumentId, AHashSet<PositionId>>,
@@ -50,7 +54,6 @@ pub(super) struct CacheIndex {
     pub(crate) positions: AHashSet<PositionId>,
     pub(crate) positions_open: AHashSet<PositionId>,
     pub(crate) positions_closed: AHashSet<PositionId>,
-    pub(crate) actors: AHashSet<ComponentId>,
     pub(crate) strategies: AHashSet<StrategyId>,
     pub(crate) exec_algorithms: AHashSet<ExecAlgorithmId>,
 }
@@ -68,6 +71,7 @@ impl Default for CacheIndex {
             order_strategy: AHashMap::new(),
             order_client: AHashMap::new(),
             position_strategy: AHashMap::new(),
+            position_oms: AHashMap::new(),
             position_orders: AHashMap::new(),
             instrument_orders: AHashMap::new(),
             instrument_positions: AHashMap::new(),
@@ -87,7 +91,6 @@ impl Default for CacheIndex {
             positions: AHashSet::new(),
             positions_open: AHashSet::new(),
             positions_closed: AHashSet::new(),
-            actors: AHashSet::new(),
             strategies: AHashSet::new(),
             exec_algorithms: AHashSet::new(),
         }
@@ -106,6 +109,7 @@ impl CacheIndex {
         self.order_strategy.clear();
         self.order_client.clear();
         self.position_strategy.clear();
+        self.position_oms.clear();
         self.position_orders.clear();
         self.instrument_orders.clear();
         self.instrument_positions.clear();
@@ -125,7 +129,6 @@ impl CacheIndex {
         self.positions.clear();
         self.positions_open.clear();
         self.positions_closed.clear();
-        self.actors.clear();
         self.strategies.clear();
         self.exec_algorithms.clear();
     }

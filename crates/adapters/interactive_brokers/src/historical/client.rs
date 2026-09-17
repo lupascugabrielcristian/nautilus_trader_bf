@@ -18,12 +18,13 @@
 use std::{fmt::Debug, str::FromStr, sync::Arc};
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
 use ibapi::{
     client::Client,
-    contracts::Contract,
+    contracts::{Contract, SecurityType},
     market_data::{IgnoreSize, TradingHours, historical},
+    prelude::{StreamExt, SubscriptionItemStreamExt},
 };
+use jiff::Timestamp;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{Bar, BarSpecification, BarType, Data, QuoteTick, TradeTick},
@@ -40,9 +41,9 @@ use crate::{
     },
     config::InteractiveBrokersDataClientConfig,
     data::convert::{
-        apply_bar_price_magnifier, apply_price_magnifier, bar_type_to_ib_bar_size,
-        chrono_to_ib_datetime, ib_bar_to_nautilus_bar, ib_timestamp_to_unix_nanos,
-        price_type_to_ib_what_to_show,
+        apply_bar_price_magnifier, apply_price_magnifier, bar_request_segments,
+        bar_type_to_ib_bar_size, ib_bar_to_nautilus_bar, ib_timestamp_to_unix_nanos,
+        jiff_to_ib_datetime, price_type_to_ib_what_to_show_for_security,
     },
     providers::instruments::InteractiveBrokersInstrumentProvider,
 };
@@ -54,9 +55,15 @@ use crate::{
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.interactive_brokers",
+        module = "nautilus_trader.adapters.interactive_brokers",
         subclass,
         from_py_object
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(
+        module = "nautilus_trader.adapters.interactive_brokers"
     )
 )]
 pub struct HistoricalInteractiveBrokersClient {
@@ -190,6 +197,15 @@ impl HistoricalInteractiveBrokersClient {
 
     /// Request historical bars.
     ///
+    /// # Continuous futures
+    ///
+    /// Continuous futures (`CONTFUT`) reject an explicit end date/time with IB
+    /// error 10339. For these contracts the end date is dropped and only the
+    /// first duration segment is requested, anchored to the current time, so
+    /// the returned bars may fall outside `[start_date_time, end_date_time]`.
+    /// A warning is logged when the requested end date/time is in the past or
+    /// the range spans more than one duration segment.
+    ///
     /// # Arguments
     ///
     /// * `bar_specifications` - List of bar specifications (e.g., "1-HOUR-LAST")
@@ -208,8 +224,8 @@ impl HistoricalInteractiveBrokersClient {
     pub async fn request_bars(
         &self,
         bar_specifications: Vec<&str>,
-        end_date_time: DateTime<Utc>,
-        start_date_time: Option<DateTime<Utc>>,
+        end_date_time: Timestamp,
+        start_date_time: Option<Timestamp>,
         duration: Option<&str>,
         contracts: Option<Vec<Contract>>,
         instrument_ids: Option<Vec<InstrumentId>>,
@@ -351,30 +367,42 @@ impl HistoricalInteractiveBrokersClient {
                 let bar_type_with_id =
                     BarType::new(instrument_id, bar_spec, AggregationSource::External);
 
-                // Convert bar type to IB parameters
+                // Convert bar type to IB parameters. Crypto trade-price bars must
+                // request AGGTRADES, not TRADES (TWS rejects TRADES for crypto,
+                // error 10299) - same rule as the live data client's historical path.
                 let ib_bar_size = bar_type_to_ib_bar_size(&bar_type_with_id)?;
-                let ib_what_to_show = price_type_to_ib_what_to_show(bar_spec.price_type);
+                let is_crypto = crate::common::parse::is_crypto_contract(&contract);
+                let ib_what_to_show =
+                    price_type_to_ib_what_to_show_for_security(bar_spec.price_type, is_crypto);
 
-                // Calculate duration segments
-                let segments =
-                    self.calculate_duration_segments(start_date_time, end_date_time, duration);
+                // Omit the end date for continuous futures (IB error 10339).
+                let is_continuous_future = contract.security_type == SecurityType::ContinuousFuture;
+                let segments = bar_request_segments(
+                    self.calculate_duration_segments(start_date_time, end_date_time, duration),
+                    is_continuous_future,
+                );
 
                 for (segment_end, segment_duration) in segments {
-                    tracing::info!(
-                        "Requesting historical bars ending on {} with duration {}",
+                    tracing::debug!(
+                        "Requesting historical bars ending on {:?} with duration {}",
                         segment_end,
                         segment_duration
                     );
 
+                    let mut request = self
+                        .ib_client
+                        .historical_data(&contract, ib_bar_size)
+                        .duration(segment_duration)
+                        .what_to_show(ib_what_to_show)
+                        .trading_hours(trading_hours);
+
+                    if let Some(end) = segment_end {
+                        request = request.ending(jiff_to_ib_datetime(&end));
+                    }
+
                     let historical_data = tokio::time::timeout(
                         std::time::Duration::from_secs(timeout),
-                        self.ib_client
-                            .historical_data(&contract, ib_bar_size)
-                            .ending(chrono_to_ib_datetime(&segment_end))
-                            .duration(segment_duration)
-                            .what_to_show(ib_what_to_show)
-                            .trading_hours(trading_hours)
-                            .fetch(),
+                        request.fetch(),
                     )
                     .await
                     .context(format!(
@@ -404,7 +432,7 @@ impl HistoricalInteractiveBrokersClient {
                         all_bars.push(nautilus_bar);
                     }
 
-                    tracing::info!("Retrieved {} bars in batch", historical_data.bars.len());
+                    tracing::debug!("Retrieved {} bars in batch", historical_data.bars.len());
                 }
             }
         }
@@ -435,8 +463,8 @@ impl HistoricalInteractiveBrokersClient {
     pub async fn request_ticks(
         &self,
         tick_type: IbHistoricalTickType,
-        start_date_time: DateTime<Utc>,
-        end_date_time: DateTime<Utc>,
+        start_date_time: Timestamp,
+        end_date_time: Timestamp,
         contracts: Option<Vec<Contract>>,
         instrument_ids: Option<Vec<InstrumentId>>,
         use_rth: bool,
@@ -449,7 +477,7 @@ impl HistoricalInteractiveBrokersClient {
 
         let limit = (limit > 0).then_some(limit);
 
-        if end_date_time.signed_duration_since(start_date_time) > chrono::Duration::days(1) {
+        if end_date_time.duration_since(start_date_time) > jiff::SignedDuration::from_hours(24) {
             tracing::warn!(
                 "Requesting tick data for more than 1 day may take a long time, particularly for liquid instruments"
             );
@@ -541,29 +569,21 @@ impl HistoricalInteractiveBrokersClient {
             // Pagination loop for ticks (similar to Python _handle_timestamp_iteration)
             let mut current_end_date = end_date_time;
             let current_start_date = start_date_time;
-            let start_date_time_ns = UnixNanos::from(
-                start_date_time
-                    .timestamp_nanos_opt()
-                    .unwrap_or_else(|| start_date_time.timestamp() * 1_000_000_000)
-                    as u64,
-            );
-            let end_date_time_ns = UnixNanos::from(
-                end_date_time
-                    .timestamp_nanos_opt()
-                    .unwrap_or_else(|| end_date_time.timestamp() * 1_000_000_000)
-                    as u64,
-            );
+            let start_date_time_ns =
+                UnixNanos::from(u64::try_from(start_date_time.as_nanosecond()).unwrap_or_default());
+            let end_date_time_ns =
+                UnixNanos::from(u64::try_from(end_date_time.as_nanosecond()).unwrap_or_default());
 
             match tick_type {
                 IbHistoricalTickType::Trades => {
                     loop {
                         // Make request for this batch
-                        let mut subscription = tokio::time::timeout(
+                        let subscription = tokio::time::timeout(
                             std::time::Duration::from_secs(timeout),
                             self.ib_client
                                 .historical_ticks(&contract, 1000)
-                                .starting(chrono_to_ib_datetime(&current_start_date))
-                                .ending(chrono_to_ib_datetime(&current_end_date))
+                                .starting(jiff_to_ib_datetime(&current_start_date))
+                                .ending(jiff_to_ib_datetime(&current_end_date))
                                 .trading_hours(trading_hours)
                                 .trade(),
                         )
@@ -573,9 +593,17 @@ impl HistoricalInteractiveBrokersClient {
                             timeout
                         ))??;
 
+                        let mut subscription = subscription.filter_data();
                         let mut batch_ticks = Vec::new();
 
-                        while let Some(tick) = subscription.next().await {
+                        while let Some(tick_result) = subscription.next().await {
+                            let tick = match tick_result {
+                                Ok(tick) => tick,
+                                Err(e) => {
+                                    tracing::warn!("Historical trade ticks stream error: {e:?}");
+                                    continue;
+                                }
+                            };
                             let ts_event = ib_timestamp_to_unix_nanos(&tick.timestamp);
 
                             if ts_event < start_date_time_ns || ts_event > end_date_time_ns {
@@ -659,12 +687,12 @@ impl HistoricalInteractiveBrokersClient {
                 IbHistoricalTickType::BidAsk => {
                     loop {
                         // Make request for this batch
-                        let mut subscription = tokio::time::timeout(
+                        let subscription = tokio::time::timeout(
                             std::time::Duration::from_secs(timeout),
                             self.ib_client
                                 .historical_ticks(&contract, 1000)
-                                .starting(chrono_to_ib_datetime(&current_start_date))
-                                .ending(chrono_to_ib_datetime(&current_end_date))
+                                .starting(jiff_to_ib_datetime(&current_start_date))
+                                .ending(jiff_to_ib_datetime(&current_end_date))
                                 .trading_hours(trading_hours)
                                 .bid_ask(IgnoreSize::No),
                         )
@@ -674,9 +702,17 @@ impl HistoricalInteractiveBrokersClient {
                             timeout
                         ))??;
 
+                        let mut subscription = subscription.filter_data();
                         let mut batch_ticks = Vec::new();
 
-                        while let Some(tick) = subscription.next().await {
+                        while let Some(tick_result) = subscription.next().await {
+                            let tick = match tick_result {
+                                Ok(tick) => tick,
+                                Err(e) => {
+                                    tracing::warn!("Historical bid/ask ticks stream error: {e:?}");
+                                    continue;
+                                }
+                            };
                             let ts_event = ib_timestamp_to_unix_nanos(&tick.timestamp);
 
                             if ts_event < start_date_time_ns || ts_event > end_date_time_ns {
@@ -878,7 +914,7 @@ impl HistoricalInteractiveBrokersClient {
 
                 // Fetch if not cached (matching Python: if not self._client._cache.instrument(instrument_id))
                 if self.instrument_provider.find(&instrument_id).is_none() {
-                    tracing::info!("Fetching Instrument for: {}", instrument_id);
+                    tracing::debug!("Fetching Instrument for: {}", instrument_id);
 
                     if let Err(e) = self
                         .instrument_provider
@@ -911,7 +947,7 @@ impl HistoricalInteractiveBrokersClient {
             }
         }
 
-        tracing::info!("Loaded {} instruments", loaded_instruments.len());
+        tracing::debug!("Loaded {} instruments", loaded_instruments.len());
 
         Ok(loaded_instruments)
     }
@@ -931,10 +967,10 @@ impl HistoricalInteractiveBrokersClient {
     /// Returns a list of (end_date, duration) tuples.
     fn calculate_duration_segments(
         &self,
-        start_date: Option<DateTime<Utc>>,
-        end_date: DateTime<Utc>,
+        start_date: Option<Timestamp>,
+        end_date: Timestamp,
         duration: Option<&str>,
-    ) -> Vec<(DateTime<Utc>, historical::Duration)> {
+    ) -> Vec<(Timestamp, historical::Duration)> {
         // If duration is specified, use it directly
         if let Some(dur_str) = duration {
             if let Ok(dur) = dur_str.parse::<historical::Duration>() {
@@ -946,45 +982,45 @@ impl HistoricalInteractiveBrokersClient {
 
         // Calculate from start/end dates - matching Python's comprehensive breakdown
         if let Some(start) = start_date {
-            let total_delta = end_date.signed_duration_since(start);
-            let total_days = total_delta.num_days();
+            let total_delta = end_date.duration_since(start);
+            let total_days = total_delta.as_secs() / (24 * 60 * 60);
 
             let mut segments = Vec::new();
 
             // Calculate full years in the time delta (matching Python: years = total_delta.days // 365)
             let years = total_days / 365;
             let minus_years_date = if years > 0 {
-                end_date - chrono::Duration::days(365 * years)
+                end_date - jiff::SignedDuration::from_hours(24 * (365 * years))
             } else {
                 end_date
             };
 
             // Calculate remaining days after subtracting full years (matching Python logic)
             let days = if years > 0 {
-                let remaining_delta = minus_years_date.signed_duration_since(start);
-                remaining_delta.num_days()
+                let remaining_delta = minus_years_date.duration_since(start);
+                remaining_delta.as_secs() / (24 * 60 * 60)
             } else {
                 total_days
             };
 
             let minus_days_date = if days > 0 {
-                minus_years_date - chrono::Duration::days(days)
+                minus_years_date - jiff::SignedDuration::from_hours(24 * (days))
             } else {
                 minus_years_date
             };
 
             // Calculate remaining time in seconds after subtracting years and days
             // Matching Python: hours*3600 + minutes*60 + seconds + subsecond
-            let remaining_delta = minus_days_date.signed_duration_since(start);
+            let remaining_delta = minus_days_date.duration_since(start);
             // Extract time components from the remaining delta
-            let total_secs = remaining_delta.num_seconds();
+            let total_secs = remaining_delta.as_secs();
             let hours = total_secs / 3600;
             let minutes = (total_secs % 3600) / 60;
             let secs = total_secs % 60;
             // Check for subsecond precision (milliseconds, microseconds, nanoseconds)
-            let subsecond = if remaining_delta.num_milliseconds() % 1000 > 0
-                || remaining_delta.num_microseconds().unwrap_or(0) % 1000 > 0
-                || remaining_delta.num_nanoseconds().unwrap_or(0) % 1000 > 0
+            let subsecond = if remaining_delta.as_millis() % 1000 > 0
+                || remaining_delta.as_micros() % 1000 > 0
+                || remaining_delta.as_nanos() % 1000 > 0
             {
                 1
             } else {
@@ -1060,23 +1096,21 @@ impl HistoricalInteractiveBrokersClient {
     }
 }
 
-fn retreat_end_datetime(min_ts_nanos: u64) -> Option<DateTime<Utc>> {
+fn retreat_end_datetime(min_ts_nanos: u64) -> Option<Timestamp> {
     let new_end_nanos = min_ts_nanos.saturating_sub(1_000_000); // 1ms
-    let seconds = (new_end_nanos / 1_000_000_000) as i64;
-    let nanos = (new_end_nanos % 1_000_000_000) as u32;
-    chrono::DateTime::from_timestamp(seconds, nanos)
+    Timestamp::from_nanosecond(i128::from(new_end_nanos)).ok()
 }
 
 fn should_continue_backward_pagination(
-    current_end_date: DateTime<Utc>,
-    current_start_date: DateTime<Utc>,
+    current_end_date: Timestamp,
+    current_start_date: Timestamp,
 ) -> bool {
     current_end_date > current_start_date
 }
 
 #[cfg(test)]
 mod tests {
-    use chrono::{TimeZone, Utc};
+    use jiff::Timestamp;
     use rstest::rstest;
 
     use super::{retreat_end_datetime, should_continue_backward_pagination};
@@ -1086,7 +1120,7 @@ mod tests {
         let ts_nanos = 1_700_000_000_123_456_789_u64;
         let result = retreat_end_datetime(ts_nanos).unwrap();
         assert_eq!(
-            result.timestamp_nanos_opt().unwrap() as u64,
+            u64::try_from(result.as_nanosecond()).unwrap(),
             ts_nanos - 1_000_000
         );
     }
@@ -1094,19 +1128,19 @@ mod tests {
     #[rstest]
     fn test_retreat_end_datetime_saturates_at_zero() {
         let result = retreat_end_datetime(500_000).unwrap();
-        assert_eq!(result.timestamp_nanos_opt().unwrap(), 0);
+        assert_eq!(result.as_nanosecond(), 0);
     }
 
     #[rstest]
     fn test_should_continue_backward_pagination_true_when_end_after_start() {
-        let start = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
-        let end = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 1).unwrap();
+        let start = "2025-01-01T00:00:00Z".parse::<Timestamp>().unwrap();
+        let end = "2025-01-01T00:00:01Z".parse::<Timestamp>().unwrap();
         assert!(should_continue_backward_pagination(end, start));
     }
 
     #[rstest]
     fn test_should_continue_backward_pagination_false_when_end_equal_start() {
-        let start = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let start = "2025-01-01T00:00:00Z".parse::<Timestamp>().unwrap();
         assert!(!should_continue_backward_pagination(start, start));
     }
 }

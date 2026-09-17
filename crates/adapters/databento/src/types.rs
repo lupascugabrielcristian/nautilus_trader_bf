@@ -48,10 +48,7 @@ pub type Dataset = Ustr;
 /// Represents a Databento publisher.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.databento",
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.adapters.databento", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -75,10 +72,7 @@ pub struct DatabentoPublisher {
 /// excluding `publisher_id` and `instrument_id`.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.databento",
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.adapters.databento", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -98,8 +92,9 @@ pub struct DatabentoImbalance {
     pub paired_qty: Quantity,
     // The quantity of shares which are not paired at `ref_price`.
     pub total_imbalance_qty: Quantity,
-    // The market side of the `total_imbalance_qty` (can be `NO_ORDER_SIDE`).
-    pub side: OrderSide,
+    // The market side of the `total_imbalance_qty`.
+    #[serde(with = "nautilus_model::enums::serde_option_order_side")]
+    pub side: Option<OrderSide>,
     // A venue-specific character code. For Nasdaq, contains the raw Price Variation Indicator.
     pub significant_imbalance: c_char,
     // UNIX timestamp (nanoseconds) when the data event occurred.
@@ -135,7 +130,7 @@ impl DatabentoImbalance {
         auct_interest_clr_price: Price,
         paired_qty: Quantity,
         total_imbalance_qty: Quantity,
-        side: OrderSide,
+        side: Option<OrderSide>,
         significant_imbalance: c_char,
         ts_event: UnixNanos,
         ts_recv: UnixNanos,
@@ -213,10 +208,7 @@ impl CustomDataTrait for DatabentoImbalance {
 /// excluding `publisher_id` and `instrument_id`.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.databento",
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.adapters.databento", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",

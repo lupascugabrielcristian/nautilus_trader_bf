@@ -15,7 +15,6 @@
 
 //! Python bindings for Interactive Brokers factory types.
 
-use nautilus_model::identifiers::{AccountId, TraderId};
 use pyo3::prelude::*;
 
 use crate::{
@@ -24,6 +23,7 @@ use crate::{
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl InteractiveBrokersDataClientFactory {
     /// Factory for creating Interactive Brokers data clients.
     #[new]
@@ -38,11 +38,12 @@ impl InteractiveBrokersDataClientFactory {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl InteractiveBrokersExecutionClientFactory {
     /// Factory for creating Interactive Brokers execution clients.
     #[new]
-    fn py_new(trader_id: TraderId, account_id: AccountId) -> Self {
-        Self::new(trader_id, account_id)
+    fn py_new() -> Self {
+        Self::new()
     }
 
     #[pyo3(name = "name")]

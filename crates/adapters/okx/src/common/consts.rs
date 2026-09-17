@@ -24,7 +24,7 @@ use nautilus_model::{
 };
 use ustr::Ustr;
 
-use super::enums::OKXInstrumentType;
+use super::enums::{OKXBookChannel, OKXInstrumentType, OKXVipLevel};
 
 /// Venue identifier string.
 pub const OKX: &str = "OKX";
@@ -37,6 +37,18 @@ pub static OKX_CLIENT_ID: LazyLock<ClientId> = LazyLock::new(|| ClientId::new(Us
 
 /// See <https://www.okx.com/docs-v5/en/#overview-broker-program> for further details.
 pub const OKX_NAUTILUS_BROKER_ID: &str = "5328c82e5542BCDE";
+
+/// Default lookback for terminal orders and fills during reconciliation.
+///
+/// Active orders and current positions are requested independently of this window. The three-day
+/// default matches the retention of `GET /api/v5/trade/fills`.
+pub const OKX_RECONCILIATION_LOOKBACK_DEFAULT_MINS: u64 = 3 * 24 * 60;
+
+/// Maximum lookback for terminal orders and fills during reconciliation.
+///
+/// Seven days is the longest complete window across the regular order history and spread trade
+/// history endpoints used for reconciliation.
+pub const OKX_RECONCILIATION_LOOKBACK_MAX_MINS: u64 = 7 * 24 * 60;
 
 // Use the canonical host with www to avoid cross-domain redirects which may
 // strip authentication headers in some HTTP clients and middleboxes.
@@ -149,9 +161,12 @@ pub const OKX_ADVANCE_ALGO_ORDER_TYPES: &[OrderType] = &[OrderType::TrailingStop
 
 /// OKX error codes that should trigger retries.
 ///
-/// Only retry on temporary network/system issues. `50004` ("request
-/// timeout, outcome unknown") is safe because every order/cancel/amend
-/// path sends `clOrdId` and OKX rejects duplicates with `51000`.
+/// Only retry on temporary network/system issues. Retries never apply to
+/// order submission POSTs: OKX rejects a duplicate `clOrdId` only while the
+/// first order rests open, so a submit whose response was lost can already
+/// have filled, and retrying could place a second live order. Submits are
+/// sent once, and an ambiguous outcome resolves through stream updates and
+/// reconciliation.
 ///
 /// # References
 ///
@@ -182,6 +197,9 @@ pub static OKX_RETRY_ERROR_CODES: LazyLock<AHashSet<&'static str>> = LazyLock::n
 pub fn should_retry_error_code(error_code: &str) -> bool {
     OKX_RETRY_ERROR_CODES.contains(error_code)
 }
+
+/// OKX error code returned when an order request timed out and the outcome is unknown.
+pub const OKX_ORDER_REQUEST_TIMEOUT_CODE: &str = "51149";
 
 /// OKX error code returned when a post-only order would immediately take liquidity.
 pub const OKX_POST_ONLY_ERROR_CODE: &str = "51019";
@@ -254,11 +272,36 @@ pub fn resolve_book_depth(raw_depth: usize) -> usize {
     }
 }
 
+pub(crate) fn select_book_channel(depth: usize, vip: OKXVipLevel) -> OKXBookChannel {
+    match depth {
+        50 if vip >= OKXVipLevel::Vip4 => OKXBookChannel::Books50L2Tbt,
+        0 | 400 if vip >= OKXVipLevel::Vip5 => OKXBookChannel::BookL2Tbt,
+        0 | 50 | 400 => OKXBookChannel::Book,
+        _ => unreachable!("book depth must be resolved before channel selection"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case::auto_default(0, OKXVipLevel::Vip0, OKXBookChannel::Book)]
+    #[case::auto_vip4(0, OKXVipLevel::Vip4, OKXBookChannel::Book)]
+    #[case::auto_vip5(0, OKXVipLevel::Vip5, OKXBookChannel::BookL2Tbt)]
+    #[case::depth_50_vip3(50, OKXVipLevel::Vip3, OKXBookChannel::Book)]
+    #[case::depth_50_vip4(50, OKXVipLevel::Vip4, OKXBookChannel::Books50L2Tbt)]
+    #[case::depth_400_vip4(400, OKXVipLevel::Vip4, OKXBookChannel::Book)]
+    #[case::depth_400_vip5(400, OKXVipLevel::Vip5, OKXBookChannel::BookL2Tbt)]
+    fn test_select_book_channel(
+        #[case] depth: usize,
+        #[case] vip: OKXVipLevel,
+        #[case] expected: OKXBookChannel,
+    ) {
+        assert_eq!(select_book_channel(depth, vip), expected);
+    }
 
     #[rstest]
     #[case("54084", true)]

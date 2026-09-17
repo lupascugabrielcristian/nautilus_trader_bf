@@ -45,7 +45,8 @@ python = [
 turmoil = ["dep:turmoil", "nautilus-network/turmoil"]
 
 [package.metadata.docs.rs]
-features = ["python"]
+# Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
+features = ["hypersync", "turmoil"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -62,6 +63,7 @@ alloy = { workspace = true }
 anyhow = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
+aws-lc-rs = { workspace = true }
 bon = { workspace = true }
 bytes = { workspace = true }
 dotenvy = { workspace = true }
@@ -78,6 +80,7 @@ tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tokio-util = { workspace = true }
 ustr = { workspace = true }
+zeroize = { workspace = true }
 
 hypersync-client = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true }
@@ -85,6 +88,9 @@ pyo3-stub-gen = { workspace = true, optional = true }
 turmoil = { workspace = true, optional = true }
 
 [dev-dependencies]
+nautilus-trading = { workspace = true }
+
+axum = { workspace = true }
 rstest = { workspace = true }
 toml = { workspace = true }
 turmoil = { workspace = true }

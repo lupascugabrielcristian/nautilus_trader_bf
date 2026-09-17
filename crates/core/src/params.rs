@@ -53,7 +53,7 @@ impl Params {
     /// Returns `None` if the key is missing or the value cannot be converted to `u64`.
     #[must_use]
     pub fn get_u64(&self, key: &str) -> Option<u64> {
-        self.get(key).and_then(|v| v.as_u64())
+        self.get(key).and_then(Value::as_u64)
     }
 
     /// Extracts an `i64` value from the params map.
@@ -61,19 +61,17 @@ impl Params {
     /// Returns `None` if the key is missing or the value cannot be converted to `i64`.
     #[must_use]
     pub fn get_i64(&self, key: &str) -> Option<i64> {
-        self.get(key).and_then(|v| v.as_i64())
+        self.get(key).and_then(Value::as_i64)
     }
 
     /// Extracts a `usize` value from the params map.
     ///
     /// Returns `None` if the key is missing or the value cannot be converted to `usize`.
     #[must_use]
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "usize is 64-bit on all supported targets"
-    )]
     pub fn get_usize(&self, key: &str) -> Option<usize> {
-        self.get(key).and_then(|v| v.as_u64()).map(|n| n as usize)
+        self.get(key)
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
     }
 
     /// Extracts a string value from the params map.
@@ -89,7 +87,7 @@ impl Params {
     /// Returns `None` if the key is missing or the value is not a boolean.
     #[must_use]
     pub fn get_bool(&self, key: &str) -> Option<bool> {
-        self.get(key).and_then(|v| v.as_bool())
+        self.get(key).and_then(Value::as_bool)
     }
 
     /// Extracts a `f64` value from the params map.
@@ -97,7 +95,7 @@ impl Params {
     /// Returns `None` if the key is missing or the value cannot be converted to `f64`.
     #[must_use]
     pub fn get_f64(&self, key: &str) -> Option<f64> {
-        self.get(key).and_then(|v| v.as_f64())
+        self.get(key).and_then(Value::as_f64)
     }
 
     #[cfg(feature = "python")]
@@ -247,6 +245,19 @@ mod tests {
         let params = create_test_params();
         assert_eq!(params.get_usize("usize_val"), Some(5));
         assert_eq!(params.get_usize("missing"), None);
+    }
+
+    #[rstest]
+    fn test_params_ref_get_usize_respects_target_width() {
+        let mut params = Params::new();
+        params.insert("u32_max".to_string(), json!(u32::MAX));
+        params.insert("u32_overflow".to_string(), json!(4_294_967_296_u64));
+
+        assert_eq!(params.get_usize("u32_max"), Some(4_294_967_295_usize));
+        #[cfg(target_pointer_width = "32")]
+        assert_eq!(params.get_usize("u32_overflow"), None);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(params.get_usize("u32_overflow"), Some(4_294_967_296));
     }
 
     #[rstest]

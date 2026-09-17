@@ -14,51 +14,180 @@
 // -------------------------------------------------------------------------------------------------
 
 use std::{
-    sync::atomic::Ordering,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
-use nautilus_common::live::{runner::get_exec_event_sender, runtime::get_runtime};
-use nautilus_core::MUTEX_POISONED;
+use indexmap::IndexMap;
+use nautilus_common::{
+    live::runner::get_exec_event_sender,
+    msgbus::{self, TypedHandler},
+};
+use nautilus_core::{MUTEX_POISONED, collections::AtomicMap, time::AtomicTime};
+use nautilus_live::task::TaskGroupGuard;
 use nautilus_model::{
+    events::{OrderEventAny, OrderFilled, PositionEvent},
     identifiers::InstrumentId,
     instruments::{Instrument, InstrumentAny},
+    orders::Order,
 };
+use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
 use super::PolymarketExecutionClient;
 use crate::{
-    execution::reports::fetch_and_emit_account_state,
+    execution::{identity::OrderIdentity, reports::fetch_and_emit_account_state},
+    http::{clob::HeartbeatResponse, error::Error as HttpError},
     websocket::{
         dispatch::{WsDispatchContext, WsDispatchState, dispatch_user_message},
         messages::PolymarketWsMessage,
     },
 };
 
+const SUPPORTED_CLOB_VERSION: u8 = 2;
+
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const HEARTBEAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+const HEARTBEAT_SAFETY_TIMEOUT: Duration = Duration::from_secs(10);
+const HEARTBEAT_HEALTH_MARGIN: Duration = Duration::from_secs(1);
+const HEARTBEAT_REQUEST_FAILURE_LIMIT: u32 = 2;
+const TASK_SESSION_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const TASK_ABORT_TIMEOUT: Duration = Duration::from_secs(2);
+
 impl PolymarketExecutionClient {
+    fn start_heartbeat_task(&self) -> anyhow::Result<()> {
+        if !self.config.heartbeat_enabled {
+            return Ok(());
+        }
+
+        self.heartbeat_healthy.store(false, Ordering::Release);
+        let cancellation = self.session_tasks.cancellation_token();
+
+        self.session_tasks.spawn(run_heartbeats(
+            self.http_client.clone(),
+            cancellation,
+            Arc::clone(&self.heartbeat_healthy),
+        ))?;
+        Ok(())
+    }
+
+    fn ensure_order_event_subscription(&mut self) {
+        if self.order_event_handler.is_some() {
+            return;
+        }
+
+        let core = self.core.clone();
+        let clock = self.clock;
+        let shared_token_instruments = self.shared_token_instruments.clone();
+        let neg_risk_index = self.neg_risk_index.clone();
+        let handler = TypedHandler::from(move |event: &OrderEventAny| {
+            if !is_terminal_order_event(event) || event.instrument_id().venue != core.venue {
+                return;
+            }
+
+            sync_execution_lookup_for_instrument(
+                &core,
+                clock,
+                &shared_token_instruments,
+                &neg_risk_index,
+                event.instrument_id(),
+            );
+        });
+
+        msgbus::subscribe_order_events("events.order.*".into(), handler.clone(), Some(10));
+        self.order_event_handler = Some(handler);
+    }
+
+    fn clear_order_event_subscription(&mut self) {
+        if let Some(handler) = self.order_event_handler.take() {
+            msgbus::unsubscribe_order_events("events.order.*".into(), &handler);
+        }
+    }
+
+    fn ensure_position_event_subscription(&mut self) {
+        if self.position_event_handler.is_some() {
+            return;
+        }
+
+        let core = self.core.clone();
+        let clock = self.clock;
+        let shared_token_instruments = self.shared_token_instruments.clone();
+        let neg_risk_index = self.neg_risk_index.clone();
+        let handler = TypedHandler::from(move |event: &PositionEvent| {
+            if !matches!(event, PositionEvent::PositionClosed(_)) {
+                return;
+            }
+
+            if event.instrument_id().venue != core.venue {
+                return;
+            }
+
+            sync_execution_lookup_for_instrument(
+                &core,
+                clock,
+                &shared_token_instruments,
+                &neg_risk_index,
+                event.instrument_id(),
+            );
+        });
+
+        msgbus::subscribe_position_events("events.position.*".into(), handler.clone(), Some(10));
+        self.position_event_handler = Some(handler);
+    }
+
+    fn clear_position_event_subscription(&mut self) {
+        if let Some(handler) = self.position_event_handler.take() {
+            msgbus::unsubscribe_position_events("events.position.*".into(), &handler);
+        }
+    }
+
     pub(super) fn spawn_task<F>(&self, description: &'static str, fut: F)
     where
         F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
     {
-        let runtime = get_runtime();
-        let handle = runtime.spawn(async move {
+        let future = async move {
             if let Err(e) = fut.await {
                 log::warn!("{description} failed: {e:?}");
             }
-        });
+        };
 
-        let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
-        tasks.retain(|handle| !handle.is_finished());
-        tasks.push(handle);
+        if let Err(e) = self.pending_tasks.spawn(future) {
+            log::warn!("Skipping Polymarket {description} after shutdown began: {e}");
+        }
     }
 
     pub(super) fn abort_pending_tasks(&self) {
-        let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
-        for handle in tasks.drain(..) {
-            handle.abort();
-        }
+        self.pending_tasks.begin_shutdown();
+    }
+
+    pub(super) fn abort_session_tasks(&self) {
+        self.session_tasks.begin_shutdown();
+    }
+
+    pub(super) async fn await_pending_tasks(&self) -> anyhow::Result<()> {
+        self.pending_tasks.begin_shutdown();
+        self.pending_tasks
+            .finish_shutdown(
+                Duration::from_secs(self.config.http_timeout_secs),
+                TASK_ABORT_TIMEOUT,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to terminate Polymarket execution tasks: {e}"))?;
+        Ok(())
+    }
+
+    pub(super) async fn await_session_tasks(&self) -> anyhow::Result<()> {
+        self.session_tasks.begin_shutdown();
+        self.session_tasks
+            .finish_shutdown(TASK_SESSION_GRACEFUL_SHUTDOWN_TIMEOUT, TASK_ABORT_TIMEOUT)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to terminate Polymarket session tasks: {e}"))?;
+        Ok(())
     }
 
     pub(super) async fn refresh_account_state(&self) -> anyhow::Result<()> {
@@ -105,15 +234,29 @@ impl PolymarketExecutionClient {
             .await
             .context("failed to connect user WebSocket")?;
 
-        self.ws_client
+        if let Err(e) = self
+            .ws_client
             .subscribe_user()
             .await
-            .context("failed to subscribe to user channel")?;
+            .context("failed to subscribe to user channel")
+        {
+            if let Err(shutdown_error) = self.ws_client.disconnect().await {
+                return Err(e.context(format!(
+                    "Polymarket WebSocket startup rollback failed: {shutdown_error}"
+                )));
+            }
+            return Err(e);
+        }
 
-        let mut rx = self
-            .ws_client
-            .take_message_receiver()
-            .ok_or_else(|| anyhow::anyhow!("WebSocket message receiver not available"))?;
+        let Some(mut rx) = self.ws_client.take_message_receiver() else {
+            let receiver_error = anyhow::anyhow!("WebSocket message receiver not available");
+            if let Err(shutdown_error) = self.ws_client.disconnect().await {
+                return Err(receiver_error.context(format!(
+                    "Polymarket WebSocket startup rollback failed: {shutdown_error}"
+                )));
+            }
+            return Err(receiver_error);
+        };
 
         let emitter = self.emitter.clone();
         let token_instruments = self.shared_token_instruments.clone();
@@ -121,6 +264,7 @@ impl PolymarketExecutionClient {
         let http_client = self.http_client.clone();
         let clock = self.clock;
         let signature_type = self.config.signature_type;
+        let stopping = self.stopping.clone();
         let user_address = self
             .secrets
             .funder
@@ -130,17 +274,19 @@ impl PolymarketExecutionClient {
 
         let fill_tracker = self.fill_tracker.clone();
         let pending_submits = self.pending_submits.clone();
-        let pending_fills = self.pending_fills.clone();
-        let pending_order_reports = self.pending_order_reports.clone();
+        let order_identities = self.order_identities.clone();
+        let ws_dispatch_state = self.ws_dispatch_state.clone();
+        let session_spawner = self
+            .session_tasks
+            .spawner()
+            .map_err(|e| anyhow::anyhow!("Polymarket session task admission is closed: {e}"))?;
 
-        let handle = get_runtime().spawn(async move {
-            let mut state = WsDispatchState::default();
+        if let Err(e) = self.session_tasks.spawn(async move {
             let ctx = WsDispatchContext {
                 token_instruments: &token_instruments,
                 fill_tracker: &fill_tracker,
                 pending_submits: &pending_submits,
-                pending_fills: &pending_fills,
-                pending_order_reports: &pending_order_reports,
+                order_identities: &order_identities,
                 emitter: &emitter,
                 account_id,
                 clock,
@@ -151,31 +297,62 @@ impl PolymarketExecutionClient {
             loop {
                 match rx.recv().await {
                     Some(PolymarketWsMessage::User(user_msg)) => {
-                        if let Some(_refresh) =
+                        let refresh = {
+                            let mut state = ws_dispatch_state.lock().expect(MUTEX_POISONED);
                             dispatch_user_message(&user_msg, &ctx, &mut state)
-                        {
+                        };
+
+                        if refresh.is_some() {
                             let http = http_client.clone();
                             let emit = emitter.clone();
+                            let session_spawner = session_spawner.clone();
 
-                            get_runtime().spawn(async move {
+                            let future = async move {
                                 match fetch_and_emit_account_state(
                                     &http, &emit, clock, signature_type,
                                 )
                                 .await
                                 {
-                                    Ok(()) => log::info!(
+                                    Ok(()) => log::debug!(
                                         "Account state refreshed after finalized trade for {account_id}"
                                     ),
                                     Err(e) => log::warn!(
                                         "Failed to refresh account after finalized trade: {e}"
                                     ),
                                 }
-                            });
+                            };
+
+                            if let Err(e) = session_spawner.spawn(future) {
+                                log::debug!("Skipping finalized trade refresh during shutdown: {e}");
+                            }
                         }
                     }
                     Some(PolymarketWsMessage::Market(_)) => {}
                     Some(PolymarketWsMessage::Reconnected) => {
                         log::info!("User WebSocket reconnected");
+                        if stopping.load(Ordering::Acquire) {
+                            log::debug!("Skipping account refresh because execution client is stopping");
+                            continue;
+                        }
+
+                        let http = http_client.clone();
+                        let emit = emitter.clone();
+                        let future = async move {
+                            match fetch_and_emit_account_state(&http, &emit, clock, signature_type)
+                                .await
+                            {
+                                Ok(()) => {
+                                    log::info!("Account state refreshed after WebSocket reconnect");
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to refresh account after reconnect: {e}");
+                                }
+                            }
+                        };
+
+                        if let Err(e) = session_spawner.spawn(future) {
+                            log::debug!("Skipping reconnect refresh during shutdown: {e}");
+                        }
                     }
                     None => {
                         log::debug!("User WebSocket stream ended");
@@ -185,10 +362,48 @@ impl PolymarketExecutionClient {
             }
 
             log::debug!("User WebSocket handler task completed");
-        });
+        }) {
+            if let Err(shutdown_error) = self.ws_client.disconnect().await {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "Polymarket WebSocket startup rollback failed: {shutdown_error}"
+                )));
+            }
+            return Err(e.into());
+        }
 
-        *self.ws_stream_handle.lock().expect(MUTEX_POISONED) = Some(handle);
         Ok(())
+    }
+
+    async fn teardown_partial_connect(&mut self) -> anyhow::Result<()> {
+        self.stopping.store(true, Ordering::Release);
+        self.clear_order_event_subscription();
+        self.clear_position_event_subscription();
+        self.abort_session_tasks();
+        self.abort_pending_tasks();
+        self.ws_client.begin_shutdown();
+
+        if let Err(e) = self.ws_client.disconnect().await {
+            self.shutdown_errors.push(e.to_string());
+        }
+
+        if let Err(e) = self.await_session_tasks().await {
+            self.shutdown_errors.push(e.to_string());
+        }
+
+        if let Err(e) = self.await_pending_tasks().await {
+            self.shutdown_errors.push(e.to_string());
+        }
+        self.core.set_disconnected();
+
+        if self.shutdown_errors.is_empty() {
+            Ok(())
+        } else {
+            let errors = std::mem::take(&mut self.shutdown_errors);
+            anyhow::bail!(
+                "Polymarket execution shutdown failed: {}",
+                errors.join("; ")
+            )
+        }
     }
 
     pub(super) fn get_neg_risk(&self, instrument_id: &InstrumentId) -> bool {
@@ -204,6 +419,14 @@ impl PolymarketExecutionClient {
         neg_risk_index.get(instrument_id).copied().unwrap_or(false)
     }
 
+    fn upsert_execution_lookup(&self, instrument: &InstrumentAny) {
+        upsert_execution_lookup(
+            &self.shared_token_instruments,
+            &self.neg_risk_index,
+            instrument,
+        );
+    }
+
     pub(super) fn load_instruments_from_cache(&self) {
         let cache = self.core.cache();
         let instruments: Vec<InstrumentAny> = cache
@@ -211,25 +434,77 @@ impl PolymarketExecutionClient {
             .into_iter()
             .cloned()
             .collect();
-        drop(cache);
 
         for inst in &instruments {
-            self.shared_token_instruments
-                .insert(Ustr::from(inst.raw_symbol().as_str()), inst.clone());
+            self.upsert_execution_lookup(inst);
         }
 
-        for inst in &instruments {
-            if let InstrumentAny::BinaryOption(bo) = inst {
-                let neg_risk = bo
-                    .info
-                    .as_ref()
-                    .and_then(|i| i.get_bool("neg_risk"))
-                    .unwrap_or(false);
-                self.neg_risk_index.insert(bo.id, neg_risk);
+        log::debug!("Loaded {} instruments from cache", instruments.len());
+    }
+
+    pub(super) fn load_orders_from_cache(&self) {
+        let cache = self.core.cache();
+        let orders: Vec<_> = cache
+            .orders(
+                Some(&self.core.venue),
+                None,
+                None,
+                Some(&self.core.account_id),
+                None,
+            )
+            .into_iter()
+            .map(|order| order.cloned())
+            .collect();
+        drop(cache);
+
+        let mut matched_fills: AHashMap<String, Vec<OrderFilled>> = AHashMap::new();
+        let mut voided_trades = AHashSet::new();
+
+        for order in &orders {
+            let Some(venue_order_id) = order.venue_order_id() else {
+                continue;
+            };
+
+            self.order_identities
+                .register_order_identity(venue_order_id, OrderIdentity::from_order(order));
+            self.order_identities.mark_accepted(venue_order_id);
+            self.fill_tracker.restore_order(
+                venue_order_id,
+                order.quantity(),
+                order.filled_qty(),
+                order.order_side(),
+            );
+
+            for event in order.events() {
+                match event {
+                    OrderEventAny::Filled(fill) => {
+                        if let Some(key) = polymarket_trade_key(fill.info.as_ref()) {
+                            matched_fills.entry(key).or_default().push(fill.clone());
+                        }
+                    }
+                    OrderEventAny::FillVoided(voided) => {
+                        if let Some(key) = polymarket_trade_key(voided.info.as_ref()) {
+                            voided_trades.insert(key);
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
 
-        log::info!("Loaded {} instruments from cache", instruments.len());
+        let mut state = self.ws_dispatch_state.lock().expect(MUTEX_POISONED);
+
+        for (key, fills) in matched_fills {
+            if !voided_trades.contains(&key) {
+                state.restore_matched_trade(key, fills);
+            }
+        }
+
+        for key in voided_trades {
+            state.restore_voided_trade(key);
+        }
+
+        log::debug!("Loaded {} order lifecycles from cache", orders.len());
     }
 
     pub(super) fn start_client(&mut self) {
@@ -257,48 +532,114 @@ impl PolymarketExecutionClient {
         log::info!("Stopping Polymarket execution client");
 
         self.stopping.store(true, Ordering::Release);
+        self.session_tasks.begin_shutdown();
+        self.pending_tasks.begin_shutdown();
+        self.clear_order_event_subscription();
+        self.clear_position_event_subscription();
 
-        if let Some(handle) = self.ws_stream_handle.lock().expect(MUTEX_POISONED).take() {
-            handle.abort();
-        }
+        self.ws_client.begin_shutdown();
 
-        self.abort_pending_tasks();
-        self.ws_client.abort();
-
-        self.core.set_disconnected();
         self.core.set_stopped();
+        self.core.set_disconnected();
 
         log::info!("Polymarket execution client stopped");
     }
 
+    pub(super) fn reset_client(&mut self) {
+        log::debug!("Resetting Polymarket execution client");
+
+        self.stopping.store(true, Ordering::Release);
+        self.session_tasks.begin_shutdown();
+        self.pending_tasks.begin_shutdown();
+        self.ws_client.begin_shutdown();
+        self.core.set_disconnected();
+        self.clear_order_event_subscription();
+        self.clear_position_event_subscription();
+        self.shared_token_instruments.store(AHashMap::new());
+        self.neg_risk_index.store(AHashMap::new());
+        *self.ws_dispatch_state.lock().expect(MUTEX_POISONED) = WsDispatchState::default();
+    }
+
     pub(super) async fn connect_client(&mut self) -> anyhow::Result<()> {
-        if self.core.is_connected() {
+        if self.core.is_connected() && self.pending_tasks.is_open() && self.session_tasks.is_open()
+        {
             return Ok(());
         }
 
         log::info!("Connecting Polymarket execution client");
 
+        if !self.pending_tasks.is_open() || !self.session_tasks.is_open() {
+            self.teardown_partial_connect().await?;
+        }
+
+        if !self.pending_tasks.is_open() {
+            self.await_pending_tasks().await?;
+            self.pending_tasks
+                .start_generation()
+                .map_err(|e| anyhow::anyhow!("Failed to start Polymarket task generation: {e}"))?;
+        }
+
+        if !self.session_tasks.is_open() {
+            self.await_session_tasks().await?;
+            self.session_tasks.start_generation().map_err(|e| {
+                anyhow::anyhow!("Failed to start Polymarket session generation: {e}")
+            })?;
+        }
         self.stopping.store(false, Ordering::Release);
+        let ws_shutdown = self.ws_client.shutdown_handle();
+        let stopping = Arc::clone(&self.stopping);
+        let setup_guard =
+            TaskGroupGuard::new(&[&self.session_tasks, &self.pending_tasks], move || {
+                stopping.store(true, Ordering::Release);
+                ws_shutdown.begin_shutdown();
+            });
+
+        let version = self
+            .http_client
+            .get_version()
+            .await
+            .context("failed to query Polymarket CLOB protocol version")?
+            .version;
+
+        if version != SUPPORTED_CLOB_VERSION {
+            anyhow::bail!(
+                "Polymarket CLOB protocol version {version} is unsupported; adapter supports V2 only"
+            );
+        }
 
         self.load_instruments_from_cache();
+        self.load_orders_from_cache();
         self.core.set_instruments_initialized();
 
-        self.start_ws_stream().await?;
+        if let Err(e) = self.start_ws_stream().await {
+            if let Err(teardown_error) = self.teardown_partial_connect().await {
+                return Err(e.context(format!(
+                    "Polymarket startup teardown failed: {teardown_error}"
+                )));
+            }
+            return Err(e);
+        }
+        self.ensure_order_event_subscription();
+        self.ensure_position_event_subscription();
 
         let post_ws = async {
             self.refresh_account_state().await?;
             self.await_account_registered(30.0).await?;
+            self.start_heartbeat_task()?;
             Ok::<(), anyhow::Error>(())
         };
 
         if let Err(e) = post_ws.await {
             log::warn!("Connect failed after WS started, tearing down: {e}");
-            self.stopping.store(true, Ordering::Release);
-            let _ = self.ws_client.disconnect().await;
-            self.abort_pending_tasks();
+            if let Err(teardown_error) = self.teardown_partial_connect().await {
+                return Err(e.context(format!(
+                    "Polymarket startup teardown failed: {teardown_error}"
+                )));
+            }
             return Err(e);
         }
 
+        setup_guard.disarm();
         self.core.set_connected();
 
         log::info!("Connected: client_id={}", self.core.client_id);
@@ -306,37 +647,952 @@ impl PolymarketExecutionClient {
     }
 
     pub(super) async fn disconnect_client(&mut self) -> anyhow::Result<()> {
-        if self.core.is_disconnected() {
-            return Ok(());
-        }
-
         log::info!("Disconnecting Polymarket execution client");
 
-        self.stopping.store(true, Ordering::Release);
-
-        self.ws_client.disconnect().await?;
-
-        if let Some(handle) = self.ws_stream_handle.lock().expect(MUTEX_POISONED).take() {
-            handle.abort();
-        }
-
-        self.abort_pending_tasks();
-        self.core.set_disconnected();
+        self.teardown_partial_connect().await?;
 
         log::info!("Disconnected: client_id={}", self.core.client_id);
         Ok(())
     }
 
-    pub(super) fn on_instrument_update(&self, instrument: InstrumentAny) {
-        let token_id = Ustr::from(instrument.raw_symbol().as_str());
-        if let InstrumentAny::BinaryOption(bo) = &instrument {
-            let neg_risk = bo
-                .info
-                .as_ref()
-                .and_then(|i| i.get_bool("neg_risk"))
-                .unwrap_or(false);
-            self.neg_risk_index.insert(bo.id, neg_risk);
+    pub(super) fn on_instrument_update(&self, instrument: &InstrumentAny) {
+        self.upsert_execution_lookup(instrument);
+    }
+}
+
+async fn run_heartbeats(
+    http_client: crate::http::clob::PolymarketClobHttpClient,
+    cancellation: CancellationToken,
+    healthy: Arc<AtomicBool>,
+) {
+    let heartbeat_health_timeout = HEARTBEAT_SAFETY_TIMEOUT
+        .checked_sub(HEARTBEAT_HEALTH_MARGIN)
+        .expect("heartbeat health margin should be shorter than the safety timeout");
+    let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut heartbeat_id = String::new();
+    let mut request_failures = 0;
+    let mut last_acknowledged = None;
+
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            _ = interval.tick() => {}
         }
-        self.shared_token_instruments.insert(token_id, instrument);
+
+        let mut resynchronized = false;
+
+        loop {
+            let now = tokio::time::Instant::now();
+            let request_timeout = now
+                .checked_add(HEARTBEAT_REQUEST_TIMEOUT)
+                .expect("heartbeat request timeout should fit in an instant");
+            let health_deadline = last_acknowledged.map(|acknowledged: tokio::time::Instant| {
+                acknowledged
+                    .checked_add(heartbeat_health_timeout)
+                    .expect("heartbeat health timeout should fit in an instant")
+            });
+
+            if health_deadline.is_some_and(|deadline| deadline <= now) {
+                log::error!("Polymarket heartbeat health deadline elapsed");
+                healthy.store(false, Ordering::Release);
+                return;
+            }
+            let request_deadline =
+                health_deadline.map_or(request_timeout, |deadline| deadline.min(request_timeout));
+            let response = tokio::select! {
+                () = cancellation.cancelled() => return,
+                response = tokio::time::timeout_at(
+                    request_deadline,
+                    http_client.post_heartbeat(&heartbeat_id),
+                ) => response.unwrap_or(Err(HttpError::Timeout)),
+            };
+
+            match response {
+                Ok(HeartbeatResponse::Acknowledged(next_id)) => {
+                    let acknowledged = tokio::time::Instant::now();
+                    if health_deadline.is_some_and(|deadline| acknowledged >= deadline) {
+                        log::error!(
+                            "Polymarket heartbeat was acknowledged after the health deadline"
+                        );
+                        healthy.store(false, Ordering::Release);
+                        return;
+                    }
+
+                    heartbeat_id = next_id;
+                    request_failures = 0;
+                    last_acknowledged = Some(acknowledged);
+                    healthy.store(true, Ordering::Release);
+                    interval.reset_after(HEARTBEAT_INTERVAL);
+                    break;
+                }
+                Ok(HeartbeatResponse::Resynchronize(next_id)) if !resynchronized => {
+                    heartbeat_id = next_id;
+                    resynchronized = true;
+                }
+                Ok(HeartbeatResponse::Resynchronize(_)) => {
+                    log::error!("Polymarket heartbeat rejected after ID resynchronization");
+                    healthy.store(false, Ordering::Release);
+                    return;
+                }
+                Err(e) if e.is_retryable() => {
+                    request_failures += 1;
+                    if request_failures >= HEARTBEAT_REQUEST_FAILURE_LIMIT {
+                        log::error!(
+                            "Polymarket heartbeat failed after {request_failures} consecutive request attempts"
+                        );
+                        healthy.store(false, Ordering::Release);
+                        return;
+                    }
+
+                    let Some(retry_after) = e.retry_after() else {
+                        log::warn!(
+                            "Polymarket heartbeat request attempt {request_failures} failed"
+                        );
+                        continue;
+                    };
+                    let now = tokio::time::Instant::now();
+                    let Some(retry_at) = now.checked_add(retry_after) else {
+                        log::error!(
+                            "Polymarket heartbeat retry delay exceeded the safety deadline"
+                        );
+                        healthy.store(false, Ordering::Release);
+                        return;
+                    };
+
+                    if health_deadline.is_some_and(|deadline| retry_at >= deadline) {
+                        log::error!(
+                            "Polymarket heartbeat retry delay exceeded the health deadline"
+                        );
+                        healthy.store(false, Ordering::Release);
+                        return;
+                    }
+
+                    log::warn!(
+                        "Polymarket heartbeat request attempt {request_failures} was rate limited; retrying after {retry_after:?}"
+                    );
+                    tokio::select! {
+                        () = cancellation.cancelled() => return,
+                        () = tokio::time::sleep_until(retry_at) => {}
+                    }
+
+                    if cancellation.is_cancelled() {
+                        return;
+                    }
+                }
+                Err(e) if e.is_auth_error() => {
+                    log::error!("Polymarket heartbeat authentication failed");
+                    healthy.store(false, Ordering::Release);
+                    return;
+                }
+                Err(_) => {
+                    log::error!("Polymarket heartbeat was rejected by the venue");
+                    healthy.store(false, Ordering::Release);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn polymarket_trade_key(info: Option<&IndexMap<Ustr, Ustr>>) -> Option<String> {
+    let info = info?;
+    let trade_id = info.get(&Ustr::from("id"))?;
+    let taker_order_id = info.get(&Ustr::from("taker_order_id"))?;
+    Some(format!("{trade_id}-{taker_order_id}"))
+}
+
+fn upsert_execution_lookup(
+    shared_token_instruments: &AtomicMap<Ustr, InstrumentAny>,
+    neg_risk_index: &AtomicMap<InstrumentId, bool>,
+    instrument: &InstrumentAny,
+) {
+    let token_id = Ustr::from(instrument.raw_symbol().as_str());
+    shared_token_instruments.insert(token_id, instrument.clone());
+
+    if let InstrumentAny::BinaryOption(bo) = instrument {
+        let neg_risk = bo
+            .info
+            .as_ref()
+            .and_then(|i| i.get_bool("neg_risk"))
+            .unwrap_or(false);
+        neg_risk_index.insert(bo.id, neg_risk);
+    }
+}
+
+fn remove_execution_lookup(
+    shared_token_instruments: &AtomicMap<Ustr, InstrumentAny>,
+    neg_risk_index: &AtomicMap<InstrumentId, bool>,
+    instrument: &InstrumentAny,
+) {
+    shared_token_instruments.remove(&Ustr::from(instrument.raw_symbol().as_str()));
+    neg_risk_index.remove(&instrument.id());
+}
+
+fn sync_execution_lookup_for_instrument(
+    core: &nautilus_live::ExecutionClientCore,
+    clock: &'static AtomicTime,
+    shared_token_instruments: &AtomicMap<Ustr, InstrumentAny>,
+    neg_risk_index: &AtomicMap<InstrumentId, bool>,
+    instrument_id: InstrumentId,
+) {
+    let now_ns = clock.get_time_ns();
+    let account_id = core.account_id;
+    let cache = core.cache();
+
+    let instrument = cache.instrument(&instrument_id).cloned();
+    let retain = instrument.as_ref().is_some_and(|instrument| {
+        if !crate::filters::is_expired(instrument, now_ns) {
+            return true;
+        }
+
+        cache.has_orders_open(
+            Some(&core.venue),
+            Some(&instrument_id),
+            None,
+            Some(&account_id),
+            None,
+        ) || cache.has_positions_open(
+            Some(&core.venue),
+            Some(&instrument_id),
+            None,
+            Some(&account_id),
+            None,
+        )
+    });
+
+    drop(cache);
+
+    match instrument {
+        Some(instrument) if retain => {
+            upsert_execution_lookup(shared_token_instruments, neg_risk_index, &instrument);
+        }
+        Some(instrument) => {
+            remove_execution_lookup(shared_token_instruments, neg_risk_index, &instrument);
+        }
+        // Instrument not in cache: token key cannot be derived, so drop only the neg-risk entry
+        None => neg_risk_index.remove(&instrument_id),
+    }
+}
+
+fn is_terminal_order_event(event: &OrderEventAny) -> bool {
+    matches!(
+        event,
+        OrderEventAny::Canceled(_)
+            | OrderEventAny::Expired(_)
+            | OrderEventAny::Rejected(_)
+            | OrderEventAny::Filled(_)
+            | OrderEventAny::FillVoided(_)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use nautilus_common::{
+        cache::Cache,
+        live::runner::set_exec_event_sender,
+        msgbus::{publish_order_event, publish_position_event},
+    };
+    use nautilus_core::{UUID4, UnixNanos, nanos::DurationNanos};
+    use nautilus_live::ExecutionClientCore;
+    use nautilus_model::{
+        enums::{AccountType, OmsType, OrderSide, OrderStatus, PositionSide, TimeInForce},
+        events::{OrderEventAny, PositionClosed, PositionEvent, order::spec::OrderFillVoidedSpec},
+        identifiers::{
+            AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Symbol, TradeId,
+            TraderId, VenueOrderId,
+        },
+        instruments::stubs::binary_option,
+        orders::{LimitOrder, Order, OrderAny, stubs::TestOrderEventStubs},
+        position::Position,
+        types::{Currency, Money, Price, Price as ModelPrice, Quantity, Quantity as ModelQuantity},
+    };
+    use rstest::rstest;
+    use serde_json::Value;
+
+    use super::*;
+    use crate::factories::spawn_rejecting_proxy;
+
+    const TEST_PRIVATE_KEY: &str =
+        "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    const TEST_API_SECRET_B64: &str = "dGVzdF9zZWNyZXRfa2V5XzMyYnl0ZXNfcGFkMTIzNDU=";
+
+    fn test_client() -> (PolymarketExecutionClient, Rc<RefCell<Cache>>) {
+        test_client_with_proxy(None)
+    }
+
+    fn test_client_with_proxy(
+        proxy_url: Option<String>,
+    ) -> (PolymarketExecutionClient, Rc<RefCell<Cache>>) {
+        test_client_with_proxy_and_http_urls(
+            proxy_url,
+            "http://127.0.0.1:3000",
+            "http://127.0.0.1:3000",
+        )
+    }
+
+    fn test_client_with_proxy_and_http_urls(
+        proxy_url: Option<String>,
+        base_url_http: &str,
+        base_url_data_api: &str,
+    ) -> (PolymarketExecutionClient, Rc<RefCell<Cache>>) {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let core = ExecutionClientCore::new(
+            TraderId::from("TESTER-001"),
+            ClientId::from("POLYMARKET"),
+            *crate::common::consts::POLYMARKET_VENUE,
+            OmsType::Netting,
+            AccountId::from("POLYMARKET-001"),
+            AccountType::Cash,
+            None,
+            cache.clone(),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        set_exec_event_sender(tx);
+        let client = PolymarketExecutionClient::new(
+            core,
+            crate::config::PolymarketExecutionClientConfig {
+                private_key: Some(TEST_PRIVATE_KEY.to_string()),
+                api_key: Some("test_api_key".to_string()),
+                api_secret: Some(TEST_API_SECRET_B64.to_string()),
+                passphrase: Some("test_pass".to_string()),
+                funder: None,
+                base_url_http: Some(base_url_http.to_string()),
+                base_url_ws: Some("ws://127.0.0.1:3000/ws".to_string()),
+                base_url_data_api: Some(base_url_data_api.to_string()),
+                proxy_url,
+                ..crate::config::PolymarketExecutionClientConfig::default()
+            },
+        )
+        .expect("test client should construct");
+
+        (client, cache)
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn execution_client_propagates_proxy_without_debug_exposure() {
+        const USERNAME: &str = "exec-user";
+        const SECRET: &str = "exec-client-proxy-secret";
+        let (proxy_addr, requests) = spawn_rejecting_proxy(2).await;
+        let proxy_url = format!("http://{USERNAME}:{SECRET}@{proxy_addr}");
+        let (client, _cache) = test_client_with_proxy_and_http_urls(
+            Some(proxy_url.clone()),
+            "https://clob-auth.fixture",
+            "https://data-auth.fixture",
+        );
+        let debug = format!("{client:?}");
+        let errors = [
+            client
+                .http_client
+                .get_book("auth-token")
+                .await
+                .unwrap_err()
+                .to_string(),
+            client
+                .data_api_client
+                .get_positions("0x0000000000000000000000000000000000000002")
+                .await
+                .unwrap_err()
+                .to_string(),
+        ];
+        let requests = requests.lock().await;
+        let request_lines = requests
+            .iter()
+            .map(|request| request.lines().next().unwrap().to_string())
+            .collect::<Vec<_>>();
+        let expected_auth = format!("Basic {}", BASE64.encode(format!("{USERNAME}:{SECRET}")));
+
+        assert_eq!(client.config.proxy_url.as_deref(), Some(proxy_url.as_str()));
+        assert_eq!(client.ws_client.proxy_url().unwrap().expose(), proxy_url);
+        assert_eq!(
+            request_lines,
+            [
+                "CONNECT clob-auth.fixture:443 HTTP/1.1",
+                "CONNECT data-auth.fixture:443 HTTP/1.1",
+            ]
+        );
+
+        for request in requests.iter() {
+            let auth = request
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("proxy-authorization")
+                        .then_some(value.trim())
+                })
+                .expect("Proxy-Authorization header");
+            assert_eq!(auth, expected_auth);
+        }
+
+        for error in errors {
+            assert!(!error.contains(SECRET));
+            assert!(!error.contains(&expected_auth));
+        }
+        assert!(!debug.contains(SECRET));
+    }
+
+    fn test_binary_option(raw_symbol: &str, expired: bool, neg_risk: bool) -> InstrumentAny {
+        let clock = nautilus_core::time::get_atomic_clock_realtime();
+        let mut binary = binary_option();
+        binary.id = InstrumentId::from(format!("{raw_symbol}.POLYMARKET").as_str());
+        binary.raw_symbol = Symbol::new(raw_symbol);
+        binary.currency = Currency::pUSD();
+        binary.expiration_ns = if expired {
+            UnixNanos::from(clock.get_time_ns().as_u64().saturating_sub(1_000_000_000))
+        } else {
+            UnixNanos::from(
+                clock
+                    .get_time_ns()
+                    .as_u64()
+                    .saturating_add(86_400_000_000_000),
+            )
+        };
+
+        let mut info = nautilus_core::Params::new();
+        info.insert("neg_risk".to_string(), Value::Bool(neg_risk));
+        binary.info = Some(info);
+
+        InstrumentAny::BinaryOption(binary)
+    }
+
+    fn open_limit_order(instrument_id: InstrumentId) -> OrderAny {
+        OrderAny::Limit(LimitOrder::new(
+            TraderId::from("TESTER-001"),
+            StrategyId::from("S-001"),
+            instrument_id,
+            ClientOrderId::from("O-RETAIN"),
+            OrderSide::Buy,
+            ModelQuantity::new(10.0, 0),
+            ModelPrice::from("0.5000"),
+            TimeInForce::Gtc,
+            None,
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            nautilus_core::UUID4::new(),
+            UnixNanos::default(),
+        ))
+    }
+
+    fn cache_accepted_open_order(cache: &mut Cache, instrument_id: InstrumentId) -> OrderAny {
+        let mut order = open_limit_order(instrument_id);
+        cache.add_order(order.clone(), None, None, false).unwrap();
+
+        let submitted = TestOrderEventStubs::submitted(&order, AccountId::from("POLYMARKET-001"));
+        order = cache.update_order(&submitted).unwrap();
+
+        let accepted = TestOrderEventStubs::accepted(
+            &order,
+            AccountId::from("POLYMARKET-001"),
+            VenueOrderId::from("V-001"),
+        );
+        cache.update_order(&accepted).unwrap()
+    }
+
+    fn open_position(instrument: &InstrumentAny) -> Position {
+        let order = open_limit_order(instrument.id());
+        let filled = match TestOrderEventStubs::filled(
+            &order,
+            instrument,
+            None,
+            None,
+            Some(ModelPrice::from("0.5000")),
+            None,
+            None,
+            None,
+            None,
+            Some(AccountId::from("POLYMARKET-001")),
+        ) {
+            OrderEventAny::Filled(filled) => filled,
+            other => panic!("expected filled event, was {other:?}"),
+        };
+
+        Position::new(instrument, filled)
+    }
+
+    fn closed_position(position: &Position) -> Position {
+        let mut closed = position.clone();
+        closed.side = PositionSide::Flat;
+        closed.signed_qty = 0.0;
+        closed.quantity = Quantity::zero(position.size_precision);
+        closed.ts_closed = Some(position.ts_last);
+        closed.duration_ns = 1;
+        closed
+    }
+
+    fn position_closed_event(position: &Position) -> PositionEvent {
+        PositionEvent::PositionClosed(PositionClosed {
+            trader_id: position.trader_id,
+            strategy_id: position.strategy_id,
+            instrument_id: position.instrument_id,
+            position_id: position.id,
+            account_id: position.account_id,
+            opening_order_id: position.opening_order_id,
+            closing_order_id: position.closing_order_id,
+            entry: position.entry,
+            side: PositionSide::Flat,
+            signed_qty: 0.0,
+            quantity: Quantity::zero(position.size_precision),
+            peak_quantity: position.peak_qty,
+            last_qty: Quantity::zero(position.size_precision),
+            last_px: Price::zero(position.price_precision),
+            currency: position.quote_currency,
+            avg_px_open: position.avg_px_open,
+            avg_px_close: position.avg_px_close,
+            realized_return: position.realized_return,
+            realized_pnl: position.realized_pnl,
+            unrealized_pnl: Money::zero(position.quote_currency),
+            duration: DurationNanos::from(1_u64),
+            event_id: UUID4::new(),
+            ts_opened: position.ts_opened,
+            ts_closed: position.ts_closed.or(Some(position.ts_last)),
+            ts_event: position.ts_last,
+            ts_init: position.ts_last,
+        })
+    }
+
+    #[rstest]
+    fn load_instruments_from_cache_preloads_expired_execution_lookup_state() {
+        let (client, cache) = test_client();
+        let active = test_binary_option("0xACTIVE", false, true);
+        let expired = test_binary_option("0xEXPIRED", true, true);
+
+        {
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(active.clone()).unwrap();
+            cache.add_instrument(expired.clone()).unwrap();
+        }
+
+        client.load_instruments_from_cache();
+
+        assert!(
+            client
+                .shared_token_instruments
+                .contains_key(&Ustr::from(active.raw_symbol().as_str()))
+        );
+        assert!(client.neg_risk_index.contains_key(&active.id()));
+        assert!(
+            client
+                .shared_token_instruments
+                .contains_key(&Ustr::from(expired.raw_symbol().as_str()))
+        );
+        assert!(client.neg_risk_index.contains_key(&expired.id()));
+    }
+
+    #[rstest]
+    fn load_orders_from_cache_restores_failed_trade_correction_state() {
+        let (client, cache) = test_client();
+        let instrument = test_binary_option("0xRESTART", false, false);
+        let venue_order_id = VenueOrderId::from("V-001");
+
+        let order = {
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(instrument.clone()).unwrap();
+            let order = cache_accepted_open_order(&mut cache, instrument.id());
+            let mut filled = TestOrderEventStubs::filled(
+                &order,
+                &instrument,
+                None,
+                None,
+                Some(ModelPrice::from("0.5000")),
+                None,
+                None,
+                None,
+                None,
+                Some(AccountId::from("POLYMARKET-001")),
+            );
+
+            if let OrderEventAny::Filled(ref mut fill) = filled {
+                fill.trade_id = TradeId::from("trade-restart");
+                fill.info = Some(IndexMap::from([
+                    (Ustr::from("id"), Ustr::from("trade-restart")),
+                    (Ustr::from("taker_order_id"), Ustr::from("V-001")),
+                ]));
+            }
+            let filled = match filled {
+                OrderEventAny::Filled(filled) => filled,
+                other => panic!("expected filled event, was {other:?}"),
+            };
+            cache
+                .update_order(&OrderEventAny::Filled(filled.clone()))
+                .unwrap();
+            let voided = OrderFillVoidedSpec::builder()
+                .trader_id(filled.trader_id)
+                .strategy_id(filled.strategy_id)
+                .instrument_id(filled.instrument_id)
+                .client_order_id(filled.client_order_id)
+                .venue_order_id(filled.venue_order_id)
+                .account_id(filled.account_id)
+                .trade_id(filled.trade_id)
+                .voided_qty(filled.last_qty)
+                .maybe_commission_voided(filled.commission)
+                .order_side(filled.order_side)
+                .order_type(filled.order_type)
+                .last_px(filled.last_px)
+                .currency(filled.currency)
+                .liquidity_side(filled.liquidity_side)
+                .maybe_position_id(filled.position_id)
+                .maybe_info(filled.info)
+                .build();
+            cache
+                .update_order(&OrderEventAny::FillVoided(voided))
+                .unwrap()
+        };
+
+        client.load_orders_from_cache();
+
+        let key = "trade-restart-V-001";
+        let identity = client
+            .order_identities
+            .get(&venue_order_id)
+            .expect("order identity restored");
+        let state = client.ws_dispatch_state.lock().expect(MUTEX_POISONED);
+
+        assert_eq!(identity.client_order_id, order.client_order_id());
+        assert!(!client.order_identities.mark_accepted(venue_order_id));
+        assert_eq!(
+            client.fill_tracker.get_cumulative_filled(&venue_order_id),
+            Some(order.filled_qty())
+        );
+        assert_eq!(order.status(), OrderStatus::Voided);
+        assert!(state.processed_fills.contains(&key.to_string()));
+        assert_eq!(state.matched_fill_count(key), 0);
+        assert!(state.is_voided_trade(key));
+    }
+
+    #[rstest]
+    fn on_instrument_update_upserts_expired_execution_lookup_state() {
+        let (client, _cache) = test_client();
+        let expired = test_binary_option("0xEXPIRED_ONLY", true, true);
+
+        client.on_instrument_update(&expired);
+
+        assert!(
+            client
+                .shared_token_instruments
+                .contains_key(&Ustr::from(expired.raw_symbol().as_str()))
+        );
+        assert!(client.neg_risk_index.contains_key(&expired.id()));
+    }
+
+    #[rstest]
+    fn sync_execution_lookup_keeps_expired_lookup_state_with_open_position() {
+        let (client, cache) = test_client();
+        let expired = test_binary_option("0xEXPIRED_POSITION", true, true);
+        let position = open_position(&expired);
+
+        {
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(expired.clone()).unwrap();
+            cache.add_position(&position, OmsType::Netting).unwrap();
+        }
+
+        sync_execution_lookup_for_instrument(
+            &client.core,
+            client.clock,
+            &client.shared_token_instruments,
+            &client.neg_risk_index,
+            expired.id(),
+        );
+
+        assert!(
+            client
+                .shared_token_instruments
+                .contains_key(&Ustr::from(expired.raw_symbol().as_str()))
+        );
+        assert!(client.neg_risk_index.contains_key(&expired.id()));
+    }
+
+    #[rstest]
+    fn sync_execution_lookup_keeps_expired_lookup_state_with_open_order() {
+        let (client, cache) = test_client();
+        let expired = test_binary_option("0xEXPIRED_ORDER", true, true);
+
+        {
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(expired.clone()).unwrap();
+            let _order = cache_accepted_open_order(&mut cache, expired.id());
+        }
+
+        sync_execution_lookup_for_instrument(
+            &client.core,
+            client.clock,
+            &client.shared_token_instruments,
+            &client.neg_risk_index,
+            expired.id(),
+        );
+
+        assert!(
+            client
+                .shared_token_instruments
+                .contains_key(&Ustr::from(expired.raw_symbol().as_str()))
+        );
+        assert!(client.neg_risk_index.contains_key(&expired.id()));
+    }
+
+    #[rstest]
+    fn position_event_subscription_prunes_expired_lookup_after_position_closes() {
+        let (client, cache) = test_client();
+        let expired = test_binary_option("0xEXPIRED_CLOSED", true, true);
+        let position = open_position(&expired);
+        let closed = closed_position(&position);
+
+        {
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(expired.clone()).unwrap();
+            cache.add_position(&position, OmsType::Netting).unwrap();
+        }
+
+        sync_execution_lookup_for_instrument(
+            &client.core,
+            client.clock,
+            &client.shared_token_instruments,
+            &client.neg_risk_index,
+            expired.id(),
+        );
+        assert!(
+            client
+                .shared_token_instruments
+                .contains_key(&Ustr::from(expired.raw_symbol().as_str()))
+        );
+        assert!(client.neg_risk_index.contains_key(&expired.id()));
+
+        {
+            let mut cache = cache.borrow_mut();
+            cache.update_position(&closed).unwrap();
+        }
+
+        let mut client = client;
+        client.ensure_position_event_subscription();
+        let event = position_closed_event(&closed);
+        assert!(matches!(event, PositionEvent::PositionClosed(_)));
+        publish_position_event("events.position.TEST".into(), &event);
+
+        assert!(
+            !client
+                .shared_token_instruments
+                .contains_key(&Ustr::from(expired.raw_symbol().as_str()))
+        );
+        assert!(!client.neg_risk_index.contains_key(&expired.id()));
+    }
+
+    #[rstest]
+    fn order_event_subscription_prunes_expired_lookup_after_terminal_order() {
+        let (client, cache) = test_client();
+        let expired = test_binary_option("0xEXPIRED_ORDER_CLOSED", true, true);
+        let mut order;
+
+        {
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(expired.clone()).unwrap();
+            order = cache_accepted_open_order(&mut cache, expired.id());
+        }
+
+        sync_execution_lookup_for_instrument(
+            &client.core,
+            client.clock,
+            &client.shared_token_instruments,
+            &client.neg_risk_index,
+            expired.id(),
+        );
+
+        let canceled = TestOrderEventStubs::canceled(
+            &order,
+            AccountId::from("POLYMARKET-001"),
+            order.venue_order_id(),
+        );
+        order.apply(canceled.clone()).unwrap();
+
+        {
+            let mut cache = cache.borrow_mut();
+            cache.update_order(&canceled).unwrap();
+        }
+
+        let mut client = client;
+        client.ensure_order_event_subscription();
+        publish_order_event("events.order.TEST".into(), &canceled);
+
+        assert!(
+            !client
+                .shared_token_instruments
+                .contains_key(&Ustr::from(expired.raw_symbol().as_str()))
+        );
+        assert!(!client.neg_risk_index.contains_key(&expired.id()));
+    }
+
+    #[rstest]
+    fn order_event_subscription_keeps_expired_lookup_after_filled_when_position_remains_open() {
+        let (client, cache) = test_client();
+        let expired = test_binary_option("0xEXPIRED_FILLED_OPEN", true, true);
+        let order;
+        let position;
+
+        {
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(expired.clone()).unwrap();
+            order = cache_accepted_open_order(&mut cache, expired.id());
+        }
+
+        sync_execution_lookup_for_instrument(
+            &client.core,
+            client.clock,
+            &client.shared_token_instruments,
+            &client.neg_risk_index,
+            expired.id(),
+        );
+
+        let filled = TestOrderEventStubs::filled(
+            &order,
+            &expired,
+            None,
+            None,
+            Some(ModelPrice::from("0.5000")),
+            None,
+            None,
+            None,
+            None,
+            Some(AccountId::from("POLYMARKET-001")),
+        );
+
+        position = match filled.clone() {
+            OrderEventAny::Filled(filled) => Position::new(&expired, filled),
+            other => panic!("expected filled event, was {other:?}"),
+        };
+
+        {
+            let mut cache = cache.borrow_mut();
+            cache.update_order(&filled).unwrap();
+            cache.add_position(&position, OmsType::Netting).unwrap();
+        }
+
+        let mut client = client;
+        client.ensure_order_event_subscription();
+        publish_order_event("events.order.TEST".into(), &filled);
+
+        assert!(
+            client
+                .shared_token_instruments
+                .contains_key(&Ustr::from(expired.raw_symbol().as_str()))
+        );
+        assert!(client.neg_risk_index.contains_key(&expired.id()));
+    }
+
+    #[rstest]
+    fn position_event_subscription_ignores_other_venue_events() {
+        let (mut client, _cache) = test_client();
+        let expired = test_binary_option("0xOTHER_VENUE", true, true);
+        client.upsert_execution_lookup(&expired);
+        client.ensure_position_event_subscription();
+
+        let mut event = position_closed_event(&closed_position(&open_position(&expired)));
+        if let PositionEvent::PositionClosed(ref mut closed) = event {
+            closed.instrument_id = InstrumentId::from("0xOTHER.OTHER");
+        }
+
+        publish_position_event("events.position.TEST".into(), &event);
+
+        assert!(
+            client
+                .shared_token_instruments
+                .contains_key(&Ustr::from(expired.raw_symbol().as_str()))
+        );
+        assert!(client.neg_risk_index.contains_key(&expired.id()));
+    }
+
+    #[rstest]
+    fn event_subscriptions_can_be_reinstalled_after_disconnect_cleanup() {
+        let (mut client, _cache) = test_client();
+
+        client.start_client();
+        assert!(client.order_event_handler.is_none());
+        assert!(client.position_event_handler.is_none());
+
+        client.ensure_order_event_subscription();
+        client.ensure_position_event_subscription();
+        assert!(client.order_event_handler.is_some());
+        assert!(client.position_event_handler.is_some());
+
+        client.clear_order_event_subscription();
+        client.clear_position_event_subscription();
+        assert!(client.order_event_handler.is_none());
+        assert!(client.position_event_handler.is_none());
+
+        client.ensure_order_event_subscription();
+        client.ensure_position_event_subscription();
+        assert!(client.order_event_handler.is_some());
+        assert!(client.position_event_handler.is_some());
+    }
+
+    #[rstest]
+    fn reset_clears_subscriptions_and_lookup_state() {
+        let (mut client, _cache) = test_client();
+        let expired = test_binary_option("0xRESET", true, true);
+        client.upsert_execution_lookup(&expired);
+        client.ensure_order_event_subscription();
+        client.ensure_position_event_subscription();
+        client
+            .ws_dispatch_state
+            .lock()
+            .expect(MUTEX_POISONED)
+            .processed_fills
+            .add("trade-1".to_string());
+
+        client.reset_client();
+
+        assert!(client.order_event_handler.is_none());
+        assert!(client.position_event_handler.is_none());
+        assert!(
+            !client
+                .shared_token_instruments
+                .contains_key(&Ustr::from(expired.raw_symbol().as_str()))
+        );
+        assert!(!client.neg_risk_index.contains_key(&expired.id()));
+        assert!(
+            !client
+                .ws_dispatch_state
+                .lock()
+                .expect(MUTEX_POISONED)
+                .processed_fills
+                .contains(&"trade-1".to_string())
+        );
+    }
+
+    #[rstest]
+    fn stop_preserves_websocket_dedup_state_for_reconnect() {
+        let (mut client, _cache) = test_client();
+        let dedup_key = "trade-reconnect".to_string();
+        client.start_client();
+        client
+            .ws_dispatch_state
+            .lock()
+            .expect(MUTEX_POISONED)
+            .processed_fills
+            .add(dedup_key.clone());
+
+        client.stop_client();
+
+        assert!(
+            client
+                .ws_dispatch_state
+                .lock()
+                .expect(MUTEX_POISONED)
+                .processed_fills
+                .contains(&dedup_key)
+        );
     }
 }

@@ -54,8 +54,13 @@
 #![deny(clippy::missing_errors_doc)]
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
+#![allow(
+    clippy::assert_is_empty,
+    reason = "`assert!(x.is_empty())` is clearer than comparing against an empty value"
+)]
 
 pub mod builder;
+pub mod clock_factory;
 pub mod config;
 pub mod controller;
 pub mod event_store;
@@ -70,6 +75,7 @@ pub mod python;
 
 // Re-exports
 pub use builder::NautilusKernelBuilder;
+pub use clock_factory::ClockFactory;
 pub use config::{NautilusKernelConfig, RotationConfig, StreamingConfig};
 pub use controller::Controller;
 pub use event_store::{EventStoreFactory, KernelEventStore, RegisteredComponents};

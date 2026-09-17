@@ -33,7 +33,9 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::Response,
 };
+use jiff::Timestamp;
 use nautilus_common::{
+    cache::INSTRUMENT_NOT_FOUND,
     clients::DataClient,
     live::runner::replace_data_event_sender,
     messages::{
@@ -54,22 +56,25 @@ use nautilus_kraken::{
     config::KrakenDataClientConfig,
     data::{KrakenFuturesDataClient, KrakenSpotDataClient},
     http::{
-        KrakenFuturesHttpClient, KrakenFuturesRawHttpClient, KrakenSpotAddOrderParamsBuilder,
-        KrakenSpotCancelOrderParamsBuilder, KrakenSpotHttpClient, KrakenSpotRawHttpClient,
+        KrakenFuturesHttpClient, KrakenFuturesRawHttpClient, KrakenHttpError,
+        KrakenSpotAddOrderParamsBuilder, KrakenSpotCancelOrderParamsBuilder, KrakenSpotHttpClient,
+        KrakenSpotRawHttpClient,
     },
 };
 use nautilus_model::{
     data::BarType,
     enums::{
-        AccountType, MarketStatusAction, OrderSide as ModelOrderSide, OrderType as ModelOrderType,
-        TimeInForce,
+        AccountType, MarketStatusAction, OrderSide as ModelOrderSide, OrderStatus,
+        OrderType as ModelOrderType, TimeInForce, TriggerType,
     },
     identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol, VenueOrderId},
     instruments::{CryptoPerpetual, CurrencyPair, Instrument, InstrumentAny},
     types::{Currency, Price, Quantity},
 };
 use nautilus_network::http::HttpClient;
+use nautilus_testkit::events::drain_data_events;
 use rstest::rstest;
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde_json::Value;
 
@@ -79,6 +84,7 @@ struct TestServerState {
     rate_limit_after: Arc<AtomicUsize>,
     last_trades_query: Arc<tokio::sync::Mutex<Option<HashMap<String, String>>>>,
     last_ohlc_query: Arc<tokio::sync::Mutex<Option<HashMap<String, String>>>>,
+    last_executions_query: Arc<tokio::sync::Mutex<Option<HashMap<String, String>>>>,
     add_order_calls: Arc<AtomicUsize>,
     add_order_batch_calls: Arc<AtomicUsize>,
     /// When true, `/0/private/TradeBalance` returns an API error instead of the normal fixture.
@@ -104,6 +110,7 @@ impl Default for TestServerState {
             rate_limit_after: Arc::new(AtomicUsize::new(usize::MAX)), // No rate limit
             last_trades_query: Arc::new(tokio::sync::Mutex::new(None)),
             last_ohlc_query: Arc::new(tokio::sync::Mutex::new(None)),
+            last_executions_query: Arc::new(tokio::sync::Mutex::new(None)),
             add_order_calls: Arc::new(AtomicUsize::new(0)),
             add_order_batch_calls: Arc::new(AtomicUsize::new(0)),
             trade_balance_error: Arc::new(AtomicBool::new(false)),
@@ -122,8 +129,7 @@ impl Default for TestServerState {
 /// Wait for the test server to be ready by polling a health endpoint.
 async fn wait_for_server(addr: SocketAddr, path: &str) {
     let health_url = format!("http://{addr}{path}");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    let http_client = HttpClient::builder().build().unwrap();
     wait_until_async(
         || {
             let url = health_url.clone();
@@ -144,33 +150,25 @@ fn create_test_futures_instrument() -> InstrumentAny {
 
     // price_precision must match price_increment.precision (0 for "1")
     // size_precision must match size_increment.precision (4 for "0.0001")
-    InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
-        instrument_id,
-        raw_symbol,
-        btc,
-        usd,
-        usd,
-        false, // is_inverse
-        0,     // price_precision (matches "1" increment)
-        4,     // size_precision (matches "0.0001" increment)
-        Price::from("1"),
-        Quantity::from("0.0001"),
-        None, // multiplier
-        None, // lot_size
-        None, // max_quantity
-        None, // min_quantity
-        None, // max_notional
-        None, // min_notional
-        None, // max_price
-        None, // min_price
-        None, // margin_init
-        None, // margin_maint
-        None, // maker_fee
-        None, // taker_fee
-        None,
-        0.into(),
-        0.into(),
-    ))
+    InstrumentAny::CryptoPerpetual(
+        CryptoPerpetual::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(raw_symbol)
+            .base_currency(btc)
+            .quote_currency(usd)
+            .settlement_currency(usd)
+            .is_inverse(false)
+            // price_precision (matches "1" increment)
+            .price_precision(0)
+            // size_precision (matches "0.0001" increment)
+            .size_precision(4)
+            .price_increment(Price::from("1"))
+            .size_increment(Quantity::from("0.0001"))
+            .ts_event(0.into())
+            .ts_init(0.into())
+            .build()
+            .unwrap(),
+    )
 }
 
 fn manifest_path() -> PathBuf {
@@ -534,6 +532,10 @@ async fn mock_handler(req: Request, state: Arc<TestServerState>) -> Response {
         return match path {
             p if p.starts_with("/api/history/v2/orders") => mock_futures_order_events().await,
             p if p.contains("/market/") && p.contains("/executions") => {
+                let params = Query::<HashMap<String, String>>::try_from_uri(req.uri())
+                    .map(|q| q.0)
+                    .unwrap_or_default();
+                *state.last_executions_query.lock().await = Some(params);
                 mock_futures_public_executions().await
             }
             _ => Response::builder()
@@ -718,18 +720,6 @@ async fn start_test_server() -> (SocketAddr, Arc<TestServerState>) {
     wait_for_server(addr, "/0/public/Time").await;
 
     (addr, state)
-}
-
-async fn drain_data_events(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
-    timeout: Duration,
-) -> Vec<DataEvent> {
-    let mut events = Vec::new();
-    let deadline = tokio::time::Instant::now() + timeout;
-    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
-        events.push(event);
-    }
-    events
 }
 
 fn instrument_response(events: &[DataEvent]) -> Option<&InstrumentResponse> {
@@ -1417,6 +1407,24 @@ async fn test_spot_raw_get_websockets_token_with_credentials() {
 
 #[rstest]
 #[tokio::test]
+async fn test_spot_domain_request_trades_missing_cached_instrument_returns_parse_error() {
+    let client =
+        KrakenSpotHttpClient::new(KrakenEnvironment::Live, None, 10, None, None, None, None, 5)
+            .unwrap();
+
+    let instrument_id = InstrumentId::from("UNKNOWN.KRAKEN");
+    let result = client.request_trades(instrument_id, None, None, None).await;
+
+    match result {
+        Err(KrakenHttpError::ParseError(message)) => {
+            assert_eq!(message, format!("{INSTRUMENT_NOT_FOUND}: {instrument_id}"));
+        }
+        other => panic!("Expected parse error, was {other:?}"),
+    }
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_spot_domain_request_trades() {
     let state = Arc::new(TestServerState::default());
     let app = create_router(state);
@@ -1452,8 +1460,19 @@ async fn test_spot_domain_request_trades() {
     let result = client.request_trades(instrument_id, None, None, None).await;
     assert!(result.is_ok(), "Failed to request trades: {result:?}");
 
-    let trades = result.unwrap();
-    assert!(!trades.is_empty());
+    let all = result.unwrap();
+    assert!(!all.is_empty());
+
+    // `ts_init` is stamped per request and differs between the two calls, so
+    // compare the most recent trades by trade id rather than by value
+    let limited = client
+        .request_trades(instrument_id, None, None, Some(3))
+        .await
+        .unwrap();
+    assert_eq!(limited.len(), 3);
+    let recent_ids: Vec<_> = all[all.len() - 3..].iter().map(|t| t.trade_id).collect();
+    let limited_ids: Vec<_> = limited.iter().map(|t| t.trade_id).collect();
+    assert_eq!(limited_ids, recent_ids);
 }
 
 #[rstest]
@@ -1609,10 +1628,8 @@ async fn test_futures_raw_get_tickers() {
 
     let ticker = &response.tickers[0];
     assert_eq!(ticker.symbol, "PI_XBTUSD");
-    assert!(ticker.mark_price.is_some());
-    assert!(ticker.mark_price.unwrap() > 0.0);
-    assert!(ticker.index_price.is_some());
-    assert!(ticker.index_price.unwrap() > 0.0);
+    assert_eq!(ticker.mark_price, Some(dec!(91506.6009839176)));
+    assert_eq!(ticker.index_price, Some(dec!(91468.38)));
 }
 
 #[rstest]
@@ -1961,6 +1978,126 @@ async fn test_futures_raw_get_open_orders() {
 
 #[rstest]
 #[tokio::test]
+async fn test_futures_domain_request_order_status_reports_uses_position_size_for_attached_trigger()
+{
+    let (addr, _) = start_test_server().await;
+    let base_url = format!("http://{addr}");
+
+    let client = KrakenFuturesHttpClient::with_credentials(
+        "test".to_string(),
+        "test".to_string(),
+        KrakenEnvironment::Live,
+        Some(base_url),
+        10,
+        None,
+        None,
+        None,
+        None,
+        5,
+    )
+    .unwrap();
+
+    let instruments = client.request_instruments().await.unwrap();
+    client.cache_instruments(&instruments);
+
+    let account_id = AccountId::from("KRAKEN-001");
+    let reports = client
+        .request_order_status_reports(account_id, None, None, None, true)
+        .await
+        .unwrap();
+
+    assert_eq!(reports.len(), 2);
+    assert_eq!(
+        reports
+            .iter()
+            .map(|report| report.venue_order_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "c8135f52-2a86-4e26-b629-43cc37da9dbf",
+            "7a9f8b3e-1c2d-4e5f-9a8b-7c6d5e4f3a2b",
+        ]
+    );
+
+    let report = reports
+        .iter()
+        .find(|report| report.venue_order_id.as_str() == "c8135f52-2a86-4e26-b629-43cc37da9dbf")
+        .unwrap();
+    assert_eq!(report.account_id, account_id);
+    assert_eq!(report.instrument_id, InstrumentId::from("PI_XBTUSD.KRAKEN"));
+    assert_eq!(report.client_order_id, None);
+    assert_eq!(report.order_side, Some(ModelOrderSide::Buy));
+    assert_eq!(report.order_type, ModelOrderType::MarketIfTouched);
+    assert_eq!(report.time_in_force, TimeInForce::Gtc);
+    assert_eq!(report.order_status, OrderStatus::Accepted);
+    assert_eq!(report.quantity, Quantity::from("8000"));
+    assert_eq!(report.filled_qty, Quantity::from("0"));
+    assert_eq!(report.price, None);
+    assert_eq!(report.trigger_price, Some(Price::from("1880.4")));
+    assert_eq!(report.trigger_type, Some(TriggerType::LastPrice));
+    assert!(report.reduce_only);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_futures_domain_submit_order_uses_submitted_size_for_attached_trigger() {
+    let (addr, _) = start_test_server().await;
+    let base_url = format!("http://{addr}");
+
+    let client = KrakenFuturesHttpClient::with_credentials(
+        "test".to_string(),
+        "test".to_string(),
+        KrakenEnvironment::Live,
+        Some(base_url),
+        10,
+        None,
+        None,
+        None,
+        None,
+        5,
+    )
+    .unwrap();
+
+    let instruments = client.request_instruments().await.unwrap();
+    client.cache_instruments(&instruments);
+
+    let account_id = AccountId::from("KRAKEN-001");
+    let report = client
+        .submit_order(
+            account_id,
+            InstrumentId::from("PI_XBTUSD.KRAKEN"),
+            ClientOrderId::from("test-order-001"),
+            ModelOrderSide::Buy,
+            ModelOrderType::MarketIfTouched,
+            Quantity::from("1234"),
+            TimeInForce::Gtc,
+            None,
+            Some(Price::from("1880.4")),
+            Some(TriggerType::LastPrice),
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.account_id, account_id);
+    assert_eq!(report.instrument_id, InstrumentId::from("PI_XBTUSD.KRAKEN"));
+    assert_eq!(
+        report.venue_order_id,
+        VenueOrderId::from("c8135f52-2a86-4e26-b629-43cc37da9dbf")
+    );
+    assert_eq!(report.order_side, Some(ModelOrderSide::Buy));
+    assert_eq!(report.order_type, ModelOrderType::MarketIfTouched);
+    assert_eq!(report.order_status, OrderStatus::Accepted);
+    assert_eq!(report.quantity, Quantity::from("1234"));
+    assert_eq!(report.filled_qty, Quantity::from("0"));
+    assert_eq!(report.price, None);
+    assert_eq!(report.trigger_price, Some(Price::from("1880.4")));
+    assert_eq!(report.trigger_type, Some(TriggerType::LastPrice));
+    assert!(report.reduce_only);
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_futures_raw_get_order_events() {
     let state = Arc::new(TestServerState::default());
     let app = create_router(state);
@@ -2000,11 +2137,11 @@ async fn test_futures_raw_get_order_events() {
     let first_event = &response.order_events[0].order;
     assert_eq!(first_event.order_id, "c8a35168-8d52-4609-944f-3f32bb0d5c77");
     assert_eq!(first_event.symbol, "PI_XBTUSD");
-    assert_eq!(first_event.filled, 5000.0);
-    assert_eq!(first_event.quantity, 5000.0);
+    assert_eq!(first_event.filled, dec!(5000));
+    assert_eq!(first_event.quantity, dec!(5000));
 
     let third_event = &response.order_events[2].order;
-    assert_eq!(third_event.filled, 0.0);
+    assert_eq!(third_event.filled, dec!(0));
     assert!(third_event.reduce_only);
 }
 
@@ -2047,7 +2184,7 @@ async fn test_futures_raw_get_fills() {
     let first_fill = &response.fills[0];
     assert_eq!(first_fill.fill_id, "cad76f07-814e-4dc6-8478-7867407b6bff");
     assert_eq!(first_fill.symbol, "PI_XBTUSD");
-    assert_eq!(first_fill.size, 5000.0);
+    assert_eq!(first_fill.size, dec!(5000));
 }
 
 #[rstest]
@@ -2091,7 +2228,7 @@ async fn test_futures_raw_get_open_positions() {
 
     let first_position = &response.open_positions[0];
     assert_eq!(first_position.symbol, "PI_XBTUSD");
-    assert_eq!(first_position.size, 8000.0);
+    assert_eq!(first_position.size, dec!(8000));
 }
 
 #[rstest]
@@ -2360,9 +2497,27 @@ async fn test_spot_raw_api_error_response() {
 
 #[rstest]
 #[tokio::test]
+async fn test_futures_domain_request_trades_missing_cached_instrument_returns_parse_error() {
+    let client =
+        KrakenFuturesHttpClient::new(KrakenEnvironment::Live, None, 10, None, None, None, None, 5)
+            .unwrap();
+
+    let instrument_id = InstrumentId::from("UNKNOWN.KRAKEN");
+    let result = client.request_trades(instrument_id, None, None, None).await;
+
+    match result {
+        Err(KrakenHttpError::ParseError(message)) => {
+            assert_eq!(message, format!("{INSTRUMENT_NOT_FOUND}: {instrument_id}"));
+        }
+        other => panic!("Expected parse error, was {other:?}"),
+    }
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_futures_domain_request_trades() {
     let state = Arc::new(TestServerState::default());
-    let app = create_router(state);
+    let app = create_router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let base_url = format!("http://{addr}");
@@ -2392,11 +2547,49 @@ async fn test_futures_domain_request_trades() {
     // due to mock execution data having BTC-level prices
     let instrument_id = InstrumentId::from("PF_ETHUSD.KRAKEN");
 
-    let result = client.request_trades(instrument_id, None, None, None).await;
+    // Count-only requests fetch the most recent page with `sort=desc`
+    let trades = client
+        .request_trades(instrument_id, None, None, None)
+        .await
+        .expect("Failed to request futures trades");
+    {
+        let query = state.last_executions_query.lock().await;
+        let sort = query.as_ref().and_then(|params| params.get("sort"));
+        assert_eq!(sort.map(String::as_str), Some("desc"));
+    }
+    // The `sort=desc` page is reversed back to ascending chronological order
+    assert!(
+        trades.len() >= 2,
+        "need >=2 parsed trades to assert ordering, was {}",
+        trades.len()
+    );
+    assert!(
+        trades.windows(2).all(|w| w[0].ts_event <= w[1].ts_event),
+        "count-only futures trades must be ascending by ts_event"
+    );
+
+    // A count-only limit keeps the most recent trade (tail after reversal)
+    let limited = client
+        .request_trades(instrument_id, None, None, Some(1))
+        .await
+        .expect("Failed to request limited futures trades");
+    assert_eq!(limited.len(), 1);
+    assert_eq!(limited[0].trade_id, trades[trades.len() - 1].trade_id);
+
+    // Anchored requests page forward from `start` with `sort=asc`
+    let start = Some(Timestamp::from_second(1_700_000_000).unwrap());
+    let result = client
+        .request_trades(instrument_id, start, None, None)
+        .await;
     assert!(
         result.is_ok(),
-        "Failed to request futures trades: {result:?}"
+        "Failed to request anchored futures trades: {result:?}"
     );
+    {
+        let query = state.last_executions_query.lock().await;
+        let sort = query.as_ref().and_then(|params| params.get("sort"));
+        assert_eq!(sort.map(String::as_str), Some("asc"));
+    }
 }
 
 #[rstest]
@@ -2438,7 +2631,7 @@ async fn test_futures_domain_request_instruments_includes_tokenized_contract() {
             assert_eq!(perp.id.symbol.as_str(), "PF_AAPLxUSD");
             assert_eq!(perp.base_currency.code.as_str(), "AAPLx");
             assert_eq!(perp.quote_currency.code.as_str(), "USD");
-            assert_eq!(perp.size_increment.as_f64(), 0.01);
+            assert_eq!(perp.size_increment.as_decimal(), dec!(0.01));
         }
         _ => panic!("Expected CryptoPerpetual"),
     }
@@ -2615,6 +2808,7 @@ async fn test_futures_domain_request_funding_rates() {
     let rates = result.unwrap();
     assert_eq!(rates.len(), 3);
     assert_eq!(rates[0].instrument_id, instrument_id);
+    assert_eq!(rates[0].rate, dec!(0.00015));
 
     // Rates are returned in ascending chronological order (oldest first)
     assert!(rates[0].ts_event < rates[1].ts_event);
@@ -2653,31 +2847,21 @@ async fn test_spot_domain_submit_orders_batch_preserves_status_order() {
     .unwrap();
 
     let instrument_id = InstrumentId::from("XBT/USD.KRAKEN");
-    client.cache_instrument(InstrumentAny::CurrencyPair(CurrencyPair::new(
-        instrument_id,
-        Symbol::new("XBTUSD"),
-        Currency::BTC(),
-        Currency::USD(),
-        1,
-        8,
-        Price::from("0.1"),
-        Quantity::from("0.00000001"),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        0.into(),
-        0.into(),
-    )));
+    client.cache_instrument(InstrumentAny::CurrencyPair(
+        CurrencyPair::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(Symbol::new("XBTUSD"))
+            .base_currency(Currency::BTC())
+            .quote_currency(Currency::USD())
+            .price_precision(1)
+            .size_precision(8)
+            .price_increment(Price::from("0.1"))
+            .size_increment(Quantity::from("0.00000001"))
+            .ts_event(0.into())
+            .ts_init(0.into())
+            .build()
+            .unwrap(),
+    ));
 
     let statuses = client
         .submit_orders_batch(
@@ -2783,31 +2967,21 @@ async fn test_spot_domain_submit_orders_batch_singleton_falls_back_to_add_order(
     .unwrap();
 
     let instrument_id = InstrumentId::from("XBT/USD.KRAKEN");
-    client.cache_instrument(InstrumentAny::CurrencyPair(CurrencyPair::new(
-        instrument_id,
-        Symbol::new("XBTUSD"),
-        Currency::BTC(),
-        Currency::USD(),
-        1,
-        8,
-        Price::from("0.1"),
-        Quantity::from("0.00000001"),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        0.into(),
-        0.into(),
-    )));
+    client.cache_instrument(InstrumentAny::CurrencyPair(
+        CurrencyPair::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(Symbol::new("XBTUSD"))
+            .base_currency(Currency::BTC())
+            .quote_currency(Currency::USD())
+            .price_precision(1)
+            .size_precision(8)
+            .price_increment(Price::from("0.1"))
+            .size_increment(Quantity::from("0.00000001"))
+            .ts_event(0.into())
+            .ts_init(0.into())
+            .build()
+            .unwrap(),
+    ));
 
     let statuses = client
         .submit_orders_batch(
@@ -2991,10 +3165,10 @@ async fn test_spot_request_account_state_margin_does_not_lock_free_margin() {
     assert_eq!(state.account_type, AccountType::Margin);
     assert_eq!(state.margins.len(), 1, "expected one MarginBalance entry");
     let mb = &state.margins[0];
-    assert_eq!(mb.initial.as_f64(), 12500.00);
+    assert_eq!(mb.initial.as_decimal(), dec!(12500));
     assert_eq!(
-        mb.maintenance.as_f64(),
-        0.0,
+        mb.maintenance.as_decimal(),
+        Decimal::ZERO,
         "maintenance must stay zero to avoid double-locking TradeBalance `m`"
     );
     assert_eq!(mb.currency.code.as_str(), "USD");
@@ -3059,8 +3233,8 @@ async fn test_spot_request_account_state_margin_with_gbp_asset_tags_currency() {
         .find(|b| b.currency.code.as_str() == "USD")
     {
         assert_eq!(
-            usd.locked.as_f64(),
-            0.0,
+            usd.locked.as_decimal(),
+            Decimal::ZERO,
             "USD wallet should stay unlocked when margin target is GBP"
         );
     }
@@ -3152,12 +3326,12 @@ async fn test_spot_request_account_state_margin_other_wallets_unlocked() {
         .filter(|b| b.currency.code.as_str() != "USD")
     {
         assert_eq!(
-            balance.locked.as_f64(),
-            0.0,
+            balance.locked.as_decimal(),
+            Decimal::ZERO,
             "non-margin-asset wallet {} must have locked=0",
             balance.currency.code
         );
-        assert_eq!(balance.free.as_f64(), balance.total.as_f64());
+        assert_eq!(balance.free, balance.total);
     }
 }
 
@@ -3477,31 +3651,21 @@ async fn test_spot_request_account_state_synthetic_margin_balance_error() {
 
 fn create_xbtusd_spot_instrument() -> (InstrumentId, InstrumentAny) {
     let instrument_id = InstrumentId::from("XBT/USD.KRAKEN");
-    let inst = InstrumentAny::CurrencyPair(CurrencyPair::new(
-        instrument_id,
-        Symbol::new("XXBTZUSD"),
-        Currency::BTC(),
-        Currency::USD(),
-        1,
-        8,
-        Price::from("0.1"),
-        Quantity::from("0.00000001"),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        0.into(),
-        0.into(),
-    ));
+    let inst = InstrumentAny::CurrencyPair(
+        CurrencyPair::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(Symbol::new("XXBTZUSD"))
+            .base_currency(Currency::BTC())
+            .quote_currency(Currency::USD())
+            .price_precision(1)
+            .size_precision(8)
+            .price_increment(Price::from("0.1"))
+            .size_increment(Quantity::from("0.00000001"))
+            .ts_event(0.into())
+            .ts_init(0.into())
+            .build()
+            .unwrap(),
+    );
     (instrument_id, inst)
 }
 
@@ -3512,7 +3676,7 @@ async fn test_spot_margin_position_flat_when_fully_closed() {
     // request_position_status_reports must emit a FLAT report for the requested instrument.
     // Otherwise stale positions in the engine cannot be reconciled.
     use nautilus_model::{
-        enums::{AccountType, PositionSideSpecified},
+        enums::{AccountType, PositionSide},
         identifiers::AccountId,
     };
 
@@ -3544,31 +3708,21 @@ async fn test_spot_margin_position_flat_when_fully_closed() {
     .unwrap();
 
     let instrument_id = InstrumentId::from("XBT/USD.KRAKEN");
-    client.cache_instrument(InstrumentAny::CurrencyPair(CurrencyPair::new(
-        instrument_id,
-        Symbol::new("XBTUSD"),
-        Currency::BTC(),
-        Currency::USD(),
-        1,
-        8,
-        Price::from("0.1"),
-        Quantity::from("0.00000001"),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        0.into(),
-        0.into(),
-    )));
+    client.cache_instrument(InstrumentAny::CurrencyPair(
+        CurrencyPair::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(Symbol::new("XBTUSD"))
+            .base_currency(Currency::BTC())
+            .quote_currency(Currency::USD())
+            .price_precision(1)
+            .size_precision(8)
+            .price_increment(Price::from("0.1"))
+            .size_increment(Quantity::from("0.00000001"))
+            .ts_event(0.into())
+            .ts_init(0.into())
+            .build()
+            .unwrap(),
+    ));
 
     let account_id = AccountId::new("KRAKEN-001");
     let reports = client
@@ -3596,13 +3750,13 @@ async fn test_spot_margin_position_flat_when_fully_closed() {
     );
     assert_eq!(
         report.position_side,
-        PositionSideSpecified::Flat,
+        PositionSide::Flat,
         "FLAT report side must be Flat, received {:?}",
         report.position_side
     );
 }
 
-fn make_open_positions_json(lots: &[(&str, &str, f64, f64)]) -> String {
+fn make_open_positions_json(lots: &[(&str, &str, Decimal, Decimal)]) -> String {
     let entries: Vec<String> = lots
         .iter()
         .map(|(pos_id, side, vol, vol_closed)| {
@@ -3652,11 +3806,14 @@ async fn setup_margin_position_test(json: String) -> (KrakenSpotHttpClient, Inst
 #[tokio::test]
 async fn test_spot_margin_position_opposing_lots_net_to_long() {
     use nautilus_model::{
-        enums::{AccountType, PositionSideSpecified},
+        enums::{AccountType, PositionSide},
         identifiers::AccountId,
     };
 
-    let json = make_open_positions_json(&[("LOT1", "buy", 1.0, 0.0), ("LOT2", "sell", 0.4, 0.0)]);
+    let json = make_open_positions_json(&[
+        ("LOT1", "buy", dec!(1), Decimal::ZERO),
+        ("LOT2", "sell", dec!(0.4), Decimal::ZERO),
+    ]);
     let (client, instrument_id) = setup_margin_position_test(json).await;
 
     let reports = client
@@ -3673,23 +3830,22 @@ async fn test_spot_margin_position_opposing_lots_net_to_long() {
     assert_eq!(reports.len(), 1);
     let r = &reports[0];
     assert_eq!(r.instrument_id, instrument_id);
-    assert_eq!(r.position_side, PositionSideSpecified::Long);
-    assert!(
-        (r.quantity.as_f64() - 0.6).abs() < 1e-7,
-        "expected qty ~0.6, received {}",
-        r.quantity
-    );
+    assert_eq!(r.position_side, PositionSide::Long);
+    assert_eq!(r.quantity, Quantity::from("0.6"));
 }
 
 #[rstest]
 #[tokio::test]
 async fn test_spot_margin_position_opposing_lots_net_to_short() {
     use nautilus_model::{
-        enums::{AccountType, PositionSideSpecified},
+        enums::{AccountType, PositionSide},
         identifiers::AccountId,
     };
 
-    let json = make_open_positions_json(&[("LOT1", "buy", 0.3, 0.0), ("LOT2", "sell", 0.8, 0.0)]);
+    let json = make_open_positions_json(&[
+        ("LOT1", "buy", dec!(0.3), Decimal::ZERO),
+        ("LOT2", "sell", dec!(0.8), Decimal::ZERO),
+    ]);
     let (client, instrument_id) = setup_margin_position_test(json).await;
 
     let reports = client
@@ -3706,23 +3862,22 @@ async fn test_spot_margin_position_opposing_lots_net_to_short() {
     assert_eq!(reports.len(), 1);
     let r = &reports[0];
     assert_eq!(r.instrument_id, instrument_id);
-    assert_eq!(r.position_side, PositionSideSpecified::Short);
-    assert!(
-        (r.quantity.as_f64() - 0.5).abs() < 1e-7,
-        "expected qty ~0.5, received {}",
-        r.quantity
-    );
+    assert_eq!(r.position_side, PositionSide::Short);
+    assert_eq!(r.quantity, Quantity::from("0.5"));
 }
 
 #[rstest]
 #[tokio::test]
 async fn test_spot_margin_position_opposing_lots_net_to_flat() {
     use nautilus_model::{
-        enums::{AccountType, PositionSideSpecified},
+        enums::{AccountType, PositionSide},
         identifiers::AccountId,
     };
 
-    let json = make_open_positions_json(&[("LOT1", "buy", 0.5, 0.0), ("LOT2", "sell", 0.5, 0.0)]);
+    let json = make_open_positions_json(&[
+        ("LOT1", "buy", dec!(0.5), Decimal::ZERO),
+        ("LOT2", "sell", dec!(0.5), Decimal::ZERO),
+    ]);
     let (client, instrument_id) = setup_margin_position_test(json).await;
 
     let reports = client
@@ -3739,7 +3894,7 @@ async fn test_spot_margin_position_opposing_lots_net_to_flat() {
     assert_eq!(reports.len(), 1);
     let r = &reports[0];
     assert_eq!(r.instrument_id, instrument_id);
-    assert_eq!(r.position_side, PositionSideSpecified::Flat);
+    assert_eq!(r.position_side, PositionSide::Flat);
     assert!(
         r.quantity.is_zero(),
         "expected zero qty, received {}",
@@ -3752,7 +3907,7 @@ async fn test_spot_margin_position_opposing_lots_net_to_flat() {
 async fn test_spot_margin_position_bails_on_unknown_pair_when_cache_missing() {
     use nautilus_model::{enums::AccountType, identifiers::AccountId};
 
-    let json = make_open_positions_json(&[("LOT1", "buy", 1.0, 0.0)]);
+    let json = make_open_positions_json(&[("LOT1", "buy", dec!(1), Decimal::ZERO)]);
 
     let state = Arc::new(TestServerState::default());
     *state.open_positions_json.lock().await = Some(json);

@@ -44,7 +44,13 @@ use nautilus_coinbase::{
     common::enums::CoinbaseWsChannel,
     websocket::{client::CoinbaseWebSocketClient, handler::NautilusWsMessage},
 };
-use nautilus_common::testing::wait_until_async;
+use nautilus_common::{
+    live::runner::replace_system_event_sender,
+    messages::{SystemEvent, system::SocketState},
+    testing::wait_until_async,
+};
+use nautilus_live::{SocketControl, SocketReconnectRegistry, SocketReconnectRequestOutcome};
+use nautilus_model::identifiers::{ClientId, Venue};
 use nautilus_network::websocket::TransportBackend;
 use rstest::rstest;
 use serde_json::Value;
@@ -192,18 +198,11 @@ async fn start_mock_ws_server(state: WsServerState) -> SocketAddr {
         axum::serve(listener, router).await.unwrap();
     });
 
-    let start = std::time::Instant::now();
-
-    loop {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            break;
-        }
-        assert!(
-            start.elapsed() <= Duration::from_secs(5),
-            "Mock server did not start within timeout"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_until_async(
+        || async { tokio::net::TcpStream::connect(addr).await.is_ok() },
+        Duration::from_secs(5),
+    )
+    .await;
 
     addr
 }
@@ -213,12 +212,24 @@ fn ws_url(addr: SocketAddr) -> String {
 }
 
 #[rstest]
+#[case("coinbase-data-streams")]
+#[case("coinbase-user-streams")]
 #[tokio::test]
-async fn test_ws_connect_and_disconnect_lifecycle() {
+async fn test_ws_connect_and_disconnect_lifecycle(#[case] endpoint: &str) {
     let state = WsServerState::default();
     let addr = start_mock_ws_server(state.clone()).await;
+    let (system_tx, mut system_rx) = tokio::sync::mpsc::unbounded_channel();
+    replace_system_event_sender(system_tx);
+    let registry = SocketReconnectRegistry::default();
+    let endpoint = Ustr::from(endpoint);
 
-    let mut client = CoinbaseWebSocketClient::new(&ws_url(addr), TransportBackend::default(), None);
+    let mut client = CoinbaseWebSocketClient::new(&ws_url(addr), TransportBackend::default(), None)
+        .with_socket_control(SocketControl::with_registry(
+            ClientId::from("COINBASE"),
+            Some(Venue::from("COINBASE")),
+            endpoint,
+            &registry,
+        ));
     assert!(!client.is_active());
 
     client.connect().await.unwrap();
@@ -233,7 +244,37 @@ async fn test_ws_connect_and_disconnect_lifecycle() {
     )
     .await;
 
-    client.disconnect().await;
+    let event = tokio::time::timeout(Duration::from_secs(2), system_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let SystemEvent::SocketState(change) = event;
+    let handle = registry
+        .handle(ClientId::from("COINBASE"), endpoint)
+        .unwrap();
+
+    assert_eq!(change.client_id, ClientId::from("COINBASE"));
+    assert_eq!(change.venue, Some(Venue::from("COINBASE")));
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Connected);
+    assert_eq!(
+        handle.request_reconnect(),
+        SocketReconnectRequestOutcome::Accepted
+    );
+    let event = tokio::time::timeout(Duration::from_secs(2), system_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let SystemEvent::SocketState(change) = event;
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Disconnected);
+
+    client.disconnect().await.unwrap();
+    assert!(
+        registry
+            .handle(ClientId::from("COINBASE"), endpoint)
+            .is_none()
+    );
 }
 
 #[rstest]
@@ -273,7 +314,7 @@ async fn test_ws_subscribe_sends_typed_payload() {
     assert_eq!(pids.len(), 1);
     assert_eq!(pids[0].as_str(), Some("BTC-USD"));
 
-    client.disconnect().await;
+    client.disconnect().await.unwrap();
 }
 
 #[rstest]
@@ -320,7 +361,7 @@ async fn test_ws_unsubscribe_sends_typed_payload() {
         Some("ticker")
     );
 
-    client.disconnect().await;
+    client.disconnect().await.unwrap();
 }
 
 #[rstest]
@@ -343,7 +384,7 @@ async fn test_ws_user_channel_subscribe_without_credentials_fails() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(state.received_subscribes().await.is_empty());
 
-    client.disconnect().await;
+    client.disconnect().await.unwrap();
 }
 
 #[rstest]
@@ -424,7 +465,7 @@ async fn test_ws_resubscribes_topics_after_reconnect() {
         assert_eq!(sub.get("channel").and_then(|c| c.as_str()), Some("ticker"));
     }
 
-    client.disconnect().await;
+    client.disconnect().await.unwrap();
 }
 
 #[rstest]
@@ -459,7 +500,7 @@ async fn test_ws_emits_reconnected_message_after_drop() {
     }
     assert!(saw_reconnected, "client did not emit Reconnected sentinel");
 
-    client.disconnect().await;
+    client.disconnect().await.unwrap();
 }
 
 #[rstest]
@@ -496,7 +537,7 @@ async fn test_ws_handles_malformed_message_gracefully() {
         "connection dropped after malformed frame"
     );
 
-    client.disconnect().await;
+    client.disconnect().await.unwrap();
 }
 
 #[rstest]
@@ -546,5 +587,5 @@ async fn test_ws_multiple_subscribes_each_reach_server() {
     assert_eq!(counts.get("ticker").copied(), Some(1));
     assert_eq!(counts.get("level2").copied(), Some(1));
 
-    client.disconnect().await;
+    client.disconnect().await.unwrap();
 }

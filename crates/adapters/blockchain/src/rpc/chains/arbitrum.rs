@@ -13,12 +13,16 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use alloy::primitives::Address;
+use nautilus_live::SocketControl;
 use nautilus_model::defi::chain::chains;
 use nautilus_network::websocket::TransportBackend;
 
 use crate::rpc::{
-    BlockchainRpcClient, core::CoreBlockchainRpcClient, error::BlockchainRpcClientError,
-    types::BlockchainMessage,
+    BlockchainRpcClient,
+    core::CoreBlockchainRpcClient,
+    error::BlockchainRpcClientError,
+    types::{BlockchainMessage, RpcEventType},
 };
 
 #[derive(Debug)]
@@ -45,6 +49,17 @@ impl BlockchainRpcClient for ArbitrumRpcClient {
         self.base_client.subscribe_blocks().await
     }
 
+    async fn subscribe_pool_events(
+        &mut self,
+        event_type: RpcEventType,
+        addresses: &[Address],
+        event_signature: String,
+    ) -> Result<(), BlockchainRpcClientError> {
+        self.base_client
+            .subscribe_pool_events(event_type, addresses, event_signature)
+            .await
+    }
+
     async fn unsubscribe_blocks(&mut self) -> Result<(), BlockchainRpcClientError> {
         self.base_client.unsubscribe_blocks().await
     }
@@ -55,5 +70,9 @@ impl BlockchainRpcClient for ArbitrumRpcClient {
 
     fn set_transport_backend(&mut self, backend: TransportBackend) {
         self.base_client.set_transport_backend(backend);
+    }
+
+    fn set_socket_control(&mut self, control: SocketControl) {
+        self.base_client.set_socket_control(control);
     }
 }

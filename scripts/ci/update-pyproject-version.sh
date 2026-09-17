@@ -9,21 +9,34 @@ fi
 
 branch_name="${GITHUB_REF_NAME}" # Get the branch name
 echo "Branch name: ${branch_name}"
-base_version=$(echo "$current_version" | sed -E 's/(\.dev[0-9]{8}\+[0-9]+|a[0-9]{8})$//')
+base_version=$(echo "$current_version" | sed -E 's/(\.dev[0-9]{8}(\+[0-9]+)?|a[0-9]{8})$//')
 
 suffix=""
-if [[ "$branch_name" == "develop" ]]; then
+target_version="${PUBLISH_WHEEL_VERSION:-}"
+if [[ -n "$target_version" ]]; then
+  echo "Using planned wheel version ${target_version}"
+elif [[ "$branch_name" == "develop" ]]; then
   # Develop branch: use dev versioning with build number
   suffix=".dev$(date +%Y%m%d)+${GITHUB_RUN_NUMBER}"
 elif [[ "$branch_name" == "nightly" ]]; then
-  # Nightly branch: use alpha versioning
-  suffix="a$(date +%Y%m%d)"
+  # Nightly branch: use alpha versioning, unless the base is already a pre-release
+  # (e.g. 2.0.0rc1). PEP 440 forbids stacking pre-release segments (2.0.0rc1a... is
+  # invalid), so fall back to a dev segment when the base already has one.
+  if [[ "$base_version" =~ (a|b|rc)[0-9]+$ ]]; then
+    suffix=".dev$(date +%Y%m%d)"
+  else
+    suffix="a$(date +%Y%m%d)"
+  fi
 else
   echo "Not modifying version"
 fi
 
-if [[ -n "$suffix" && "$current_version" != *"$suffix"* ]]; then
-  new_version="${base_version}${suffix}"
+if [[ -z "$target_version" && -n "$suffix" ]]; then
+  target_version="${base_version}${suffix}"
+fi
+
+if [[ -n "$target_version" && "$current_version" != "$target_version" ]]; then
+  new_version="$target_version"
   if sed -i.bak "s/^version = \".*\"/version = \"${new_version}\"/" pyproject.toml; then
     echo "Version updated to ${new_version}"
     rm -f pyproject.toml.bak

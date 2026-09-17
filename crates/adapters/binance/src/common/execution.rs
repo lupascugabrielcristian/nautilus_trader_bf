@@ -17,49 +17,49 @@
 
 use std::{
     future::Future,
-    sync::Mutex,
     time::{Duration, Instant},
 };
 
-use nautilus_common::live::get_runtime;
-use nautilus_core::MUTEX_POISONED;
-use nautilus_live::ExecutionClientCore;
+use nautilus_live::{ExecutionClientCore, task::TaskGroup};
 use nautilus_model::identifiers::AccountId;
-use tokio::task::JoinHandle;
 
 /// Spawns an async task and tracks its handle in `pending_tasks`.
-///
-/// Prunes finished handles before adding the new one to prevent unbounded growth.
-///
-/// # Panics
-///
-/// Panics if the `pending_tasks` mutex is poisoned.
-pub fn spawn_task<F>(pending_tasks: &Mutex<Vec<JoinHandle<()>>>, description: &'static str, fut: F)
+pub fn spawn_task<F>(pending_tasks: &TaskGroup, description: &'static str, fut: F)
 where
     F: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
-    let runtime = get_runtime();
-    let handle = runtime.spawn(async move {
+    let future = async move {
         if let Err(e) = fut.await {
             log::warn!("{description} failed: {e}");
         }
-    });
+    };
 
-    let mut tasks = pending_tasks.lock().expect(MUTEX_POISONED);
-    tasks.retain(|handle| !handle.is_finished());
-    tasks.push(handle);
+    if let Err(e) = pending_tasks.spawn(future) {
+        log::warn!("Skipping Binance {description} after shutdown began: {e}");
+    }
 }
 
-/// Aborts all pending tasks tracked in the mutex.
+/// Aborts all pending tasks stored in `pending_tasks`.
 ///
 /// # Panics
 ///
-/// Panics if the `pending_tasks` mutex is poisoned.
-pub fn abort_pending_tasks(pending_tasks: &Mutex<Vec<JoinHandle<()>>>) {
-    let mut tasks = pending_tasks.lock().expect(MUTEX_POISONED);
-    for handle in tasks.drain(..) {
-        handle.abort();
-    }
+/// Panics if the task handle storage mutex is poisoned.
+pub fn abort_pending_tasks(pending_tasks: &TaskGroup) {
+    pending_tasks.begin_shutdown();
+}
+
+/// Completes bounded shutdown for Binance command tasks.
+///
+/// # Errors
+///
+/// Returns an error when bounded task shutdown fails.
+pub async fn await_pending_tasks(pending_tasks: &TaskGroup) -> anyhow::Result<()> {
+    pending_tasks.begin_shutdown();
+    pending_tasks
+        .finish_shutdown(Duration::from_secs(1), Duration::from_secs(2))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to terminate Binance execution tasks: {e}"))?;
+    Ok(())
 }
 
 /// Polls the cache until the account is registered or timeout is reached.
@@ -120,29 +120,25 @@ mod tests {
     use crate::common::consts::{BINANCE_CLIENT_ID, BINANCE_VENUE};
 
     #[rstest]
-    fn test_spawn_task_prunes_finished_handles() {
-        let finished = get_runtime().spawn(async {});
-        get_runtime().block_on(async {
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while !finished.is_finished() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("Finished task should complete");
-        });
-
-        let pending_tasks = Mutex::new(vec![finished]);
+    #[tokio::test]
+    async fn test_spawn_task_unregisters_finished_task_before_shutdown() {
+        let pending_tasks = TaskGroup::new();
 
         spawn_task(&pending_tasks, "test task", async { Ok(()) });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !pending_tasks.all_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("task should finish");
 
-        assert_eq!(
-            pending_tasks.lock().expect(MUTEX_POISONED).len(),
-            1,
-            "spawn_task should drop finished handles before storing the new one",
-        );
-
+        assert!(pending_tasks.is_empty());
         abort_pending_tasks(&pending_tasks);
+        await_pending_tasks(&pending_tasks)
+            .await
+            .expect("task shutdown");
+        assert!(pending_tasks.is_empty());
     }
 
     #[rstest]
@@ -151,15 +147,20 @@ mod tests {
         let (drop_tx, drop_rx) = tokio::sync::oneshot::channel();
         let guard = AbortDropSignal { tx: Some(drop_tx) };
 
-        let handle = get_runtime().spawn(async move {
-            let _guard = guard;
-            tokio::time::sleep(Duration::from_secs(60)).await;
-        });
-        let pending_tasks = Mutex::new(vec![handle]);
+        let pending_tasks = TaskGroup::new();
+        pending_tasks
+            .spawn(async move {
+                let _guard = guard;
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            })
+            .expect("task spawn");
 
         abort_pending_tasks(&pending_tasks);
+        await_pending_tasks(&pending_tasks)
+            .await
+            .expect("task shutdown");
 
-        assert!(pending_tasks.lock().expect(MUTEX_POISONED).is_empty());
+        assert!(pending_tasks.is_empty());
         tokio::time::timeout(Duration::from_secs(1), drop_rx)
             .await
             .expect("Aborted task should drop its future")

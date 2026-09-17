@@ -212,31 +212,22 @@ fn parse_spot_instrument(
     let taker_fee = Decimal::from_str(&instrument.taker_commission.to_string())
         .context("Failed to parse taker_commission")?;
 
-    let currency_pair = CurrencyPair::new(
-        instrument_id,
-        instrument.instrument_name.into(),
-        base_currency,
-        quote_currency,
-        price_increment.precision,
-        size_increment.precision,
-        price_increment,
-        size_increment,
-        None, // multiplier
-        None, // lot_size
-        None, // max_quantity
-        Some(min_quantity),
-        None, // max_notional
-        None, // min_notional
-        None, // max_price
-        None, // min_price
-        None, // margin_init
-        None, // margin_maint
-        Some(maker_fee),
-        Some(taker_fee),
-        None,
-        ts_event,
-        ts_init,
-    );
+    let currency_pair = CurrencyPair::builder()
+        .instrument_id(instrument_id)
+        .raw_symbol(instrument.instrument_name.into())
+        .base_currency(base_currency)
+        .quote_currency(quote_currency)
+        .price_precision(price_increment.precision)
+        .size_precision(size_increment.precision)
+        .price_increment(price_increment)
+        .size_increment(size_increment)
+        .min_quantity(min_quantity)
+        .maker_fee(maker_fee)
+        .taker_fee(taker_fee)
+        .ts_event(ts_event)
+        .ts_init(ts_init)
+        .build()
+        .unwrap();
 
     Ok(InstrumentAny::CurrencyPair(currency_pair))
 }
@@ -264,8 +255,7 @@ fn parse_perpetual_instrument(
     let size_increment = Quantity::from_decimal(instrument.min_trade_amount)?;
     let min_quantity = Quantity::from_decimal(instrument.min_trade_amount)?;
 
-    // Contract size represents the multiplier (e.g., 10 USD per contract for BTC-PERPETUAL)
-    let multiplier = Some(Quantity::from_decimal(instrument.contract_size)?);
+    let multiplier = Some(deribit_amount_quantity_multiplier());
     let lot_size = Some(size_increment);
 
     let maker_fee = Decimal::from_str(&instrument.maker_commission.to_string())
@@ -273,33 +263,27 @@ fn parse_perpetual_instrument(
     let taker_fee = Decimal::from_str(&instrument.taker_commission.to_string())
         .context("Failed to parse taker_commission")?;
 
-    let perpetual = CryptoPerpetual::new(
-        instrument_id,
-        instrument.instrument_name.into(),
-        base_currency,
-        quote_currency,
-        settlement_currency,
-        is_inverse,
-        price_increment.precision,
-        size_increment.precision,
-        price_increment,
-        size_increment,
-        multiplier,
-        lot_size,
-        None, // max_quantity - Deribit doesn't specify a hard max
-        Some(min_quantity),
-        None, // max_notional
-        None, // min_notional
-        None, // max_price
-        None, // min_price
-        None, // margin_init
-        None, // margin_maint
-        Some(maker_fee),
-        Some(taker_fee),
-        None,
-        ts_event,
-        ts_init,
-    );
+    let perpetual = CryptoPerpetual::builder()
+        .instrument_id(instrument_id)
+        .raw_symbol(instrument.instrument_name.into())
+        .base_currency(base_currency)
+        .quote_currency(quote_currency)
+        .settlement_currency(settlement_currency)
+        .is_inverse(is_inverse)
+        .price_precision(price_increment.precision)
+        .size_precision(size_increment.precision)
+        .price_increment(price_increment)
+        .size_increment(size_increment)
+        .maybe_multiplier(multiplier)
+        .maybe_lot_size(lot_size)
+        // max_quantity - Deribit doesn't specify a hard max
+        .min_quantity(min_quantity)
+        .maker_fee(maker_fee)
+        .taker_fee(taker_fee)
+        .ts_event(ts_event)
+        .ts_init(ts_init)
+        .build()
+        .unwrap();
 
     Ok(InstrumentAny::CryptoPerpetual(perpetual))
 }
@@ -334,8 +318,7 @@ fn parse_future_instrument(
     let size_increment = Quantity::from_decimal(instrument.min_trade_amount)?;
     let min_quantity = Quantity::from_decimal(instrument.min_trade_amount)?;
 
-    // Contract size represents the multiplier
-    let multiplier = Some(Quantity::from_decimal(instrument.contract_size)?);
+    let multiplier = Some(deribit_amount_quantity_multiplier());
     let lot_size = Some(size_increment); // Use min_trade_amount as lot size
 
     let maker_fee = Decimal::from_str(&instrument.maker_commission.to_string())
@@ -343,35 +326,29 @@ fn parse_future_instrument(
     let taker_fee = Decimal::from_str(&instrument.taker_commission.to_string())
         .context("Failed to parse taker_commission")?;
 
-    let future = CryptoFuture::new(
-        instrument_id,
-        instrument.instrument_name.into(),
-        underlying,
-        quote_currency,
-        settlement_currency,
-        is_inverse,
-        UnixNanos::from(activation_ns),
-        UnixNanos::from(expiration_ns),
-        price_increment.precision,
-        size_increment.precision,
-        price_increment,
-        size_increment,
-        multiplier,
-        lot_size,
-        None, // max_quantity - Deribit doesn't specify a hard max
-        Some(min_quantity),
-        None, // max_notional
-        None, // min_notional
-        None, // max_price
-        None, // min_price
-        None, // margin_init
-        None, // margin_maint
-        Some(maker_fee),
-        Some(taker_fee),
-        None,
-        ts_event,
-        ts_init,
-    );
+    let future = CryptoFuture::builder()
+        .instrument_id(instrument_id)
+        .raw_symbol(instrument.instrument_name.into())
+        .underlying(underlying)
+        .quote_currency(quote_currency)
+        .settlement_currency(settlement_currency)
+        .is_inverse(is_inverse)
+        .activation_ns(UnixNanos::from(activation_ns))
+        .expiration_ns(UnixNanos::from(expiration_ns))
+        .price_precision(price_increment.precision)
+        .size_precision(size_increment.precision)
+        .price_increment(price_increment)
+        .size_increment(size_increment)
+        .maybe_multiplier(multiplier)
+        .maybe_lot_size(lot_size)
+        // max_quantity - Deribit doesn't specify a hard max
+        .min_quantity(min_quantity)
+        .maker_fee(maker_fee)
+        .taker_fee(taker_fee)
+        .ts_event(ts_event)
+        .ts_init(ts_init)
+        .build()
+        .unwrap();
 
     Ok(InstrumentAny::CryptoFuture(future))
 }
@@ -416,8 +393,7 @@ fn parse_option_instrument(
 
     let price_increment = Price::from_decimal(instrument.tick_size)?;
 
-    // Contract size is the multiplier (e.g., 1.0 for BTC options)
-    let multiplier = Quantity::from_decimal(instrument.contract_size)?;
+    let multiplier = deribit_amount_quantity_multiplier();
     let lot_size = Quantity::from_decimal(instrument.min_trade_amount)?;
     let min_trade_amount = Quantity::from_decimal(instrument.min_trade_amount)?;
 
@@ -426,37 +402,30 @@ fn parse_option_instrument(
     let taker_fee = Decimal::from_str(&instrument.taker_commission.to_string())
         .context("Failed to parse taker_commission")?;
 
-    let option = CryptoOption::new(
-        instrument_id,
-        instrument.instrument_name.into(),
-        underlying,
-        quote_currency,
-        settlement_currency,
-        is_inverse,
-        option_kind,
-        strike_price,
-        UnixNanos::from(activation_ns),
-        UnixNanos::from(expiration_ns),
-        price_increment.precision,
-        lot_size.precision,
-        price_increment,
-        lot_size,
-        Some(multiplier),
-        Some(lot_size),
-        None,
-        Some(min_trade_amount),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(maker_fee),
-        Some(taker_fee),
-        None,
-        ts_event,
-        ts_init,
-    );
+    let option = CryptoOption::builder()
+        .instrument_id(instrument_id)
+        .raw_symbol(instrument.instrument_name.into())
+        .underlying(underlying)
+        .quote_currency(quote_currency)
+        .settlement_currency(settlement_currency)
+        .is_inverse(is_inverse)
+        .option_kind(option_kind)
+        .strike_price(strike_price)
+        .activation_ns(UnixNanos::from(activation_ns))
+        .expiration_ns(UnixNanos::from(expiration_ns))
+        .price_precision(price_increment.precision)
+        .size_precision(lot_size.precision)
+        .price_increment(price_increment)
+        .size_increment(lot_size)
+        .multiplier(multiplier)
+        .lot_size(lot_size)
+        .min_quantity(min_trade_amount)
+        .maker_fee(maker_fee)
+        .taker_fee(taker_fee)
+        .ts_event(ts_event)
+        .ts_init(ts_init)
+        .build()
+        .unwrap();
 
     Ok(InstrumentAny::CryptoOption(option))
 }
@@ -468,36 +437,29 @@ fn parse_option_combo_instrument(
     ts_event: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
     let spread = build_spread_common(instrument, ts_init, ts_event)?;
-    let option_spread = CryptoOptionSpread::new(
-        spread.id,
-        spread.raw_symbol,
-        spread.underlying,
-        spread.quote_currency,
-        spread.settlement_currency,
-        spread.is_inverse,
-        spread.strategy_type,
-        spread.activation_ns,
-        spread.expiration_ns,
-        spread.price_precision,
-        spread.size_precision,
-        spread.price_increment,
-        spread.size_increment,
-        Some(spread.multiplier),
-        Some(spread.lot_size),
-        None,
-        Some(spread.size_increment),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(spread.maker_fee),
-        Some(spread.taker_fee),
-        None,
-        ts_event,
-        ts_init,
-    );
+    let option_spread = CryptoOptionSpread::builder()
+        .instrument_id(spread.id)
+        .raw_symbol(spread.raw_symbol)
+        .underlying(spread.underlying)
+        .quote_currency(spread.quote_currency)
+        .settlement_currency(spread.settlement_currency)
+        .is_inverse(spread.is_inverse)
+        .strategy_type(spread.strategy_type)
+        .activation_ns(spread.activation_ns)
+        .expiration_ns(spread.expiration_ns)
+        .price_precision(spread.price_precision)
+        .size_precision(spread.size_precision)
+        .price_increment(spread.price_increment)
+        .size_increment(spread.size_increment)
+        .multiplier(spread.multiplier)
+        .lot_size(spread.lot_size)
+        .min_quantity(spread.size_increment)
+        .maker_fee(spread.maker_fee)
+        .taker_fee(spread.taker_fee)
+        .ts_event(ts_event)
+        .ts_init(ts_init)
+        .build()
+        .unwrap();
     Ok(InstrumentAny::CryptoOptionSpread(option_spread))
 }
 
@@ -508,36 +470,29 @@ fn parse_future_combo_instrument(
     ts_event: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
     let spread = build_spread_common(instrument, ts_init, ts_event)?;
-    let futures_spread = CryptoFuturesSpread::new(
-        spread.id,
-        spread.raw_symbol,
-        spread.underlying,
-        spread.quote_currency,
-        spread.settlement_currency,
-        spread.is_inverse,
-        spread.strategy_type,
-        spread.activation_ns,
-        spread.expiration_ns,
-        spread.price_precision,
-        spread.size_precision,
-        spread.price_increment,
-        spread.size_increment,
-        Some(spread.multiplier),
-        Some(spread.lot_size),
-        None,
-        Some(spread.size_increment),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(spread.maker_fee),
-        Some(spread.taker_fee),
-        None,
-        ts_event,
-        ts_init,
-    );
+    let futures_spread = CryptoFuturesSpread::builder()
+        .instrument_id(spread.id)
+        .raw_symbol(spread.raw_symbol)
+        .underlying(spread.underlying)
+        .quote_currency(spread.quote_currency)
+        .settlement_currency(spread.settlement_currency)
+        .is_inverse(spread.is_inverse)
+        .strategy_type(spread.strategy_type)
+        .activation_ns(spread.activation_ns)
+        .expiration_ns(spread.expiration_ns)
+        .price_precision(spread.price_precision)
+        .size_precision(spread.size_precision)
+        .price_increment(spread.price_increment)
+        .size_increment(spread.size_increment)
+        .multiplier(spread.multiplier)
+        .lot_size(spread.lot_size)
+        .min_quantity(spread.size_increment)
+        .maker_fee(spread.maker_fee)
+        .taker_fee(spread.taker_fee)
+        .ts_event(ts_event)
+        .ts_init(ts_init)
+        .build()
+        .unwrap();
     Ok(InstrumentAny::CryptoFuturesSpread(futures_spread))
 }
 
@@ -592,7 +547,7 @@ fn build_spread_common(
 
     let price_increment = Price::from_decimal(instrument.tick_size)?;
     let size_increment = Quantity::from_decimal(instrument.min_trade_amount)?;
-    let multiplier = Quantity::from_decimal(instrument.contract_size)?;
+    let multiplier = deribit_amount_quantity_multiplier();
 
     let maker_fee = Decimal::from_str(&instrument.maker_commission.to_string())
         .context("Failed to parse maker_commission")?;
@@ -618,6 +573,11 @@ fn build_spread_common(
         maker_fee,
         taker_fee,
     })
+}
+
+fn deribit_amount_quantity_multiplier() -> Quantity {
+    // Deribit quantities use `amount`; `contract_size` converts amount to contract count
+    Quantity::from(1)
 }
 
 /// Parses Deribit account summaries into a Nautilus [`AccountState`].
@@ -835,8 +795,8 @@ pub fn parse_trade_tick(
 ) -> anyhow::Result<TradeTick> {
     // Parse aggressor side from direction
     let aggressor_side = match trade.direction.as_str() {
-        "buy" => AggressorSide::Buyer,
-        "sell" => AggressorSide::Seller,
+        "buy" => AggressorSide::Buy,
+        "sell" => AggressorSide::Sell,
         other => anyhow::bail!("Invalid trade direction: {other}"),
     };
     let price = Price::from_decimal_dp(trade.price, price_precision)?;
@@ -887,7 +847,7 @@ pub fn use_cost_for_bar_volume(instrument: &InstrumentAny) -> bool {
 /// into a vector of [`Bar`] objects.
 ///
 /// When `use_cost_for_volume` is true, `Bar.volume` is populated from `chart_data.cost` (USD)
-/// instead of `chart_data.volume` (base currency) — see [`use_cost_for_bar_volume`].
+/// instead of `chart_data.volume` (base currency) - see [`use_cost_for_bar_volume`].
 ///
 /// # Errors
 ///
@@ -1052,7 +1012,7 @@ pub fn bar_spec_to_resolution(bar_type: &BarType) -> String {
 
 #[cfg(test)]
 mod tests {
-    use nautilus_model::instruments::Instrument;
+    use nautilus_model::{instruments::Instrument, types::Money};
     use rstest::rstest;
     use rust_decimal_macros::dec;
 
@@ -1089,7 +1049,23 @@ mod tests {
         assert_eq!(perpetual.size_precision(), 0);
         assert_eq!(perpetual.price_increment(), Price::from("0.5"));
         assert_eq!(perpetual.size_increment(), Quantity::from("10"));
-        assert_eq!(perpetual.multiplier(), Quantity::from("10"));
+        assert_eq!(perpetual.multiplier(), Quantity::from("1"));
+        assert_eq!(
+            perpetual.calculate_notional_value(
+                Quantity::from("10"),
+                Price::from("50000"),
+                Some(false)
+            ),
+            Money::from("0.0002 BTC")
+        );
+        assert_eq!(
+            perpetual.calculate_notional_value(
+                Quantity::from("10"),
+                Price::from("50000"),
+                Some(true)
+            ),
+            Money::from("10 USD")
+        );
         assert_eq!(perpetual.lot_size(), Some(Quantity::from("10")));
         assert_eq!(perpetual.maker_fee(), dec!(0));
         assert_eq!(perpetual.taker_fee(), dec!(0.0005));
@@ -1136,7 +1112,7 @@ mod tests {
         assert_eq!(future.size_precision(), 0);
         assert_eq!(future.price_increment(), Price::from("0.5"));
         assert_eq!(future.size_increment(), Quantity::from("10"));
-        assert_eq!(future.multiplier(), Quantity::from("10"));
+        assert_eq!(future.multiplier(), Quantity::from("1"));
         assert_eq!(future.lot_size(), Some(Quantity::from("10")));
         assert_eq!(future.maker_fee, dec!(0));
         assert_eq!(future.taker_fee, dec!(0.0005));
@@ -1359,7 +1335,7 @@ mod tests {
         assert_eq!(trade.instrument_id, instrument_id);
         assert_eq!(trade.price, Price::from("2968.3"));
         assert_eq!(trade.size, Quantity::from("1"));
-        assert_eq!(trade.aggressor_side, AggressorSide::Seller);
+        assert_eq!(trade.aggressor_side, AggressorSide::Sell);
         assert_eq!(trade.trade_id, TradeId::new("ETH-284830839"));
         // timestamp 1766332040636 ms -> ns
         assert_eq!(
@@ -1387,7 +1363,7 @@ mod tests {
         assert_eq!(trade.instrument_id, instrument_id);
         assert_eq!(trade.price, Price::from("2968.3"));
         assert_eq!(trade.size, Quantity::from("106"));
-        assert_eq!(trade.aggressor_side, AggressorSide::Buyer);
+        assert_eq!(trade.aggressor_side, AggressorSide::Buy);
         assert_eq!(trade.trade_id, TradeId::new("ETH-284830854"));
     }
 
@@ -1468,7 +1444,7 @@ mod tests {
             "options report trade amount in base currency, must keep using volume",
         );
 
-        // Inverse future: same convention as perp — cost (USD)
+        // Inverse future: same convention as perp - cost (USD)
         let future_inst = instruments
             .iter()
             .find(|i| i.instrument_name.as_str() == "BTC-27DEC24")
@@ -1977,7 +1953,7 @@ mod tests {
         assert_eq!(spread.price_increment, Price::from("0.5"));
         assert_eq!(spread.size_precision, 0);
         assert_eq!(spread.size_increment, Quantity::from("10"));
-        assert_eq!(spread.multiplier, Quantity::from("10"));
+        assert_eq!(spread.multiplier, Quantity::from("1"));
         assert_eq!(spread.lot_size, Quantity::from("10"));
         assert_eq!(
             spread.expiration_ns,

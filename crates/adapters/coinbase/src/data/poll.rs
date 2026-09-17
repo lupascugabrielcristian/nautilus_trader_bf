@@ -34,15 +34,15 @@ use std::{
 };
 
 use ahash::AHashMap;
-use nautilus_common::{live::get_runtime, messages::DataEvent};
+use nautilus_common::messages::DataEvent;
 use nautilus_core::{MUTEX_POISONED, UnixNanos, time::AtomicTime};
+use nautilus_live::task::TaskGroup;
 use nautilus_model::{
     data::{Data, FundingRateUpdate, IndexPriceUpdate},
     identifiers::InstrumentId,
     types::Price,
 };
 use rust_decimal::Decimal;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::http::{client::CoinbaseHttpClient, models::Product};
@@ -83,7 +83,7 @@ pub(crate) struct DerivPollManager {
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
     clock: &'static AtomicTime,
     interval_secs: u64,
-    tasks: Mutex<Vec<JoinHandle<()>>>,
+    tasks: TaskGroup,
 }
 
 impl DerivPollManager {
@@ -99,7 +99,7 @@ impl DerivPollManager {
             data_sender,
             clock,
             interval_secs: interval_secs.max(1),
-            tasks: Mutex::new(Vec::new()),
+            tasks: TaskGroup::new(),
         }
     }
 
@@ -133,10 +133,28 @@ impl DerivPollManager {
             }
         }
 
-        let mut tasks = self.tasks.lock().expect(MUTEX_POISONED);
-        for handle in tasks.drain(..) {
-            handle.abort();
+        self.tasks.begin_shutdown();
+    }
+
+    pub(crate) async fn prepare(&self) -> anyhow::Result<()> {
+        if !self.tasks.is_open() {
+            self.tasks
+                .finish_shutdown(Duration::from_secs(1), Duration::from_secs(2))
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to finish Coinbase poll tasks: {e}"))?;
+            self.tasks
+                .start_generation()
+                .map_err(|e| anyhow::anyhow!("Failed to start Coinbase poll generation: {e}"))?;
         }
+        Ok(())
+    }
+
+    pub(crate) async fn finish_shutdown(&self) -> anyhow::Result<()> {
+        self.tasks
+            .finish_shutdown(Duration::from_secs(1), Duration::from_secs(2))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to finish Coinbase poll tasks: {e}"))?;
+        Ok(())
     }
 
     /// Spawns polling tasks for every entry with at least one active flag.
@@ -182,11 +200,6 @@ impl DerivPollManager {
             (entry.cancel.clone(), is_new)
         };
 
-        // Prune any completed poll handles before possibly pushing a new
-        // one so the task vec stays bounded under subscribe/unsubscribe
-        // churn on a long-lived client.
-        self.reap_finished_tasks();
-
         if is_new {
             self.spawn_task(instrument_id, token);
         }
@@ -213,17 +226,6 @@ impl DerivPollManager {
             entry.cancel.cancel();
         }
         drop(polls);
-
-        // Cancelled tasks finish asynchronously; drop any that already
-        // completed on this pass, and any prior cycles still sitting in
-        // the vec. This keeps `tasks.len()` bounded by the number of
-        // currently live poll loops.
-        self.reap_finished_tasks();
-    }
-
-    fn reap_finished_tasks(&self) {
-        let mut tasks = self.tasks.lock().expect(MUTEX_POISONED);
-        tasks.retain(|handle| !handle.is_finished());
     }
 
     fn spawn_task(&self, instrument_id: InstrumentId, cancel: CancellationToken) {
@@ -234,7 +236,7 @@ impl DerivPollManager {
         let clock = self.clock;
         let product_id = instrument_id.symbol.inner();
 
-        let handle = get_runtime().spawn(async move {
+        let future = async move {
             let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -294,9 +296,11 @@ impl DerivPollManager {
             }
 
             log::debug!("Coinbase derivatives poll task stopped for {instrument_id}");
-        });
+        };
 
-        self.tasks.lock().expect(MUTEX_POISONED).push(handle);
+        if let Err(e) = self.tasks.spawn(future) {
+            log::warn!("Skipping Coinbase derivatives poll after shutdown began: {e}");
+        }
     }
 }
 
@@ -321,7 +325,7 @@ pub(crate) fn emit_deriv_updates(
         && let Ok(price) = Price::from_decimal_dp(decimal, precision_from_index(raw))
     {
         let update = IndexPriceUpdate::new(instrument_id, price, ts_now, ts_now);
-        if let Err(e) = sender.send(DataEvent::Data(Data::IndexPriceUpdate(update))) {
+        if let Err(e) = sender.send(DataEvent::Data(Data::IndexPrice(update))) {
             log::error!("Failed to send IndexPriceUpdate for {instrument_id}: {e}");
         }
     }
@@ -451,7 +455,7 @@ mod tests {
 
         while let Ok(evt) = rx.try_recv() {
             match evt {
-                DataEvent::Data(Data::IndexPriceUpdate(ip)) => {
+                DataEvent::Data(Data::IndexPrice(ip)) => {
                     got_index = Some(ip);
                 }
                 DataEvent::FundingRate(fr) => got_funding = Some(fr),
@@ -536,28 +540,36 @@ mod tests {
             .clone();
         assert!(!old_token.is_cancelled(), "token is live before shutdown");
         assert_eq!(
-            manager.tasks.lock().unwrap().len(),
+            manager.tasks.len(),
             1,
             "one shared task spawned for two subscriptions on the same instrument"
         );
 
         manager.shutdown();
 
-        let polls = manager.polls.lock().unwrap();
-        let entry = polls.get(&instrument_id).expect("shutdown preserves entry");
-        assert!(entry.emit_index);
-        assert!(entry.emit_funding);
+        {
+            let polls = manager.polls.lock().unwrap();
+            let entry = polls.get(&instrument_id).expect("shutdown preserves entry");
+            assert!(entry.emit_index);
+            assert!(entry.emit_funding);
+            assert!(
+                old_token.is_cancelled(),
+                "shutdown must cancel the previously-live token"
+            );
+            assert!(
+                !entry.cancel.is_cancelled(),
+                "shutdown must swap in a fresh token so resume() can spawn"
+            );
+            assert!(
+                !manager.tasks.is_open(),
+                "shutdown must close task admission"
+            );
+        }
+
+        manager.prepare().await.unwrap();
         assert!(
-            old_token.is_cancelled(),
-            "shutdown must cancel the previously-live token"
-        );
-        assert!(
-            !entry.cancel.is_cancelled(),
-            "shutdown must swap in a fresh token so resume() can spawn"
-        );
-        assert!(
-            manager.tasks.lock().unwrap().is_empty(),
-            "shutdown must drain the task vec"
+            manager.tasks.is_empty(),
+            "prepare must drain the old generation"
         );
     }
 
@@ -580,7 +592,7 @@ mod tests {
         drop(polls);
 
         assert_eq!(
-            manager.tasks.lock().unwrap().len(),
+            manager.tasks.len(),
             1,
             "two subscribes for the same id must share one poll task"
         );
@@ -698,15 +710,8 @@ mod tests {
         );
     }
 
-    // Under steady-state subscribe / unsubscribe churn, completed poll
-    // handles must not accumulate in the task vec. Without the reap step
-    // a long-lived client that repeatedly flips subscriptions leaks one
-    // JoinHandle per cycle.
-    //
-    // The test asserts the invariant through the public surface only:
-    // it never calls `reap_finished_tasks()` directly, so any regression
-    // that removes the reap from `register` or `unregister` would fail
-    // here.
+    // Completed handles stay registered until shutdown so their join failures remain observable.
+    // Draining the old generation must release them before a replacement poll starts.
     #[rstest]
     #[tokio::test]
     async fn test_manager_does_not_leak_task_handles_on_churn() {
@@ -716,24 +721,18 @@ mod tests {
         for _ in 0..20 {
             manager.subscribe_index(instrument_id);
             manager.unsubscribe_index(instrument_id);
-            // Let each cancelled task notice the token flip and return
-            // so the next register's reap can drop its handle.
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
 
-        // After the churn loop the manager may still be holding the
-        // final cycle's handle because nothing has reaped since it was
-        // cancelled. Wait for that task to finish, then trigger one more
-        // subscribe: register's leading reap sweeps every accumulated
-        // handle before pushing its own.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        manager.shutdown();
+        manager.prepare().await.unwrap();
+
         manager.subscribe_index(instrument_id);
 
-        assert!(
-            manager.tasks.lock().unwrap().len() <= 1,
-            "task vec should stay bounded under subscribe/unsubscribe churn, \
-             was {}",
-            manager.tasks.lock().unwrap().len()
+        let task_count = manager.tasks.len();
+        assert_eq!(
+            task_count, 1,
+            "task group should release the drained generation before resubscribe, \
+             was {task_count}"
         );
 
         manager.unsubscribe_index(instrument_id);
@@ -750,7 +749,8 @@ mod tests {
         manager.subscribe_index(instrument_id);
         manager.subscribe_funding(instrument_id);
         manager.shutdown();
-        assert!(manager.tasks.lock().unwrap().is_empty());
+        manager.prepare().await.unwrap();
+        assert!(manager.tasks.is_empty());
 
         manager.resume();
 
@@ -762,7 +762,7 @@ mod tests {
         drop(polls);
 
         assert_eq!(
-            manager.tasks.lock().unwrap().len(),
+            manager.tasks.len(),
             1,
             "resume spawns one task per entry with any active flag"
         );
@@ -788,7 +788,7 @@ mod tests {
 
         manager.resume();
         assert!(
-            manager.tasks.lock().unwrap().is_empty(),
+            manager.tasks.is_empty(),
             "resume must not spawn for zero-flag entries"
         );
     }
@@ -816,7 +816,7 @@ mod tests {
 
         while let Ok(evt) = rx.try_recv() {
             match evt {
-                DataEvent::Data(Data::IndexPriceUpdate(_)) => {
+                DataEvent::Data(Data::IndexPrice(_)) => {
                     got_index = true;
                 }
                 DataEvent::FundingRate(_) => got_funding = true,
@@ -873,7 +873,7 @@ mod tests {
 
         while let Ok(evt) = rx.try_recv() {
             match evt {
-                DataEvent::Data(Data::IndexPriceUpdate(_)) => {
+                DataEvent::Data(Data::IndexPrice(_)) => {
                     got_index = true;
                 }
                 DataEvent::FundingRate(_) => got_funding = true,

@@ -4,19 +4,20 @@ Render the AX XAU-PERP book imbalance tutorial panels from a backtest run.
 Usage:
 
     uv sync --extra visualization
-    GC_DBN=tests/test_data/local/Databento/gc_gold_quotes.dbn.zst \
+    GC_DBN=test_data/local/Databento/gc_gold_quotes.dbn.zst \
         python3 docs/tutorials/assets/gold_book_imbalance_ax/render_panels.py
 
-Replays a Databento ``GC.v.0`` mbp-1 file through the shipped
-``OrderBookImbalance`` strategy with `use_quote_ticks=True`. Quote ticks are
-sampled once per second by an actor for the panels, then four PNGs are
-written using the ``nautilus_dark`` tearsheet theme.
+Replays a Databento ``GC.v.0`` mbp-1 file through the AX example
+``OrderBookImbalance`` strategy. Quote ticks are sampled once per second by an
+actor for the panels, then four PNGs are written using the ``nautilus_dark``
+tearsheet theme.
 
 """
 
 from __future__ import annotations
 
 import os
+import sys
 from decimal import Decimal
 from pathlib import Path
 
@@ -28,34 +29,38 @@ from plotly.subplots import make_subplots
 from nautilus_trader.adapters.databento import DatabentoDataLoader
 from nautilus_trader.analysis.tearsheet import _write_figure
 from nautilus_trader.analysis.themes import get_theme
-from nautilus_trader.backtest.config import BacktestEngineConfig
-from nautilus_trader.backtest.engine import BacktestEngine
-from nautilus_trader.cache.config import CacheConfig
-from nautilus_trader.common.actor import Actor
-from nautilus_trader.common.config import ActorConfig
-from nautilus_trader.config import LoggingConfig
-from nautilus_trader.examples.strategies.orderbook_imbalance import OrderBookImbalance
-from nautilus_trader.examples.strategies.orderbook_imbalance import OrderBookImbalanceConfig
-from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.data import QuoteTick
-from nautilus_trader.model.enums import AccountType
-from nautilus_trader.model.enums import AssetClass
-from nautilus_trader.model.enums import OmsType
-from nautilus_trader.model.identifiers import InstrumentId
-from nautilus_trader.model.identifiers import Symbol
-from nautilus_trader.model.identifiers import TraderId
-from nautilus_trader.model.identifiers import Venue
-from nautilus_trader.model.instruments import PerpetualContract
-from nautilus_trader.model.objects import Money
-from nautilus_trader.model.objects import Price
-from nautilus_trader.model.objects import Quantity
+from nautilus_trader.config import BacktestEngineConfig
+from nautilus_trader.backtest import BacktestEngine
+from nautilus_trader.config import CacheConfig
+from nautilus_trader.common import DataActor
+from nautilus_trader.common import LogLevel
+from nautilus_trader.config import DataActorConfig
+from nautilus_trader.config import LoggerConfig
+from nautilus_trader.model import AccountType
+from nautilus_trader.model import AssetClass
+from nautilus_trader.model import Currency
+from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import Money
+from nautilus_trader.model import OmsType
+from nautilus_trader.model import PerpetualContract
+from nautilus_trader.model import Price
+from nautilus_trader.model import Quantity
+from nautilus_trader.model import QuoteTick
+from nautilus_trader.model import Symbol
+from nautilus_trader.model import TraderId
+from nautilus_trader.model import Venue
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "examples" / "live" / "architect_ax"))
+from strategies import OrderBookImbalance
+from strategies import OrderBookImbalanceConfig
 
 
 OUT = Path(__file__).resolve().parent
+USD = Currency.from_str("USD")
 GC_DBN = Path(
     os.environ.get(
         "GC_DBN",
-        "tests/test_data/local/Databento/gc_gold_quotes.dbn.zst",
+        "test_data/local/Databento/gc_gold_quotes.dbn.zst",
     ),
 )
 
@@ -72,12 +77,26 @@ TRIGGER_RATIO = 0.10
 MIN_TRIGGER_SIZE = 1.0
 
 
-class QuoteSamplerConfig(ActorConfig, frozen=True):
-    instrument_id: InstrumentId
-    sample_every_secs: int = 1
+class QuoteSamplerConfig(DataActorConfig):
+    _CUSTOM_FIELDS = ("instrument_id", "sample_every_secs")
+
+    def __new__(cls, *args: object, **kwargs: object) -> object:
+        for key in cls._CUSTOM_FIELDS:
+            kwargs.pop(key, None)
+        return super().__new__(cls, *args, **kwargs)
+
+    def __init__(
+        self,
+        instrument_id: InstrumentId,
+        sample_every_secs: int = 1,
+        **_kwargs: object,
+    ) -> None:
+        super().__init__()
+        self.instrument_id = instrument_id
+        self.sample_every_secs = sample_every_secs
 
 
-class QuoteSampler(Actor):
+class QuoteSampler(DataActor):
     def __init__(self, config: QuoteSamplerConfig) -> None:
         super().__init__(config)
         self.samples: list[dict] = []
@@ -85,9 +104,9 @@ class QuoteSampler(Actor):
         self._interval_ns = config.sample_every_secs * 1_000_000_000
 
     def on_start(self) -> None:
-        self.subscribe_quote_ticks(self.config.instrument_id)
+        self.subscribe_quotes(self.config.instrument_id)
 
-    def on_quote_tick(self, tick: QuoteTick) -> None:
+    def on_quote(self, tick: QuoteTick) -> None:
         ts = tick.ts_event
         if ts - self._last_sample_ns < self._interval_ns:
             return
@@ -119,7 +138,7 @@ def apply_layout(fig: go.Figure, title: str, height: int = 480) -> None:
     fig.update_yaxes(gridcolor=GRID, zeroline=False)
 
 
-def run_backtest():
+def run_backtest() -> object:
     instrument_id = InstrumentId.from_str("XAU-PERP.AX")
     XAU_PERP = PerpetualContract(
         instrument_id=instrument_id,
@@ -143,13 +162,20 @@ def run_backtest():
         ts_init=0,
     )
 
-    loader = DatabentoDataLoader()
-    quotes = loader.from_dbn_file(path=str(GC_DBN), instrument_id=instrument_id)
+    publishers_path = (
+        Path(__file__).resolve().parents[4]
+        / "crates"
+        / "adapters"
+        / "databento"
+        / "publishers.json"
+    )
+    loader = DatabentoDataLoader(publishers_path)
+    quotes = loader.load_quotes(filepath=GC_DBN, instrument_id=instrument_id)
 
     engine = BacktestEngine(
         BacktestEngineConfig(
             trader_id=TraderId("BACKTESTER-001"),
-            logging=LoggingConfig(log_level="ERROR"),
+            logging=LoggerConfig(stdout_level=LogLevel.ERROR),
             cache=CacheConfig(bar_capacity=10_000, tick_capacity=10_000),
         ),
     )
@@ -172,19 +198,17 @@ def run_backtest():
         OrderBookImbalanceConfig(
             instrument_id=instrument_id,
             max_trade_size=Decimal(10),
-            trigger_min_size=MIN_TRIGGER_SIZE,
-            trigger_imbalance_ratio=TRIGGER_RATIO,
+            trigger_min_size=Decimal(str(MIN_TRIGGER_SIZE)),
+            trigger_imbalance_ratio=Decimal(str(TRIGGER_RATIO)),
             min_seconds_between_triggers=5.0,
-            book_type="L1_MBP",
-            use_quote_ticks=True,
         ),
     )
     engine.add_strategy(strategy)
     engine.run()
 
     samples = pd.DataFrame(sampler.samples)
-    fills = engine.trader.generate_fills_report()
-    positions = engine.trader.generate_positions_report()
+    fills = engine.generate_fills_report()
+    positions = engine.generate_positions_report()
     return samples, fills, positions
 
 
@@ -204,7 +228,7 @@ def fills_to_records(fills: pd.DataFrame) -> list[dict]:
     ]
 
 
-def walk_fills_netting(fills: list[dict]):
+def walk_fills_netting(fills: list[dict]) -> object:
     entries: list[dict] = []
     closes: list[dict] = []
     pos = 0.0
@@ -227,7 +251,7 @@ def walk_fills_netting(fills: list[dict]):
 def panel_a_top_book(
     samples: pd.DataFrame,
     fills: pd.DataFrame,
-    positions: pd.DataFrame,
+    _positions: pd.DataFrame,
 ) -> go.Figure:
     fig = go.Figure()
     if samples.empty:

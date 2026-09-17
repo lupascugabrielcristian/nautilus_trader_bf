@@ -13,14 +13,14 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use core::fmt::NumBuffer;
 use std::{
     cell::RefCell,
     fmt::{Debug, Write},
     rc::Rc,
 };
 
-use chrono::{DateTime, Datelike, Timelike};
-use itoa::Buffer;
+use jiff::{Timestamp, tz::Offset};
 use nautilus_core::uuid::UUID4;
 use nautilus_model::identifiers::{ClientOrderId, StrategyId, TraderId};
 
@@ -53,8 +53,12 @@ fn write_fixed_prefix(
     use_hyphens: bool,
     epoch_second: u64,
 ) {
-    let now_utc = DateTime::from_timestamp_millis((epoch_second * 1_000) as i64)
-        .expect("Milliseconds timestamp should be within valid range");
+    let now_utc = Offset::UTC.to_datetime(
+        Timestamp::from_second(
+            i64::try_from(epoch_second).expect("seconds timestamp should fit i64"),
+        )
+        .expect("seconds timestamp should be within valid range"),
+    );
 
     buf.clear();
 
@@ -97,7 +101,7 @@ pub struct ClientOrderIdGenerator {
     buf: String,
     fixed_prefix_len: usize,
     epoch_second: u64,
-    count_buf: Buffer,
+    count_buf: NumBuffer<usize>,
 }
 
 impl Debug for ClientOrderIdGenerator {
@@ -147,7 +151,7 @@ impl ClientOrderIdGenerator {
             buf,
             fixed_prefix_len: 0,
             epoch_second: u64::MAX,
-            count_buf: Buffer::new(),
+            count_buf: NumBuffer::new(),
         }
     }
 
@@ -201,7 +205,8 @@ impl ClientOrderIdGenerator {
         // The hot path only truncates the old count and appends the new count, avoiding repeated
         // copies of the fixed prefix.
         self.buf.truncate(self.fixed_prefix_len);
-        self.buf.push_str(self.count_buf.format(self.count));
+        self.buf
+            .push_str(self.count.format_into(&mut self.count_buf));
 
         ClientOrderId::from(self.buf.as_str())
     }

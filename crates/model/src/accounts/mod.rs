@@ -21,8 +21,9 @@ pub mod betting;
 pub mod cash;
 pub mod margin;
 pub mod margin_model;
+pub mod wallet;
 
-#[cfg(any(test, feature = "stubs"))]
+#[cfg(any(test, feature = "test-support"))]
 pub mod stubs;
 
 use enum_dispatch::enum_dispatch;
@@ -32,7 +33,7 @@ use nautilus_core::UnixNanos;
 // Re-exports
 pub use crate::accounts::{
     any::AccountAny, base::BaseAccount, betting::BettingAccount, cash::CashAccount,
-    margin::MarginAccount,
+    margin::MarginAccount, wallet::WalletAccount,
 };
 use crate::{
     enums::{AccountType, LiquiditySide, OrderSide},

@@ -16,13 +16,15 @@
 //! Error structures and enumerations for the OKX integration.
 //!
 //! The JSON error schema is described in the OKX documentation under
-//! *REST API > Error Codes* – <https://www.okx.com/docs-v5/en/#error-codes>.
+//! *REST API > Error Codes* - <https://www.okx.com/docs-v5/en/#error-codes>.
 //! The types below mirror that structure and are reused across the entire
 //! crate.
 
 use nautilus_network::http::{HttpClientError, StatusCode};
 use serde::Deserialize;
 use thiserror::Error;
+
+use crate::common::consts::should_retry_error_code;
 
 /// Represents a build error for query parameter validation.
 #[derive(Debug, Error)]
@@ -89,6 +91,15 @@ pub enum OKXHttpError {
     /// Any unknown HTTP status or unexpected response from OKX.
     #[error("Unexpected HTTP status code {status}: {body}")]
     UnexpectedStatus { status: StatusCode, body: String },
+    /// A single retry attempt exceeded its configured timeout.
+    #[error("Operation timed out after {timeout_ms}ms")]
+    OperationTimeout { timeout_ms: u64 },
+    /// The retry elapsed-time budget was exhausted.
+    #[error("Retry budget exceeded: {0}")]
+    RetryBudgetExceeded(String),
+    /// The venue returned a successful envelope with no result items.
+    #[error("Empty response")]
+    EmptyResponse,
 }
 
 impl From<String> for OKXHttpError {
@@ -102,5 +113,69 @@ impl From<String> for OKXHttpError {
 impl From<serde_json::Error> for OKXHttpError {
     fn from(error: serde_json::Error) -> Self {
         Self::JsonError(error.to_string())
+    }
+}
+
+impl OKXHttpError {
+    /// Returns whether OKX reported that the requested order does not exist.
+    #[must_use]
+    pub fn is_order_not_found(&self) -> bool {
+        matches!(
+            self,
+            Self::OkxError { error_code, .. } if error_code == "51603"
+        )
+    }
+
+    /// Returns whether this error is retryable.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::HttpClientError(_) | Self::OperationTimeout { .. } => true,
+            Self::UnexpectedStatus { status, .. } => {
+                status.as_u16() >= 500 || status.as_u16() == 429
+            }
+            Self::OkxError { error_code, .. } => should_retry_error_code(error_code),
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case(OKXHttpError::HttpClientError(HttpClientError::Error("timeout".to_string())), true)]
+    #[case(OKXHttpError::UnexpectedStatus { status: StatusCode::INTERNAL_SERVER_ERROR, body: String::new() }, true)]
+    #[case(OKXHttpError::UnexpectedStatus { status: StatusCode::TOO_MANY_REQUESTS, body: String::new() }, true)]
+    #[case(OKXHttpError::UnexpectedStatus { status: StatusCode::FORBIDDEN, body: String::new() }, false)]
+    #[case(OKXHttpError::OkxError { error_code: "50001".to_string(), message: String::new() }, true)]
+    #[case(OKXHttpError::OkxError { error_code: "50011".to_string(), message: String::new() }, true)]
+    #[case(OKXHttpError::OkxError { error_code: "51000".to_string(), message: String::new() }, false)]
+    #[case(OKXHttpError::JsonError("bad".to_string()), false)]
+    #[case(OKXHttpError::ValidationError("bad".to_string()), false)]
+    #[case(OKXHttpError::MissingCredentials, false)]
+    #[case(OKXHttpError::Canceled("shutdown".to_string()), false)]
+    #[case(OKXHttpError::OperationTimeout { timeout_ms: 1_000 }, true)]
+    #[case(OKXHttpError::RetryBudgetExceeded("budget".to_string()), false)]
+    #[case(OKXHttpError::EmptyResponse, false)]
+    fn test_is_retryable(#[case] error: OKXHttpError, #[case] expected: bool) {
+        assert_eq!(error.is_retryable(), expected);
+    }
+
+    #[rstest]
+    #[case(OKXHttpError::OkxError {
+        error_code: "51603".to_string(),
+        message: "Order does not exist".to_string(),
+    }, true)]
+    #[case(OKXHttpError::OkxError {
+        error_code: "51000".to_string(),
+        message: "Parameter error".to_string(),
+    }, false)]
+    #[case(OKXHttpError::ValidationError("bad".to_string()), false)]
+    fn test_is_order_not_found(#[case] error: OKXHttpError, #[case] expected: bool) {
+        assert_eq!(error.is_order_not_found(), expected);
     }
 }

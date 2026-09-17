@@ -15,13 +15,14 @@
 
 //! Python bindings for Coinbase configuration.
 
-use nautilus_model::enums::AccountType;
+use nautilus_model::{enums::AccountType, identifiers::AccountId};
+use nautilus_network::websocket::TransportBackend;
 use pyo3::pymethods;
 use rust_decimal::Decimal;
 
 use crate::{
     common::enums::{CoinbaseEnvironment, CoinbaseMarginType},
-    config::{CoinbaseDataClientConfig, CoinbaseExecClientConfig},
+    config::{CoinbaseDataClientConfig, CoinbaseExecutionClientConfig},
 };
 
 #[pymethods]
@@ -40,6 +41,7 @@ impl CoinbaseDataClientConfig {
         ws_timeout_secs = None,
         update_instruments_interval_mins = None,
         derivatives_poll_interval_secs = None,
+        transport_backend = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -53,6 +55,7 @@ impl CoinbaseDataClientConfig {
         ws_timeout_secs: Option<u64>,
         update_instruments_interval_mins: Option<u64>,
         derivatives_poll_interval_secs: Option<u64>,
+        transport_backend: Option<TransportBackend>,
     ) -> Self {
         let defaults = Self::default();
         Self {
@@ -68,27 +71,27 @@ impl CoinbaseDataClientConfig {
                 .unwrap_or(defaults.update_instruments_interval_mins),
             derivatives_poll_interval_secs: derivatives_poll_interval_secs
                 .unwrap_or(defaults.derivatives_poll_interval_secs),
-            transport_backend: defaults.transport_backend,
+            transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
         }
     }
 
-    /// Returns the optional proxy URL for HTTP and WebSocket transports.
     #[getter]
-    fn proxy_url(&self) -> Option<String> {
-        self.proxy_url.clone()
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
     }
 
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(CoinbaseDataClientConfig).to_string()
     }
 }
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl CoinbaseExecClientConfig {
+impl CoinbaseExecutionClientConfig {
     /// Configuration for the Coinbase live execution client.
     #[new]
     #[pyo3(signature = (
+        account_id = None,
         api_key = None,
         api_secret = None,
         base_url_rest = None,
@@ -103,9 +106,11 @@ impl CoinbaseExecClientConfig {
         default_margin_type = None,
         default_leverage = None,
         retail_portfolio_id = None,
+        transport_backend = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
+        account_id: Option<AccountId>,
         api_key: Option<String>,
         api_secret: Option<String>,
         base_url_rest: Option<String>,
@@ -120,9 +125,11 @@ impl CoinbaseExecClientConfig {
         default_margin_type: Option<CoinbaseMarginType>,
         default_leverage: Option<Decimal>,
         retail_portfolio_id: Option<String>,
+        transport_backend: Option<TransportBackend>,
     ) -> Self {
         let defaults = Self::default();
         Self {
+            account_id: account_id.unwrap_or(defaults.account_id),
             api_key,
             api_secret,
             base_url_rest,
@@ -138,17 +145,16 @@ impl CoinbaseExecClientConfig {
             default_margin_type,
             default_leverage,
             retail_portfolio_id,
-            transport_backend: defaults.transport_backend,
+            transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
         }
     }
 
-    /// Returns the optional proxy URL for HTTP and WebSocket transports.
     #[getter]
-    fn proxy_url(&self) -> Option<String> {
-        self.proxy_url.clone()
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
     }
 
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(CoinbaseExecutionClientConfig).to_string()
     }
 }

@@ -145,7 +145,7 @@ impl LimitOrder {
 
     #[staticmethod]
     #[pyo3(name = "closing_side")]
-    fn py_closing_side(side: PositionSide) -> OrderSide {
+    fn py_closing_side(side: PositionSide) -> Option<OrderSide> {
         OrderCore::closing_side(side)
     }
 
@@ -400,7 +400,7 @@ impl LimitOrder {
     fn py_tags(&self) -> Option<Vec<&str>> {
         self.tags
             .as_ref()
-            .map(|vec| vec.iter().map(|s| s.as_str()).collect())
+            .map(|vec| vec.iter().map(Ustr::as_str).collect())
     }
 
     #[getter]
@@ -465,7 +465,7 @@ impl LimitOrder {
 
     #[pyo3(name = "apply")]
     fn py_apply(&mut self, event: Py<PyAny>, py: Python<'_>) -> PyResult<()> {
-        let event_any = pyobject_to_order_event(py, event).unwrap();
+        let event_any = pyobject_to_order_event(py, event)?;
         self.apply(event_any).map_err(to_pyruntime_err)
     }
 
@@ -612,8 +612,7 @@ impl LimitOrder {
             || dict.set_item("linked_order_ids", py.None()),
             |linked_order_ids| {
                 let linked_order_ids_list =
-                    PyList::new(py, linked_order_ids.iter().map(ToString::to_string))
-                        .expect("Invalid `ExactSizeIterator`");
+                    PyList::new(py, linked_order_ids.iter().map(ToString::to_string))?;
                 dict.set_item("linked_order_ids", linked_order_ids_list)
             },
         )?;
@@ -645,7 +644,7 @@ impl LimitOrder {
             |x| {
                 dict.set_item(
                     "tags",
-                    x.iter().map(|x| x.to_string()).collect::<Vec<String>>(),
+                    x.iter().map(ToString::to_string).collect::<Vec<String>>(),
                 )
             },
         )?;
@@ -671,7 +670,7 @@ impl LimitOrder {
         )?;
         self.avg_px.map_or_else(
             || dict.set_item("avg_px", py.None()),
-            |x| dict.set_item("avg_px", x),
+            |x| dict.set_item("avg_px", x.to_string()),
         )?;
         Ok(dict.into())
     }

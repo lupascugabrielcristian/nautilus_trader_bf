@@ -152,7 +152,7 @@ impl DydxGrpcClient {
 
             match Self::new(url_str.to_string()).await {
                 Ok(client) => {
-                    log::info!("Successfully connected to gRPC node: {url_str}");
+                    log::debug!("Successfully connected to gRPC node: {url_str}");
                     return Ok(client);
                 }
                 Err(e) => {
@@ -229,7 +229,7 @@ impl DydxGrpcClient {
 
             match endpoint.connect().await {
                 Ok(connected_channel) => {
-                    log::info!("Successfully reconnected to gRPC node: {url_str}");
+                    log::debug!("Successfully reconnected to gRPC node: {url_str}");
 
                     // Update all service clients with the new channel
                     self.channel = connected_channel.clone();
@@ -455,9 +455,11 @@ impl DydxGrpcClient {
     /// # Errors
     ///
     /// Returns an error if simulation fails.
-    #[allow(deprecated)]
     pub async fn simulate_tx(&mut self, tx_bytes: Vec<u8>) -> Result<u64, anyhow::Error> {
-        let req = SimulateRequest { tx_bytes, tx: None };
+        let req = SimulateRequest {
+            tx_bytes,
+            ..Default::default()
+        };
         let gas_used = self
             .tx
             .simulate(req)
@@ -545,11 +547,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_with_fallback_invalid_urls() {
-        // Test with invalid URLs that will fail to connect
-        let invalid_urls = vec!["invalid://bad-url", "http://0.0.0.0:1"];
+        // Use malformed URLs that fail deterministically during parsing
+        let invalid_urls = vec!["http://", "http://[::1"];
         let result = DydxGrpcClient::new_with_fallback(&invalid_urls).await;
 
-        // Should fail with either Config or Grpc error
-        assert!(result.is_err());
+        assert!(matches!(result, Err(DydxError::Config(_))));
     }
 }

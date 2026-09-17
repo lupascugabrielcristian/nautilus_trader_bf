@@ -27,7 +27,6 @@ use nautilus_model::{
     },
     enums::{BookType, OtoTriggerMode},
     identifiers::{InstrumentId, Venue},
-    instruments::Instrument,
     types::Money,
 };
 use nautilus_persistence::backend::{catalog::ParquetDataCatalog, session::QueryResult};
@@ -45,7 +44,7 @@ use crate::{
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.backtest", unsendable)
+    pyo3::pyclass(module = "nautilus_trader.backtest", unsendable)
 )]
 #[cfg_attr(
     feature = "python",
@@ -85,123 +84,29 @@ impl BacktestNode {
     /// Builds backtest engines from the run configurations.
     ///
     /// For each config, creates a [`BacktestEngine`], adds venues, and loads
-    /// instruments from the catalog.
+    /// instruments from the catalog. If building a config fails with
+    /// [`BacktestRunConfig::raise_exception`] disabled, logs the error and skips that config;
+    /// successful return does not guarantee an engine for every config.
     ///
     /// # Errors
     ///
-    /// Returns an error if engine creation, venue setup, or instrument loading fails.
+    /// Returns an error if building an engine from a config fails and
+    /// [`BacktestRunConfig::raise_exception`] is enabled for that config.
     pub fn build(&mut self) -> anyhow::Result<()> {
         for config in &self.configs {
             if self.engines.contains_key(config.id()) {
                 continue;
             }
 
-            let engine_config = config.engine().clone();
-            let mut engine = BacktestEngine::new(engine_config)?;
-
-            for venue_config in config.venues() {
-                let starting_balances: Vec<Money> = venue_config
-                    .starting_balances()
-                    .iter()
-                    .map(|s| s.parse::<Money>())
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| anyhow::anyhow!("Invalid starting balance: {e}"))?;
-
-                let default_leverage = venue_config.default_leverage();
-                let leverages = venue_config.leverages().cloned().unwrap_or_default();
-                let margin_model = venue_config.margin_model().cloned();
-                let modules = venue_config
-                    .modules()
-                    .iter()
-                    .cloned()
-                    .map(Into::into)
-                    .collect();
-                let fill_model = venue_config.fill_model().cloned().unwrap_or_default();
-                let fee_model = venue_config.fee_model().cloned().unwrap_or_default();
-                let latency_model = venue_config.latency_model().cloned().map(Into::into);
-                let sim_config = SimulatedVenueConfig::builder()
-                    .venue(Venue::from(venue_config.name().as_str()))
-                    .oms_type(venue_config.oms_type())
-                    .account_type(venue_config.account_type())
-                    .book_type(venue_config.book_type())
-                    .starting_balances(starting_balances)
-                    .maybe_base_currency(venue_config.base_currency())
-                    .default_leverage(default_leverage)
-                    .leverages(leverages)
-                    .maybe_margin_model(margin_model)
-                    .modules(modules)
-                    .fill_model(fill_model)
-                    .fee_model(fee_model)
-                    .maybe_latency_model(latency_model)
-                    .routing(venue_config.routing())
-                    .reject_stop_orders(venue_config.reject_stop_orders())
-                    .support_gtd_orders(venue_config.support_gtd_orders())
-                    .support_contingent_orders(venue_config.support_contingent_orders())
-                    .use_position_ids(venue_config.use_position_ids())
-                    .use_random_ids(venue_config.use_random_ids())
-                    .use_reduce_only(venue_config.use_reduce_only())
-                    .use_market_order_acks(venue_config.use_market_order_acks())
-                    .bar_execution(venue_config.bar_execution())
-                    .bar_adaptive_high_low_ordering(venue_config.bar_adaptive_high_low_ordering())
-                    .trade_execution(venue_config.trade_execution())
-                    .liquidity_consumption(venue_config.liquidity_consumption())
-                    .allow_cash_borrowing(venue_config.allow_cash_borrowing())
-                    .frozen_account(venue_config.frozen_account())
-                    .queue_position(venue_config.queue_position())
-                    .oto_full_trigger(venue_config.oto_trigger_mode() == OtoTriggerMode::Full)
-                    .price_protection_points(venue_config.price_protection_points())
-                    .liquidation_enabled(venue_config.liquidation_enabled())
-                    .liquidation_trigger_ratio(venue_config.liquidation_trigger_ratio())
-                    .liquidation_cancel_open_orders(venue_config.liquidation_cancel_open_orders())
-                    .build();
-                engine.add_venue(sim_config)?;
-            }
-
-            for data_config in config.data() {
-                let catalog = create_catalog(data_config)?;
-                let instr_ids: Vec<InstrumentId> = data_config.get_instrument_ids()?;
-                let filter: Option<Vec<String>> = if instr_ids.is_empty() {
-                    None
-                } else {
-                    Some(instr_ids.iter().map(ToString::to_string).collect())
-                };
-
-                let instruments = catalog.query_instruments(filter.as_deref())?;
-
-                if !instr_ids.is_empty() && instruments.is_empty() {
-                    let ids: Vec<String> = instr_ids.iter().map(ToString::to_string).collect();
-                    anyhow::bail!(
-                        "No instruments found in catalog for requested IDs: [{}]",
-                        ids.join(", ")
-                    );
+            match build_engine(config) {
+                Ok(engine) => {
+                    self.engines.insert(config.id().to_string(), engine);
                 }
-
-                for instrument in instruments {
-                    engine.add_instrument(&instrument)?;
+                Err(e) if config.raise_exception() => return Err(e),
+                Err(e) => {
+                    log::error!("Error building backtest '{}': {e:#}", config.id());
                 }
             }
-
-            for venue_config in config.venues() {
-                let Some(settlement_prices) = venue_config.settlement_prices() else {
-                    continue;
-                };
-                let venue = Venue::from(venue_config.name().as_str());
-
-                for (instrument_id, raw_price) in settlement_prices {
-                    let price = {
-                        let cache = engine.kernel().cache.borrow();
-                        let instrument = cache.instrument(instrument_id).ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "No instrument found for settlement price configuration: {instrument_id}"
-                            )
-                        })?;
-                        instrument.make_price(*raw_price)
-                    };
-                    engine.set_settlement_price(venue, *instrument_id, price)?;
-                }
-            }
-
-            self.engines.insert(config.id().to_string(), engine);
         }
 
         Ok(())
@@ -230,10 +135,14 @@ impl BacktestNode {
     /// Automatically calls [`build()`](Self::build) if engines have not been created yet.
     /// For each run config, loads data from the catalog and runs the engine.
     /// Supports both oneshot (`chunk_size = None`) and streaming modes.
+    /// Configs without a built engine are skipped. If a run fails with
+    /// [`BacktestRunConfig::raise_exception`] disabled, logs the error, clears its loaded data,
+    /// leaves the engine undisposed, and omits its result.
     ///
     /// # Errors
     ///
-    /// Returns an error if building, data loading, or engine execution fails.
+    /// Returns an error if building, data loading, or engine execution fails and
+    /// [`BacktestRunConfig::raise_exception`] is enabled for the run config.
     pub fn run(&mut self) -> anyhow::Result<Vec<BacktestResult>> {
         // Auto-build if not already done
         if self.engines.is_empty() {
@@ -243,19 +152,23 @@ impl BacktestNode {
         let mut results = Vec::new();
 
         for config in &self.configs {
-            let engine = self.engines.get_mut(config.id()).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Engine not found for config '{}'. Call build() first.",
-                    config.id()
-                )
-            })?;
+            let Some(engine) = self.engines.get_mut(config.id()) else {
+                continue;
+            };
 
-            match config.chunk_size() {
-                None => run_oneshot(engine, config)?,
-                Some(chunk_size) => {
-                    anyhow::ensure!(chunk_size > 0, "chunk_size must be > 0");
-                    run_streaming(engine, config, chunk_size)?;
+            let run_result = match config.chunk_size() {
+                None => run_oneshot(engine, config),
+                Some(chunk_size) => run_streaming(engine, config, chunk_size),
+            };
+
+            if let Err(e) = run_result {
+                if config.raise_exception() {
+                    return Err(e);
                 }
+
+                log::error!("Error running backtest '{}': {e:#}", config.id());
+                engine.clear_data();
+                continue;
             }
 
             results.push(engine.get_result());
@@ -299,6 +212,99 @@ impl BacktestNode {
         }
         self.engines.clear();
     }
+}
+
+fn build_engine(config: &BacktestRunConfig) -> anyhow::Result<BacktestEngine> {
+    let engine_config = config.engine().clone();
+    let mut engine = BacktestEngine::new(engine_config)?;
+
+    for venue_config in config.venues() {
+        let starting_balances: Vec<Money> = venue_config
+            .starting_balances()
+            .iter()
+            .map(|s| s.parse::<Money>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("Invalid starting balance: {e}"))?;
+
+        let default_leverage = venue_config.default_leverage();
+        let leverages = venue_config.leverages().cloned().unwrap_or_default();
+        let margin_model = venue_config.margin_model().cloned().map(Into::into);
+        let modules = venue_config
+            .modules()
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect();
+        let fill_model = venue_config
+            .fill_model()
+            .cloned()
+            .unwrap_or_default()
+            .into();
+        let fee_model = venue_config.fee_model().cloned().unwrap_or_default().into();
+        let latency_model = venue_config.latency_model().cloned().map(Into::into);
+        let sim_config = SimulatedVenueConfig::builder()
+            .venue(Venue::from(venue_config.name().as_str()))
+            .oms_type(venue_config.oms_type())
+            .account_type(venue_config.account_type())
+            .book_type(venue_config.book_type())
+            .starting_balances(starting_balances)
+            .maybe_base_currency(venue_config.base_currency())
+            .maybe_default_leverage(default_leverage)
+            .leverages(leverages)
+            .maybe_margin_model(margin_model)
+            .modules(modules)
+            .fill_model(fill_model)
+            .fee_model(fee_model)
+            .maybe_latency_model(latency_model)
+            .routing(venue_config.routing())
+            .reject_stop_orders(venue_config.reject_stop_orders())
+            .support_gtd_orders(venue_config.support_gtd_orders())
+            .support_contingent_orders(venue_config.support_contingent_orders())
+            .use_position_ids(venue_config.use_position_ids())
+            .use_random_ids(venue_config.use_random_ids())
+            .use_reduce_only(venue_config.use_reduce_only())
+            .use_market_order_acks(venue_config.use_market_order_acks())
+            .bar_execution(venue_config.bar_execution())
+            .bar_adaptive_high_low_ordering(venue_config.bar_adaptive_high_low_ordering())
+            .trade_execution(venue_config.trade_execution())
+            .liquidity_consumption(venue_config.liquidity_consumption())
+            .allow_cash_borrowing(venue_config.allow_cash_borrowing())
+            .frozen_account(venue_config.frozen_account())
+            .queue_position(venue_config.queue_position())
+            .oto_full_trigger(venue_config.oto_trigger_mode() == OtoTriggerMode::Full)
+            .price_protection_points(venue_config.price_protection_points())
+            .liquidation_enabled(venue_config.liquidation_enabled())
+            .liquidation_trigger_ratio(venue_config.liquidation_trigger_ratio())
+            .liquidation_cancel_open_orders(venue_config.liquidation_cancel_open_orders())
+            .build()?;
+        engine.add_venue(sim_config)?;
+    }
+
+    for data_config in config.data() {
+        let catalog = create_catalog(data_config)?;
+        let instr_ids: Vec<InstrumentId> = data_config.get_instrument_ids()?;
+        let filter: Option<Vec<String>> = if instr_ids.is_empty() {
+            None
+        } else {
+            Some(instr_ids.iter().map(ToString::to_string).collect())
+        };
+
+        let instruments = catalog.query_instruments(filter.as_deref())?;
+
+        if !instr_ids.is_empty() && instruments.is_empty() {
+            let ids: Vec<String> = instr_ids.iter().map(ToString::to_string).collect();
+            anyhow::bail!(
+                "No instruments found in catalog for requested IDs: [{}]",
+                ids.join(", ")
+            );
+        }
+
+        for instrument in instruments {
+            engine.add_instrument(&instrument)?;
+        }
+    }
+
+    Ok(engine)
 }
 
 fn validate_configs(configs: &[BacktestRunConfig]) -> anyhow::Result<()> {
@@ -407,11 +413,17 @@ fn run_streaming(
         let data_config = &data_configs[0];
         let mut catalog = create_catalog(data_config)?;
         let result = dispatch_query(&mut catalog, data_config, config.start(), config.end())?;
-        stream_chunks(engine, config, result.peekable(), chunk_size)?;
+        let data = result.map(|item| item.map_err(anyhow::Error::from));
+        stream_chunks(engine, config, data.peekable(), chunk_size)?;
     } else {
         // Multiple configs require loading all data to merge-sort across types
         let all_data = load_and_merge_data(config)?;
-        stream_chunks(engine, config, all_data.into_iter().peekable(), chunk_size)?;
+        stream_chunks(
+            engine,
+            config,
+            all_data.into_iter().map(Ok).peekable(),
+            chunk_size,
+        )?;
     }
 
     Ok(())
@@ -420,21 +432,20 @@ fn run_streaming(
 // Feeds data from an iterator to the engine in timestamp-aligned chunks.
 // Each chunk contains up to `chunk_size` events, extended to include all
 // events sharing the boundary timestamp so timers flush correctly.
-fn stream_chunks<I: Iterator<Item = Data>>(
+fn stream_chunks<I: Iterator<Item = anyhow::Result<Data>>>(
     engine: &mut BacktestEngine,
     config: &BacktestRunConfig,
     mut iter: Peekable<I>,
     chunk_size: usize,
 ) -> anyhow::Result<()> {
     if iter.peek().is_none() {
-        engine.end();
-        return Ok(());
+        return engine.end();
     }
 
     let mut next_start = config.start();
 
     loop {
-        let chunk = take_aligned_chunk(&mut iter, chunk_size);
+        let chunk = take_aligned_chunk(&mut iter, chunk_size)?;
         if chunk.is_empty() {
             break;
         }
@@ -461,32 +472,35 @@ fn stream_chunks<I: Iterator<Item = Data>>(
         next_start = end;
     }
 
-    engine.end();
-    Ok(())
+    engine.end()
 }
 
 // Takes up to `chunk_size` items, then extends to include all remaining
 // items sharing the boundary timestamp to avoid splitting same-ts events.
-fn take_aligned_chunk<I: Iterator<Item = Data>>(
+fn take_aligned_chunk<I: Iterator<Item = anyhow::Result<Data>>>(
     iter: &mut Peekable<I>,
     chunk_size: usize,
-) -> Vec<Data> {
+) -> anyhow::Result<Vec<Data>> {
     let mut chunk = Vec::with_capacity(chunk_size);
 
     for _ in 0..chunk_size {
         match iter.next() {
-            Some(item) => chunk.push(item),
-            None => return chunk,
+            Some(item) => chunk.push(item?),
+            None => return Ok(chunk),
         }
     }
 
     if let Some(boundary_ts) = chunk.last().map(HasTsInit::ts_init) {
-        while iter.peek().is_some_and(|d| d.ts_init() == boundary_ts) {
-            chunk.push(iter.next().unwrap());
+        // A failing item ends the extension and surfaces on the next chunk
+        while let Some(item) = iter.next_if(|item| {
+            item.as_ref()
+                .is_ok_and(|data| data.ts_init() == boundary_ts)
+        }) {
+            chunk.push(item?);
         }
     }
 
-    chunk
+    Ok(chunk)
 }
 
 fn load_and_merge_data(config: &BacktestRunConfig) -> anyhow::Result<Vec<Data>> {
@@ -523,7 +537,7 @@ fn load_data(
 ) -> anyhow::Result<Vec<Data>> {
     let mut catalog = create_catalog(config)?;
     let result = dispatch_query(&mut catalog, config, run_start, run_end)?;
-    Ok(result.collect())
+    Ok(result.collect::<Result<Vec<_>, _>>()?)
 }
 
 fn dispatch_query(
@@ -592,5 +606,141 @@ fn min_opt(a: Option<UnixNanos>, b: Option<UnixNanos>) -> Option<UnixNanos> {
         (Some(a), None) => Some(a),
         (None, Some(b)) => Some(b),
         (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "python")]
+    use nautilus_model::enums::{AccountType, OmsType};
+    use nautilus_model::{
+        identifiers::InstrumentId,
+        types::{Price, Quantity},
+    };
+    #[cfg(feature = "python")]
+    use pyo3::{ffi::c_str, prelude::*, types::PyDict};
+    use rstest::rstest;
+
+    use super::*;
+    #[cfg(feature = "python")]
+    use crate::{
+        config::BacktestVenueConfig,
+        modules::SimulationModuleAny,
+        python::modules::{PySimulationModule, PythonSimulationModule},
+    };
+
+    fn quote(ts_init: u64) -> Data {
+        Data::Quote(QuoteTick::new(
+            InstrumentId::from("EUR/USD.SIM"),
+            Price::from("1.0001"),
+            Price::from("1.0002"),
+            Quantity::from("100"),
+            Quantity::from("100"),
+            UnixNanos::from(ts_init),
+            UnixNanos::from(ts_init),
+        ))
+    }
+
+    fn stream_failure() -> anyhow::Error {
+        anyhow::anyhow!("injected stream failure")
+    }
+
+    #[rstest]
+    fn take_aligned_chunk_reports_a_stream_failure() {
+        let mut iter = vec![Ok(quote(1)), Err(stream_failure())]
+            .into_iter()
+            .peekable();
+
+        let chunk = take_aligned_chunk(&mut iter, 4);
+
+        assert_eq!(
+            chunk
+                .expect_err("a failed stream must not read as a short chunk")
+                .to_string(),
+            "injected stream failure"
+        );
+    }
+
+    #[rstest]
+    fn take_aligned_chunk_reports_a_failure_found_at_the_boundary() {
+        let mut iter = vec![Ok(quote(1)), Err(stream_failure()), Ok(quote(1))]
+            .into_iter()
+            .peekable();
+
+        let first = take_aligned_chunk(&mut iter, 1).expect("the first chunk must be complete");
+        let second = take_aligned_chunk(&mut iter, 1);
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].ts_init(), UnixNanos::from(1));
+        assert_eq!(
+            second
+                .expect_err("the failure must survive the boundary extension")
+                .to_string(),
+            "injected stream failure"
+        );
+    }
+
+    #[rstest]
+    fn take_aligned_chunk_extends_past_the_boundary_for_equal_timestamps() {
+        let mut iter = vec![Ok(quote(1)), Ok(quote(1)), Ok(quote(2))]
+            .into_iter()
+            .peekable();
+
+        let chunk = take_aligned_chunk(&mut iter, 1).expect("the chunk must be complete");
+
+        assert_eq!(chunk.len(), 2);
+        assert_eq!(chunk[0].ts_init(), UnixNanos::from(1));
+        assert_eq!(chunk[1].ts_init(), UnixNanos::from(1));
+    }
+
+    #[cfg(feature = "python")]
+    #[rstest]
+    fn build_engine_accepts_python_module_from_node_config() {
+        Python::initialize();
+
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            locals
+                .set_item("SimulationModule", py.get_type::<PySimulationModule>())
+                .unwrap();
+            let module = py
+                .eval(
+                    c_str!(
+                        "type('NodeSimulationModule', (SimulationModule,), {\
+                            'process': lambda self, ts_now, context: \
+                                (setattr(self, 'calls', self.calls + 1), [])[1]\
+                        })()"
+                    ),
+                    None,
+                    Some(&locals),
+                )
+                .unwrap();
+            module.setattr("calls", 0).unwrap();
+
+            let venue = BacktestVenueConfig::builder()
+                .name("SIM")
+                .oms_type(OmsType::Netting)
+                .account_type(AccountType::Margin)
+                .book_type(BookType::L1_MBP)
+                .starting_balances(vec!["1000 USD".to_string()])
+                .modules(vec![SimulationModuleAny::Python(
+                    PythonSimulationModule::new(module.clone().unbind()),
+                )])
+                .build()
+                .unwrap();
+            let config = BacktestRunConfig::builder()
+                .venues(vec![venue])
+                .data(Vec::new())
+                .build()
+                .unwrap();
+            let mut engine = build_engine(&config).unwrap();
+
+            engine.run(None, None, None, false).unwrap();
+
+            assert_eq!(
+                module.getattr("calls").unwrap().extract::<u32>().unwrap(),
+                1
+            );
+        });
     }
 }

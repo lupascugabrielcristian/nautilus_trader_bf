@@ -13,15 +13,18 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use nautilus_model::identifiers::{AccountId, InstrumentId, TraderId};
-use pyo3::pymethods;
+use nautilus_core::python::to_pyvalue_err;
+use nautilus_model::identifiers::{AccountId, InstrumentId};
+use nautilus_network::websocket::TransportBackend;
+use pyo3::{PyResult, pymethods};
 
 use crate::{
     common::enums::SignatureType,
     config::{
-        PolymarketDataClientConfig, PolymarketExecClientConfig, PolymarketInstrumentProviderConfig,
-        PolymarketUpDownEventSlugConfig,
+        PolymarketDataClientConfig, PolymarketExecutionClientConfig,
+        PolymarketInstrumentProviderConfig, PolymarketUpDownEventSlugConfig,
     },
+    providers::build_gamma_params_from_hashmap,
 };
 
 const PY_OPTION_U64_MISSING_SENTINEL: u64 = u64::MAX;
@@ -76,7 +79,7 @@ impl PolymarketInstrumentProviderConfig {
     /// This mirrors the Python adapter's `instrument_config` layering so scoped
     /// market bootstrap can migrate naturally to the Rust/pyO3 live path.
     #[new]
-    #[pyo3(signature = (load_all=None, load_ids=None, filters=None, event_slugs=None, market_slugs=None, event_slug_builder=None, log_warnings=None, use_gamma_markets=None))]
+    #[pyo3(signature = (load_all=None, load_ids=None, filters=None, event_slugs=None, market_slugs=None, event_slug_builder=None, log_warnings=None, use_gamma_markets=None, series_ids=None))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
         load_all: Option<bool>,
@@ -87,18 +90,26 @@ impl PolymarketInstrumentProviderConfig {
         event_slug_builder: Option<PolymarketUpDownEventSlugConfig>,
         log_warnings: Option<bool>,
         use_gamma_markets: Option<bool>,
-    ) -> Self {
+        series_ids: Option<Vec<u64>>,
+    ) -> PyResult<Self> {
         let default = Self::default();
-        Self {
+        let config = Self {
             load_all: load_all.unwrap_or(default.load_all),
             load_ids,
             filters,
             event_slugs,
             market_slugs,
             event_slug_builder,
+            series_ids,
             log_warnings: log_warnings.unwrap_or(default.log_warnings),
             use_gamma_markets: use_gamma_markets.unwrap_or(default.use_gamma_markets),
+        };
+
+        if let Some(filters) = config.filters.as_ref() {
+            build_gamma_params_from_hashmap(filters)
+                .map_err(|e| to_pyvalue_err(format!("Invalid Polymarket Gamma filters: {e}")))?;
         }
+        Ok(config)
     }
 
     fn __repr__(&self) -> String {
@@ -119,7 +130,7 @@ impl PolymarketDataClientConfig {
     /// and are skipped during serialization; they default to empty/`None` and must be
     /// installed programmatically after deserialization.
     #[new]
-    #[pyo3(signature = (instrument_config=None, base_url_http=None, base_url_ws=None, base_url_gamma=None, base_url_data_api=None, http_timeout_secs=None, ws_timeout_secs=None, ws_max_subscriptions=None, update_instruments_interval_mins=PY_OPTION_U64_MISSING_SENTINEL, subscribe_new_markets=None, auto_load_missing_instruments=None, auto_load_debounce_ms=None, auto_load_max_retries=None, auto_load_retry_delay_initial_secs=None, auto_load_retry_delay_max_secs=None, new_market_fetch_max_concurrency=None, resolve_poll_enabled=None, resolve_poll_interval_secs=None, resolve_poll_grace_secs=None, resolve_poll_max_wait_secs=None, base_url_rtds=None))]
+    #[pyo3(signature = (instrument_config=None, base_url_http=None, base_url_ws=None, base_url_gamma=None, base_url_data_api=None, http_timeout_secs=None, ws_timeout_secs=None, ws_max_subscriptions=None, update_instruments_interval_mins=PY_OPTION_U64_MISSING_SENTINEL, subscribe_new_markets=None, auto_load_missing_instruments=None, auto_load_debounce_ms=None, auto_load_max_retries=None, auto_load_retry_delay_initial_secs=None, auto_load_retry_delay_max_secs=None, new_market_fetch_max_concurrency=None, resolve_poll_enabled=None, resolve_poll_interval_secs=None, resolve_poll_grace_secs=None, resolve_poll_max_wait_secs=None, base_url_rtds=None, transport_backend=None, drop_quotes_missing_side=None, proxy_url=None, compute_effective_deltas=None))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
         instrument_config: Option<PolymarketInstrumentProviderConfig>,
@@ -143,16 +154,22 @@ impl PolymarketDataClientConfig {
         resolve_poll_grace_secs: Option<u64>,
         resolve_poll_max_wait_secs: Option<u64>,
         base_url_rtds: Option<String>,
-    ) -> Self {
+        transport_backend: Option<TransportBackend>,
+        drop_quotes_missing_side: Option<bool>,
+        proxy_url: Option<String>,
+        compute_effective_deltas: Option<bool>,
+    ) -> PyResult<Self> {
         let default = Self::default();
 
-        Self {
+        let config = Self {
             instrument_config,
+            filters: Vec::new(),
             base_url_http,
             base_url_ws,
             base_url_rtds,
             base_url_gamma,
             base_url_data_api,
+            proxy_url,
             http_timeout_secs: http_timeout_secs.unwrap_or(default.http_timeout_secs),
             ws_timeout_secs: ws_timeout_secs.unwrap_or(default.ws_timeout_secs),
             ws_max_subscriptions: ws_max_subscriptions.unwrap_or(default.ws_max_subscriptions),
@@ -161,8 +178,11 @@ impl PolymarketDataClientConfig {
                 default.update_instruments_interval_mins,
             ),
             subscribe_new_markets: subscribe_new_markets.unwrap_or(default.subscribe_new_markets),
+            new_market_filter: None,
             new_market_fetch_max_concurrency: new_market_fetch_max_concurrency
                 .unwrap_or(default.new_market_fetch_max_concurrency),
+            drop_quotes_missing_side: drop_quotes_missing_side
+                .unwrap_or(default.drop_quotes_missing_side),
             auto_load_missing_instruments: auto_load_missing_instruments
                 .unwrap_or(default.auto_load_missing_instruments),
             auto_load_debounce_ms: auto_load_debounce_ms.unwrap_or(default.auto_load_debounce_ms),
@@ -178,10 +198,20 @@ impl PolymarketDataClientConfig {
                 .unwrap_or(default.resolve_poll_grace_secs),
             resolve_poll_max_wait_secs: resolve_poll_max_wait_secs
                 .unwrap_or(default.resolve_poll_max_wait_secs),
-            filters: Vec::new(),
-            new_market_filter: None,
-            transport_backend: default.transport_backend,
-        }
+            transport_backend: transport_backend.unwrap_or(default.transport_backend),
+            compute_effective_deltas: compute_effective_deltas
+                .unwrap_or(default.compute_effective_deltas),
+        };
+        config
+            .validated_proxy_url()
+            .map_err(|e| to_pyvalue_err(format!("Invalid Polymarket proxy URL: {e}")))?;
+        Ok(config)
+    }
+
+    #[getter]
+    #[pyo3(name = "has_proxy_url")]
+    const fn py_has_proxy_url(&self) -> bool {
+        self.has_proxy_url()
     }
 
     fn __repr__(&self) -> String {
@@ -195,16 +225,15 @@ impl PolymarketDataClientConfig {
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl PolymarketExecClientConfig {
+impl PolymarketExecutionClientConfig {
     /// Configuration for the Polymarket execution client.
     ///
     /// `Debug` is implemented manually to redact secrets, so it is not part of the
     /// derive list.
     #[new]
     #[expect(clippy::too_many_arguments)]
-    #[pyo3(signature = (trader_id=None, account_id=None, private_key=None, api_key=None, api_secret=None, passphrase=None, funder=None, signature_type=None, base_url_http=None, base_url_ws=None, base_url_data_api=None, http_timeout_secs=None, max_retries=None, retry_delay_initial_ms=None, retry_delay_max_ms=None, ack_timeout_secs=None))]
+    #[pyo3(signature = (account_id=None, private_key=None, api_key=None, api_secret=None, passphrase=None, funder=None, signature_type=None, base_url_http=None, base_url_ws=None, base_url_data_api=None, http_timeout_secs=None, max_retries=None, retry_delay_initial_ms=None, retry_delay_max_ms=None, heartbeat_enabled=None, transport_backend=None, proxy_url=None, instrument_config=None))]
     fn py_new(
-        trader_id: Option<String>,
         account_id: Option<String>,
         private_key: Option<String>,
         api_key: Option<String>,
@@ -219,11 +248,13 @@ impl PolymarketExecClientConfig {
         max_retries: Option<u32>,
         retry_delay_initial_ms: Option<u64>,
         retry_delay_max_ms: Option<u64>,
-        ack_timeout_secs: Option<u64>,
-    ) -> Self {
+        heartbeat_enabled: Option<bool>,
+        transport_backend: Option<TransportBackend>,
+        proxy_url: Option<String>,
+        instrument_config: Option<PolymarketInstrumentProviderConfig>,
+    ) -> PyResult<Self> {
         let default = Self::default();
-        Self {
-            trader_id: trader_id.map_or(default.trader_id, |s| TraderId::from(s.as_str())),
+        let config = Self {
             account_id: account_id.map_or(default.account_id, |s| AccountId::from(s.as_str())),
             private_key,
             api_key,
@@ -234,14 +265,26 @@ impl PolymarketExecClientConfig {
             base_url_http,
             base_url_ws,
             base_url_data_api,
+            proxy_url,
             http_timeout_secs: http_timeout_secs.unwrap_or(default.http_timeout_secs),
             max_retries: max_retries.unwrap_or(default.max_retries),
             retry_delay_initial_ms: retry_delay_initial_ms
                 .unwrap_or(default.retry_delay_initial_ms),
             retry_delay_max_ms: retry_delay_max_ms.unwrap_or(default.retry_delay_max_ms),
-            ack_timeout_secs: ack_timeout_secs.unwrap_or(default.ack_timeout_secs),
-            transport_backend: default.transport_backend,
-        }
+            heartbeat_enabled: heartbeat_enabled.unwrap_or(default.heartbeat_enabled),
+            transport_backend: transport_backend.unwrap_or(default.transport_backend),
+            instrument_config,
+        };
+        config
+            .validated_proxy_url()
+            .map_err(|e| to_pyvalue_err(format!("Invalid Polymarket proxy URL: {e}")))?;
+        Ok(config)
+    }
+
+    #[getter]
+    #[pyo3(name = "has_proxy_url")]
+    const fn py_has_proxy_url(&self) -> bool {
+        self.has_proxy_url()
     }
 
     fn __repr__(&self) -> String {
@@ -306,6 +349,7 @@ mod tests {
                 config.update_instruments_interval_mins,
                 PolymarketDataClientConfig::default().update_instruments_interval_mins,
             );
+            assert!(config.drop_quotes_missing_side);
         });
     }
 
@@ -348,6 +392,32 @@ mod tests {
             let config = construct_data_client_config(py, None, Some(&kwargs));
 
             assert_eq!(config.new_market_fetch_max_concurrency, 23);
+        });
+    }
+
+    #[rstest]
+    fn direct_pyo3_constructor_sets_drop_quotes_missing_side() {
+        Python::initialize();
+        Python::attach(|py| {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("drop_quotes_missing_side", false).unwrap();
+
+            let config = construct_data_client_config(py, None, Some(&kwargs));
+
+            assert!(!config.drop_quotes_missing_side);
+        });
+    }
+
+    #[rstest]
+    fn direct_pyo3_constructor_sets_compute_effective_deltas() {
+        Python::initialize();
+        Python::attach(|py| {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("compute_effective_deltas", true).unwrap();
+
+            let config = construct_data_client_config(py, None, Some(&kwargs));
+
+            assert!(config.compute_effective_deltas);
         });
     }
 
@@ -427,7 +497,7 @@ mod tests {
     }
 
     #[rstest]
-    fn direct_pyo3_constructor_sets_base_url_rtds_positionally_at_end() {
+    fn direct_pyo3_constructor_preserves_base_url_rtds_positional_slot() {
         Python::initialize();
         Python::attach(|py| {
             let args = PyTuple::new(
@@ -468,6 +538,121 @@ mod tests {
                 config.base_url_rtds.as_deref(),
                 Some("wss://ws-live-data.example")
             );
+        });
+    }
+
+    #[rstest]
+    fn direct_pyo3_data_config_propagates_proxy_without_raw_getter() {
+        const SECRET: &str = "data-python-proxy-secret";
+        Python::initialize();
+        Python::attach(|py| {
+            let proxy_url = format!("http://data-user:{SECRET}@127.0.0.1:18083");
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("proxy_url", &proxy_url).unwrap();
+            let cls = py.get_type::<PolymarketDataClientConfig>();
+            let obj = cls.call((), Some(&kwargs)).expect("construct data config");
+            let has_proxy_url = obj
+                .getattr("has_proxy_url")
+                .expect("has_proxy_url getter")
+                .extract::<bool>()
+                .expect("bool getter");
+            let repr = obj.repr().expect("data config repr").to_string();
+            let config = obj
+                .extract::<PolymarketDataClientConfig>()
+                .expect("extract data config");
+
+            assert_eq!(config.proxy_url.as_deref(), Some(proxy_url.as_str()));
+            assert!(has_proxy_url);
+            assert!(!obj.hasattr("proxy_url").unwrap());
+            assert!(!repr.contains(SECRET));
+        });
+    }
+
+    #[rstest]
+    fn direct_pyo3_exec_config_propagates_proxy_without_raw_getter() {
+        const SECRET: &str = "exec-python-proxy-secret";
+        Python::initialize();
+        Python::attach(|py| {
+            let proxy_url = format!("https://exec-user:{SECRET}@127.0.0.1:18084");
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("proxy_url", &proxy_url).unwrap();
+            kwargs.set_item("heartbeat_enabled", true).unwrap();
+            let cls = py.get_type::<PolymarketExecutionClientConfig>();
+            let obj = cls
+                .call((), Some(&kwargs))
+                .expect("construct execution config");
+            let has_proxy_url = obj
+                .getattr("has_proxy_url")
+                .expect("has_proxy_url getter")
+                .extract::<bool>()
+                .expect("bool getter");
+            let repr = obj.repr().expect("execution config repr").to_string();
+            let heartbeat_enabled = obj
+                .getattr("heartbeat_enabled")
+                .expect("heartbeat_enabled getter")
+                .extract::<bool>()
+                .expect("bool getter");
+            let config = obj
+                .extract::<PolymarketExecutionClientConfig>()
+                .expect("extract execution config");
+
+            assert_eq!(config.proxy_url.as_deref(), Some(proxy_url.as_str()));
+            assert!(config.heartbeat_enabled);
+            assert!(has_proxy_url);
+            assert!(heartbeat_enabled);
+            assert!(!obj.hasattr("proxy_url").unwrap());
+            assert!(!repr.contains(SECRET));
+        });
+    }
+
+    #[rstest]
+    fn direct_pyo3_exec_config_wires_instrument_config_load_ids() {
+        Python::initialize();
+        Python::attach(|py| {
+            let scoped = InstrumentId::from("0xabc-123.POLYMARKET");
+            let provider_kwargs = PyDict::new(py);
+            provider_kwargs.set_item("load_ids", vec![scoped]).unwrap();
+            let provider = py
+                .get_type::<PolymarketInstrumentProviderConfig>()
+                .call((), Some(&provider_kwargs))
+                .expect("construct provider config");
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("instrument_config", &provider).unwrap();
+            let obj = py
+                .get_type::<PolymarketExecutionClientConfig>()
+                .call((), Some(&kwargs))
+                .expect("construct execution config");
+            let exposed = obj
+                .getattr("instrument_config")
+                .expect("instrument_config getter")
+                .extract::<PolymarketInstrumentProviderConfig>()
+                .expect("extract provider config");
+            let config = obj
+                .extract::<PolymarketExecutionClientConfig>()
+                .expect("extract execution config");
+
+            assert_eq!(exposed.load_ids.as_deref(), Some([scoped].as_slice()));
+            assert_eq!(config.reconciliation_load_ids(), Some([scoped].as_slice()));
+        });
+    }
+
+    #[rstest]
+    fn direct_pyo3_proxy_validation_error_redacts_credentials() {
+        const SECRET: &str = "invalid-python-proxy-secret";
+        Python::initialize();
+        Python::attach(|py| {
+            let kwargs = PyDict::new(py);
+            kwargs
+                .set_item("proxy_url", format!("http://proxy-user:{SECRET}@[::1"))
+                .unwrap();
+            let error = py
+                .get_type::<PolymarketDataClientConfig>()
+                .call((), Some(&kwargs))
+                .expect_err("malformed proxy URL should fail");
+            let message = error.to_string();
+
+            assert!(message.contains("Invalid Polymarket proxy URL"));
+            assert!(!message.contains(SECRET));
         });
     }
 }

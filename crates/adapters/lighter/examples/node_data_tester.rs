@@ -15,12 +15,18 @@
 
 //! Example smoke-test for the Lighter live data client.
 //!
+//! Edit the constants below to change the deployment, environment, and target instrument.
+//!
 //! Run with: `cargo run --example lighter-data-tester --package nautilus-lighter --features examples`
 
 use log::LevelFilter;
 use nautilus_common::{enums::Environment, logging::logger::LoggerConfig};
 use nautilus_lighter::{
-    common::enums::LighterEnvironment, config::LighterDataClientConfig,
+    common::{
+        consts::{LIGHTER, LIGHTER_ROBINHOOD},
+        enums::{LighterDeployment, LighterEnvironment},
+    },
+    config::LighterDataClientConfig,
     factories::LighterDataClientFactory,
 };
 use nautilus_live::node::LiveNode;
@@ -28,37 +34,46 @@ use nautilus_model::{
     data::{BarSpecification, BarType},
     enums::{AggregationSource, BarAggregation, PriceType},
     identifiers::{ClientId, InstrumentId, TraderId},
-    stubs::TestDefault,
 };
 use nautilus_testkit::testers::{DataTester, DataTesterConfig};
+
+const LIGHTER_ENVIRONMENT: LighterEnvironment = LighterEnvironment::Mainnet;
+const LIGHTER_DEPLOYMENT: LighterDeployment = LighterDeployment::Lighter;
+const VENUE: &str = match LIGHTER_DEPLOYMENT {
+    LighterDeployment::Lighter => LIGHTER,
+    LighterDeployment::Robinhood => LIGHTER_ROBINHOOD,
+};
+const TRADER_ID: &str = "TESTER-001";
+const NODE_NAME: &str = "LIGHTER-DATA-TESTER-001";
+const INSTRUMENT_SYMBOL: &str = "BTC-PERP";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
     let environment = Environment::Live;
-    let trader_id = TraderId::test_default();
-    let node_name = "LIGHTER-DATA-TESTER-001".to_string();
-    let instrument_id = InstrumentId::from("BTC-PERP.LIGHTER");
-    // let instrument_id = InstrumentId::from("0G-PERP.LIGHTER");
+    let trader_id = TraderId::from(TRADER_ID);
+    let node_name = NODE_NAME.to_string();
+    let instrument_id = InstrumentId::from(format!("{INSTRUMENT_SYMBOL}.{VENUE}").as_str());
     let instrument_ids = vec![
         instrument_id,
         // InstrumentId::from("ETH-PERP.LIGHTER"),
         // InstrumentId::from("SOL-PERP.LIGHTER"),
     ];
+
     let bar_types = vec![BarType::new(
         instrument_id,
         BarSpecification::new(1, BarAggregation::Minute, PriceType::Last),
         AggregationSource::External,
     )];
 
-    let lighter_config = LighterDataClientConfig {
-        environment: LighterEnvironment::Mainnet,
-        ..Default::default()
-    };
+    let lighter_config = LighterDataClientConfig::builder()
+        .environment(LIGHTER_ENVIRONMENT)
+        .deployment(LIGHTER_DEPLOYMENT)
+        .build();
 
     let client_factory = LighterDataClientFactory::new();
-    let client_id = ClientId::new("LIGHTER");
+    let client_id = ClientId::new(VENUE);
 
     let log_config = LoggerConfig {
         stdout_level: LevelFilter::Info,
@@ -69,7 +84,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_name(node_name)
         .with_logging(log_config)
         .with_delay_post_stop_secs(2)
-        .add_data_client(None, Box::new(client_factory), Box::new(lighter_config))?
+        .add_data_client(
+            Some(VENUE.to_string()),
+            Box::new(client_factory),
+            Box::new(lighter_config),
+        )?
         .build()?;
 
     let tester_config = DataTesterConfig::builder()
@@ -88,7 +107,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // .subscribe_index_prices(true)
         // .subscribe_mark_prices(true)
         // .subscribe_funding_rates(true)
-        .build();
+        .build()?;
+
     let tester = DataTester::new(tester_config);
 
     node.add_actor(tester)?;

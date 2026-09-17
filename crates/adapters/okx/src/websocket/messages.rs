@@ -34,11 +34,11 @@ use crate::{
     common::{
         enums::{
             OKXAlgoOrderStatus, OKXAlgoOrderType, OKXBookAction, OKXCandleConfirm, OKXExecType,
-            OKXInstrumentType, OKXOrderCategory, OKXOrderStatus, OKXOrderType, OKXPositionSide,
-            OKXPriceType, OKXQuickMarginType, OKXSelfTradePreventionMode, OKXSettlementState,
-            OKXSide, OKXTargetCurrency, OKXTradeMode, OKXTriggerType,
+            OKXInstrumentType, OKXMarginMode, OKXOrderCategory, OKXOrderStatus, OKXOrderType,
+            OKXPositionSide, OKXPriceType, OKXQuickMarginType, OKXSelfTradePreventionMode,
+            OKXSettlementState, OKXSide, OKXTargetCurrency, OKXTradeMode, OKXTriggerType,
         },
-        models::OKXInstrument,
+        models::{OKXInstrument, OKXRpiBookLevel},
         parse::{
             deserialize_empty_string_as_none, deserialize_empty_ustr_as_none,
             deserialize_string_to_u64, deserialize_target_currency_as_none,
@@ -74,11 +74,6 @@ pub enum NautilusWsMessage {
 
 /// Represents an OKX WebSocket error.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyo3::pyclass(from_py_object))]
-#[cfg_attr(
-    feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.okx")
-)]
 pub struct OKXWebSocketError {
     /// Error code from OKX (e.g., "50101").
     pub code: String,
@@ -91,7 +86,10 @@ pub struct OKXWebSocketError {
 }
 
 #[derive(Debug, Clone)]
-#[expect(clippy::large_enum_variant)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the variant size gap only crosses the threshold when high-precision widens the raw types"
+)]
 pub enum ExecutionReport {
     Order(OrderStatusReport),
     Fill(FillReport),
@@ -109,6 +107,12 @@ pub enum OKXWsMessage {
         arg: OKXWebSocketArg,
         action: OKXBookAction,
         data: Vec<OKXBookMsg>,
+    },
+    /// Retail Price Improvement order book snapshot or update.
+    RpiBookData {
+        arg: OKXWebSocketArg,
+        action: OKXBookAction,
+        data: Vec<OKXRpiBookMsg>,
     },
     /// Data from a non-book channel (trades, tickers, mark price, funding, candles, etc.).
     ChannelData {
@@ -134,14 +138,23 @@ pub enum OKXWsMessage {
     Account(serde_json::Value),
     /// Positions channel update (raw JSON).
     Positions(serde_json::Value),
+    /// Liquidation risk warnings for account positions.
+    LiquidationWarnings(Vec<OKXLiquidationWarningMsg>),
     /// Instrument definition updates.
     Instruments(Vec<OKXInstrument>),
     /// A WebSocket send failed without a structured venue response.
     SendFailed {
         request_id: String,
-        client_order_id: Option<ClientOrderId>,
+        client_order_ids: Vec<ClientOrderId>,
         op: Option<OKXWsOperation>,
-        error: String,
+        error: super::error::OKXWsError,
+    },
+    /// The venue rejected a subscribe request, so no data will flow for it.
+    SubscriptionFailed {
+        channel: OKXWsChannel,
+        inst_id: Option<Ustr>,
+        code: String,
+        msg: String,
     },
     /// Error received from OKX.
     Error(OKXWebSocketError),
@@ -264,11 +277,17 @@ pub enum OKXWsFrame {
         action: OKXBookAction,
         data: Vec<OKXBookMsg>,
     },
+    RpiBookData {
+        arg: OKXWebSocketArg,
+        action: OKXBookAction,
+        data: Vec<OKXRpiBookMsg>,
+    },
     Data {
         arg: OKXWebSocketArg,
         data: serde_json::Value,
     },
     Error {
+        arg: Option<OKXWebSocketArg>,
         code: String,
         msg: String,
     },
@@ -449,9 +468,14 @@ fn parse_book_data<E: serde::de::Error>(
         .map_err(|e| E::custom(format!("invalid action: {e}")))?;
 
     let data_val = obj.remove("data").ok_or_else(|| E::missing_field("data"))?;
+    if arg.channel == OKXWsChannel::BooksRpi {
+        let data: Vec<OKXRpiBookMsg> = serde_json::from_value(data_val)
+            .map_err(|e| E::custom(format!("invalid data: {e}")))?;
+        return Ok(OKXWsFrame::RpiBookData { arg, action, data });
+    }
+
     let data: Vec<OKXBookMsg> =
         serde_json::from_value(data_val).map_err(|e| E::custom(format!("invalid data: {e}")))?;
-
     Ok(OKXWsFrame::BookData { arg, action, data })
 }
 
@@ -470,7 +494,14 @@ fn parse_data<E: serde::de::Error>(
 fn parse_error<E: serde::de::Error>(
     obj: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Result<OKXWsFrame, E> {
+    let arg = obj
+        .remove("arg")
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| E::custom(format!("invalid arg: {e}")))?;
+
     Ok(OKXWsFrame::Error {
+        arg,
         code: take_str(obj, "code")?,
         msg: take_str(obj, "msg")?,
     })
@@ -532,7 +563,7 @@ pub struct OKXTickerMsg {
     /// Timestamp of the data generation, Unix timestamp format in milliseconds.
     #[serde(deserialize_with = "deserialize_string_to_u64")]
     pub ts: u64,
-    /// Order source for ELP liquidity identification.
+    /// Order source for RPI liquidity identification.
     #[serde(default)]
     pub source: Option<String>,
 }
@@ -574,6 +605,23 @@ pub struct OKXBookMsg {
     pub ts: u64,
 }
 
+/// Retail Price Improvement order book data for an instrument.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OKXRpiBookMsg {
+    /// Ask levels [price, total quantity, non-RPI quantity, order count].
+    pub asks: Vec<OKXRpiBookLevel>,
+    /// Bid levels [price, total quantity, non-RPI quantity, order count].
+    pub bids: Vec<OKXRpiBookLevel>,
+    /// Sequence ID of the previous message.
+    pub prev_seq_id: i64,
+    /// Sequence ID of the current message.
+    pub seq_id: u64,
+    /// Order book generation time, Unix timestamp in milliseconds.
+    #[serde(deserialize_with = "deserialize_string_to_u64")]
+    pub ts: u64,
+}
+
 /// Trade data for an instrument.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -598,7 +646,7 @@ pub struct OKXTradeMsg {
     /// Trade timestamp, Unix timestamp format in milliseconds.
     #[serde(deserialize_with = "deserialize_string_to_u64")]
     pub ts: u64,
-    /// Order source (0: normal, 1: ELP).
+    /// Order source (0: normal, 1: RPI).
     #[serde(default)]
     pub source: Option<String>,
     /// Sequence ID for trade events.
@@ -832,6 +880,52 @@ pub struct OKXStatusMsg {
 
 pub use crate::common::models::OKXAttachedAlgoOrd;
 
+/// Liquidation risk warning pushed by the `liquidation-warning` channel.
+///
+/// OKX sends this when an isolated position, or all positions under cross
+/// margin, approach liquidation. It is a risk warning only: the position may
+/// already be liquidated by the time the message arrives.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OKXLiquidationWarningMsg {
+    /// Instrument type.
+    pub inst_type: OKXInstrumentType,
+    /// Instrument family.
+    #[serde(default)]
+    pub inst_family: Option<Ustr>,
+    /// Instrument ID.
+    pub inst_id: Ustr,
+    /// Margin mode.
+    pub mgn_mode: OKXMarginMode,
+    /// Position ID.
+    #[serde(default)]
+    pub pos_id: Option<Ustr>,
+    /// Position side.
+    pub pos_side: OKXPositionSide,
+    /// Position quantity.
+    pub pos: String,
+    /// Position currency (margin positions only).
+    #[serde(default)]
+    pub pos_ccy: Option<Ustr>,
+    /// Leverage.
+    pub lever: String,
+    /// Mark price.
+    pub mark_px: String,
+    /// Maintenance margin ratio.
+    pub mgn_ratio: String,
+    /// Margin currency.
+    pub ccy: Ustr,
+    /// Creation time, Unix timestamp in milliseconds.
+    #[serde(deserialize_with = "deserialize_string_to_u64")]
+    pub c_time: u64,
+    /// Last update time, Unix timestamp in milliseconds.
+    #[serde(deserialize_with = "deserialize_string_to_u64")]
+    pub u_time: u64,
+    /// Push time, Unix timestamp in milliseconds.
+    #[serde(default)]
+    pub p_time: Option<String>,
+}
+
 /// Linked algo order metadata from order push updates.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1040,6 +1134,9 @@ pub struct OKXAlgoOrderMsg {
     pub cl_ord_id: String,
     /// Order ID (empty until algo order is triggered).
     pub ord_id: String,
+    /// Triggered child order IDs.
+    #[serde(default)]
+    pub ord_id_list: Vec<String>,
     /// Instrument ID.
     pub inst_id: Ustr,
     /// Instrument type.
@@ -1110,6 +1207,9 @@ pub struct OKXAlgoOrderMsg {
     /// Trigger time (empty until triggered).
     #[serde(default)]
     pub trigger_time: String,
+    /// Failure code for rejected algo orders.
+    #[serde(default)]
+    pub fail_code: String,
     /// Tag.
     #[serde(default)]
     pub tag: String,
@@ -1265,6 +1365,14 @@ pub struct WsPostOrderParams {
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slippage_pct: Option<String>,
+    /// Whether the order may take RPI liquidity.
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpi_taker_access: Option<bool>,
+    /// Whether OKX may round the order price to an eligible RPI price.
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpi_px_round: Option<bool>,
 }
 
 /// Parameters for WebSocket cancel order operation (instType not included).
@@ -1309,9 +1417,9 @@ pub struct WsAmendOrderParams {
     /// User-assigned client order ID (optional if using ordId).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cl_ord_id: Option<String>,
-    /// New client order ID for the amended order.
+    /// Client request ID for correlating the amendment response.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub new_cl_ord_id: Option<String>,
+    pub req_id: Option<String>,
     /// New order price (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_px: Option<String>,
@@ -1325,6 +1433,12 @@ pub struct WsAmendOrderParams {
     /// New order size (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_sz: Option<String>,
+    /// Whether the order may take RPI liquidity after amendment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpi_taker_access: Option<bool>,
+    /// Whether OKX may round the amended price to an eligible RPI price.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpi_px_round: Option<bool>,
     /// Event contract speed bump flag. Use "1" for non-post-only EVENTS orders.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speed_bump: Option<String>,
@@ -1405,8 +1519,10 @@ pub struct WsCancelAlgoOrderParams {
 mod tests {
     use nautilus_core::time::get_atomic_clock_realtime;
     use rstest::rstest;
+    use rust_decimal::Decimal;
 
     use super::*;
+    use crate::common::testing::load_test_json;
 
     #[rstest]
     fn test_deserialize_websocket_arg() {
@@ -1730,7 +1846,8 @@ mod tests {
         let parsed: OKXWsFrame = serde_json::from_str(error_json).unwrap();
 
         match parsed {
-            OKXWsFrame::Error { code, msg } => {
+            OKXWsFrame::Error { arg, code, msg } => {
+                assert!(arg.is_none());
                 assert_eq!(code, "60012");
                 assert_eq!(msg, "Invalid request");
             }
@@ -1750,7 +1867,8 @@ mod tests {
         let parsed: OKXWsFrame = serde_json::from_str(error_json).unwrap();
 
         match parsed {
-            OKXWsFrame::Error { code, msg } => {
+            OKXWsFrame::Error { arg, code, msg } => {
+                assert!(arg.is_none());
                 assert_eq!(code, "60018");
                 assert_eq!(msg, "Invalid sign");
             }
@@ -1772,7 +1890,10 @@ mod tests {
         let parsed: OKXWsFrame = serde_json::from_str(error_json).unwrap();
 
         match parsed {
-            OKXWsFrame::Error { code, msg } => {
+            OKXWsFrame::Error { arg, code, msg } => {
+                let arg = arg.expect("subscription error arg");
+                assert_eq!(arg.channel, OKXWsChannel::Tickers);
+                assert_eq!(arg.inst_id, Some(Ustr::from("INVALID-INST")));
                 assert_eq!(code, "60012");
                 assert_eq!(msg, "Invalid request: channel not found");
             }
@@ -1910,6 +2031,71 @@ mod tests {
             }
             _ => panic!("Expected BookData variant"),
         }
+    }
+
+    #[rstest]
+    fn test_rpi_book_fixtures_preserve_depth_types_and_sequence() {
+        let snapshot: OKXWsFrame =
+            serde_json::from_str(&load_test_json("ws_books_rpi_snapshot.json")).unwrap();
+        let update: OKXWsFrame =
+            serde_json::from_str(&load_test_json("ws_books_rpi_update.json")).unwrap();
+
+        let OKXWsFrame::RpiBookData { arg, action, data } = snapshot else {
+            panic!("Expected RPI book snapshot");
+        };
+        let snapshot = &data[0];
+        assert_eq!(arg.channel, OKXWsChannel::BooksRpi);
+        assert_eq!(arg.inst_id, Some(Ustr::from("OMI-USD")));
+        assert_eq!(action, OKXBookAction::Snapshot);
+        assert_eq!(data.len(), 1);
+        assert_eq!(snapshot.asks.len(), 4);
+        assert_eq!(snapshot.bids.len(), 10);
+        assert_eq!(
+            snapshot.asks[0],
+            OKXRpiBookLevel(
+                Decimal::from_str_exact("0.0001617").unwrap(),
+                Decimal::from_str_exact("12325166.992").unwrap(),
+                Decimal::from(1000),
+                2,
+            )
+        );
+        assert_eq!(snapshot.prev_seq_id, -1);
+        assert_eq!(snapshot.seq_id, 1_082_831_226);
+        assert_eq!(snapshot.ts, 1_785_406_442_403);
+
+        let OKXWsFrame::RpiBookData { arg, action, data } = update else {
+            panic!("Expected RPI book update");
+        };
+        let update = &data[0];
+        assert_eq!(arg.channel, OKXWsChannel::BooksRpi);
+        assert_eq!(arg.inst_id, Some(Ustr::from("OMI-USD")));
+        assert_eq!(action, OKXBookAction::Update);
+        assert_eq!(data.len(), 1);
+        assert_eq!(update.asks.len(), 2);
+        assert!(update.bids.is_empty());
+        assert_eq!(
+            update.asks[1],
+            OKXRpiBookLevel(
+                Decimal::from_str_exact("0.0001625").unwrap(),
+                Decimal::from_str_exact("12324367.786").unwrap(),
+                Decimal::from(1000),
+                2,
+            )
+        );
+        assert_eq!(update.prev_seq_id, snapshot.seq_id as i64);
+        assert_eq!(update.seq_id, 1_082_831_230);
+        assert_eq!(update.ts, 1_785_406_443_903);
+    }
+
+    #[rstest]
+    fn test_rpi_book_rejects_checksum_field() {
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&load_test_json("ws_books_rpi_update.json")).unwrap();
+        payload["data"][0]["checksum"] = serde_json::json!(0);
+
+        let error = serde_json::from_value::<OKXWsFrame>(payload).unwrap_err();
+
+        assert!(error.to_string().contains("checksum"));
     }
 
     #[rstest]

@@ -15,9 +15,8 @@
 """
 EMA cross strategy routing orders through the TWAP execution algorithm.
 
-Identical to ``EMACross`` except entries are submitted with an
-``exec_algorithm_id`` so the engine routes them to a registered TWAP
-execution algorithm for slicing.
+Identical to ``EMACross`` except entries are submitted with an ``exec_algorithm_id`` so
+the engine routes them to a registered TWAP execution algorithm for slicing.
 
 """
 
@@ -28,7 +27,6 @@ from strategies.ema_cross import EMACrossConfig
 
 from nautilus_trader.core import UUID4
 from nautilus_trader.model import ClientOrderId
-from nautilus_trader.model import ContingencyType
 from nautilus_trader.model import ExecAlgorithmId
 from nautilus_trader.model import MarketOrder
 from nautilus_trader.model import OrderSide
@@ -40,7 +38,10 @@ class EMACrossTWAPConfig(EMACrossConfig):
     Configuration for the EMA cross TWAP test strategy.
     """
 
-    def __new__(cls, *args, **kwargs):
+    def __new__(cls, *args: object, **kwargs: object) -> object:
+        """
+        Create a new instance.
+        """
         kwargs.pop("exec_algorithm_id", None)
         kwargs.pop("twap_horizon_secs", None)
         kwargs.pop("twap_interval_secs", None)
@@ -56,8 +57,11 @@ class EMACrossTWAPConfig(EMACrossConfig):
         exec_algorithm_id: str = "TWAP",
         twap_horizon_secs: float = 30.0,
         twap_interval_secs: float = 3.0,
-        **kwargs,
-    ):
+        **kwargs: object,
+    ) -> None:
+        """
+        Initialize the helper.
+        """
         super().__init__(
             instrument_id=instrument_id,
             bar_type=bar_type,
@@ -76,7 +80,10 @@ class EMACrossTWAP(EMACross):
     EMA cross test strategy submitting entries via the TWAP execution algorithm.
     """
 
-    def __init__(self, config: EMACrossTWAPConfig):
+    def __init__(self, config: EMACrossTWAPConfig) -> None:
+        """
+        Initialize the helper.
+        """
         super().__init__(config)
         self._exec_algorithm_id = ExecAlgorithmId(config.exec_algorithm_id)
         self._exec_algorithm_params = {
@@ -84,13 +91,14 @@ class EMACrossTWAP(EMACross):
             "interval_secs": str(config.twap_interval_secs),
         }
 
-    def _submit_market(self, side: OrderSide):
+    def _submit_market(self, side: OrderSide) -> None:
         self._order_count += 1
+        client_order_id = ClientOrderId(f"{self.strategy_id}-{self._order_count}")
         order = MarketOrder(
             trader_id=self.trader_id,
             strategy_id=self.strategy_id,
             instrument_id=self._instrument_id,
-            client_order_id=ClientOrderId(f"{self.strategy_id}-{self._order_count}"),
+            client_order_id=client_order_id,
             order_side=side,
             quantity=self._trade_size,
             init_id=UUID4(),
@@ -98,8 +106,9 @@ class EMACrossTWAP(EMACross):
             time_in_force=TimeInForce.GTC,
             reduce_only=False,
             quote_quantity=False,
-            contingency_type=ContingencyType.NO_CONTINGENCY,
+            contingency_type=None,
             exec_algorithm_id=self._exec_algorithm_id,
             exec_algorithm_params=self._exec_algorithm_params,
+            exec_spawn_id=client_order_id,
         )
         self.submit_order(order)

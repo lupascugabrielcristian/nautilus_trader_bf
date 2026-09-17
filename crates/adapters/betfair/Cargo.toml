@@ -31,7 +31,10 @@ extension-module = [
   "pyo3/extension-module",
   "python",
 ]
-high-precision = ["nautilus-model/high-precision"]
+high-precision = [
+  "nautilus-model/high-precision",
+  "nautilus-serialization/high-precision",
+]
 python = [
   "dep:nautilus-system",
   "nautilus-core/python",
@@ -46,6 +49,7 @@ python = [
 ignored = ["arrow"] # Used by `custom_data` macro expansion
 
 [package.metadata.docs.rs]
+# Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
 features = ["high-precision"]
 rustdoc-args = ["--cfg", "docsrs"]
 
@@ -66,8 +70,8 @@ async-trait = { workspace = true }
 bon = { workspace = true }
 bytes = { workspace = true }
 bzip2 = { workspace = true }
-chrono = { workspace = true }
 flate2 = { workspace = true }
+jiff = { workspace = true }
 log = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
@@ -85,13 +89,20 @@ pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
 nautilus-backtest = { workspace = true }
-nautilus-testkit = { workspace = true }
+nautilus-execution = { workspace = true }
+nautilus-live = { workspace = true, features = ["node"] }
+nautilus-portfolio = { workspace = true }
+nautilus-risk = { workspace = true }
+nautilus-testkit = { workspace = true, default-features = false, features = [
+  "testers",
+] }
 nautilus-trading = { workspace = true }
 
 axum = { workspace = true }
 dotenvy = { workspace = true }
+proptest = { workspace = true }
 rstest = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
 toml = { workspace = true }
 
 # Run with `cargo run -p nautilus-betfair --example betfair-data-tester --features examples`

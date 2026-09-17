@@ -19,7 +19,12 @@ use std::str::FromStr;
 
 use anyhow::Context;
 use ibapi::orders::{Execution, OrderStatus};
-use nautilus_core::UnixNanos;
+use jiff::{
+    Timestamp,
+    civil::DateTime,
+    tz::{AmbiguousOffset, Offset},
+};
+use nautilus_core::{UnixNanos, datetime::get_timezone};
 use nautilus_model::{
     enums::{
         LiquiditySide, OrderSide, OrderStatus as NautilusOrderStatus, OrderType, TimeInForce,
@@ -31,7 +36,6 @@ use nautilus_model::{
     types::{Currency, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
-use time::{PrimitiveDateTime, macros::format_description};
 
 use crate::{
     common::{
@@ -49,10 +53,10 @@ pub(crate) fn should_use_avg_fill_price(avg_fill_price: f64, instrument_id: &Ins
 }
 
 pub(crate) fn ib_venue_order_id(order_id: i32, perm_id: i64) -> VenueOrderId {
-    if order_id != 0 {
-        VenueOrderId::new(order_id.to_string())
-    } else {
+    if perm_id != 0 {
         VenueOrderId::new(format!("PERM-{perm_id}"))
+    } else {
+        VenueOrderId::new(order_id.to_string())
     }
 }
 
@@ -108,8 +112,8 @@ pub fn parse_execution_to_fill_report(
     let last_qty = Quantity::new(execution.shares, instrument.size_precision());
     let last_px = Price::new(execution_price, instrument.price_precision());
 
-    // Create commission — clamp IB's -1 pending sentinel to 0.0 to avoid invalid Money values
-    let commission_clamped = if commission < 0.0 { 0.0 } else { commission };
+    // Clamp only IB's -1 pending sentinel to 0.0 to preserve rebates
+    let commission_clamped = if commission == -1.0 { 0.0 } else { commission };
     let commission_money = Money::new(commission_clamped, Currency::from_str(commission_currency)?);
 
     // Parse execution time
@@ -222,7 +226,7 @@ pub fn parse_order_status_to_report(
 
     // Map order type from IB order if available
     let order_type = order
-        .map(|order| map_ib_order_type(&order.order_type))
+        .map(|order| map_ib_order_type(&order.order_type, order.limit_price))
         .unwrap_or(OrderType::Market);
 
     // Map time in force from IB order if available
@@ -243,7 +247,7 @@ pub fn parse_order_status_to_report(
         instrument_id,
         client_order_id,
         venue_order_id,
-        order_side,
+        order_side.into(),
         order_type,
         time_in_force,
         nautilus_status,
@@ -283,14 +287,19 @@ pub fn parse_order_status_to_report(
     }
 
     if include_avg_px {
-        report = report.with_avg_px(avg_px_value)?;
+        report = report.with_avg_px(decimal_from_f64(avg_px_value)?);
     }
 
     Ok(report)
 }
 
-fn map_ib_order_type(order_type: &str) -> OrderType {
-    IbOrderType::from_str(order_type).map_or(OrderType::Market, IbOrderType::nautilus_order_type)
+fn map_ib_order_type(order_type: &str, limit_price: Option<f64>) -> OrderType {
+    if order_type == "IBALGO" && limit_price.is_some_and(|price| price != 0.0) {
+        OrderType::Limit
+    } else {
+        IbOrderType::from_str(order_type)
+            .map_or(OrderType::Market, IbOrderType::nautilus_order_type)
+    }
 }
 
 fn parse_ib_order_pricing_fields(
@@ -367,56 +376,89 @@ fn decimal_from_f64(value: f64) -> anyhow::Result<Decimal> {
 /// Supported IB formats:
 /// - "20230223 00:43:36 Universal"
 /// - "20230223 00:43:36 UTC"
+/// - "20230223 00:43:36 MET"
+/// - "20230223 00:43:36 America/New_York"
 /// - "20230223 00:43:36" (assumed UTC)
 /// - "20250225-15:15:00" (assumed UTC)
 ///
+/// Timezones are resolved through Jiff's bundled IANA tz database, so any
+/// region abbreviation or name that IB stamps the execution with (e.g. `MET`,
+/// `EST`, `America/New_York`) is honored, matching the v1 pandas-based parser.
+/// This matters because some IB accounts (e.g. European paper accounts) report a
+/// server timezone such as `MET` that the gateway cannot be coerced out of.
+///
 /// # Errors
 ///
-/// Returns an error if the execution timestamp is malformed or uses a non-UTC timezone.
+/// Returns an error if the timestamp is malformed, the timezone is
+/// unrecognized, or the local time is non-existent (a DST spring-forward gap).
+/// DST fall-back folds resolve to the earliest matching instant.
 pub fn parse_execution_time(time_str: &str) -> anyhow::Result<UnixNanos> {
-    fn parse_utc(
-        time_str: &str,
-        format: &[time::format_description::FormatItem<'_>],
-    ) -> anyhow::Result<UnixNanos> {
-        let dt = PrimitiveDateTime::parse(time_str, format).map_err(|e| {
+    const NAIVE_FORMAT: &str = "%Y%m%d %H:%M:%S";
+
+    // Hyphenated, space-less form (e.g. "20250225-15:15:00") is always UTC.
+    if !time_str.contains(' ') {
+        let normalized = time_str.replace('-', " ");
+        let dt = DateTime::strptime(NAIVE_FORMAT, &normalized).map_err(|e| {
             anyhow::anyhow!("Failed to parse execution timestamp '{time_str}': {e}")
         })?;
-        let nanos: u64 = dt
-            .assume_utc()
-            .unix_timestamp_nanos()
-            .try_into()
-            .map_err(|_| {
-                anyhow::anyhow!("Execution timestamp '{time_str}' was before Unix epoch")
-            })?;
-        Ok(UnixNanos::new(nanos))
+        return datetime_to_unix_nanos(Offset::UTC.to_timestamp(dt)?, time_str);
     }
 
-    if time_str.contains('-') && !time_str.contains(' ') {
-        let format = format_description!("[year][month][day]-[hour]:[minute]:[second]");
-        return parse_utc(time_str, format);
-    }
-
-    let parts: Vec<&str> = time_str.split(' ').collect();
-
-    if parts.len() < 2 {
+    // Split into at most three parts: date, time, and optional timezone token.
+    // The timezone token itself never contains a space, so `splitn(3, ' ')`
+    // correctly groups IANA names such as "America/New_York".
+    let mut parts = time_str.splitn(3, ' ');
+    let (Some(date), Some(time)) = (parts.next(), parts.next()) else {
         anyhow::bail!("Invalid execution time format: {time_str}");
+    };
+    let tz_str = parts.next().unwrap_or("").trim();
+
+    let naive_str = format!("{date} {time}");
+    let dt = DateTime::strptime(NAIVE_FORMAT, &naive_str)
+        .map_err(|e| anyhow::anyhow!("Failed to parse execution timestamp '{time_str}': {e}"))?;
+
+    let utc = if tz_str.is_empty() {
+        Offset::UTC.to_timestamp(dt)?
+    } else {
+        localize_with_zone(dt, tz_str, time_str)?
+    };
+
+    datetime_to_unix_nanos(utc, time_str)
+}
+
+/// Localize a naive timestamp against an IB timezone token and convert to UTC.
+///
+/// `Z` is normalized to `UTC`; everything else is resolved through the IANA tz
+/// database. Error and fold behavior is documented on [`parse_execution_time`].
+fn localize_with_zone(dt: DateTime, tz_str: &str, time_str: &str) -> anyhow::Result<Timestamp> {
+    let tz_name = if tz_str.eq_ignore_ascii_case("Z") {
+        "UTC"
+    } else {
+        tz_str
+    };
+
+    let zone = get_timezone(tz_name).map_err(|_| {
+        anyhow::anyhow!(
+            "Unrecognised execution timezone '{tz_str}' in '{time_str}'. Configure TWS / IB Gateway to emit a standard timezone (e.g. UTC)"
+        )
+    })?;
+    let ambiguous = zone.to_ambiguous_timestamp(dt);
+    match ambiguous.offset() {
+        AmbiguousOffset::Unambiguous { .. } => Ok(ambiguous.unambiguous()?),
+        // Fall-back fold: take the earliest instant (worst case ~1h skew).
+        AmbiguousOffset::Fold { .. } => Ok(ambiguous.earlier()?),
+        AmbiguousOffset::Gap { .. } => {
+            anyhow::bail!("Execution timestamp '{time_str}' is non-existent in timezone '{tz_str}'")
+        }
     }
+}
 
-    let format = format_description!("[year][month][day] [hour]:[minute]:[second]");
-    let date_str = format!("{} {}", parts[0], parts[1]);
-
-    if parts.len() == 2 {
-        return parse_utc(&date_str, format);
-    }
-
-    let timezone = parts[2];
-    if !matches!(timezone, "Universal" | "UTC" | "Etc/UTC" | "GMT" | "Z") {
-        anyhow::bail!(
-            "Unsupported non-UTC execution timezone '{timezone}' in '{time_str}'. Configure TWS / IB Gateway to emit UTC timestamps"
-        );
-    }
-
-    parse_utc(&date_str, format)
+fn datetime_to_unix_nanos(dt: Timestamp, time_str: &str) -> anyhow::Result<UnixNanos> {
+    let nanos: u64 = dt
+        .as_nanosecond()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Execution timestamp '{time_str}' was before Unix epoch"))?;
+    Ok(UnixNanos::new(nanos))
 }
 
 #[cfg(test)]
@@ -428,6 +470,7 @@ mod tests {
     use nautilus_model::{
         enums::TrailingOffsetType,
         identifiers::{Symbol, Venue},
+        instruments::{InstrumentAny, stubs::equity_aapl},
     };
     use rust_decimal::Decimal;
 
@@ -449,6 +492,11 @@ mod tests {
     use rstest::rstest;
 
     #[rstest]
+    fn test_ibalgo_with_zero_limit_price_maps_to_market() {
+        assert_eq!(map_ib_order_type("IBALGO", Some(0.0)), OrderType::Market);
+    }
+
+    #[rstest]
     fn test_parse_execution_time_hyphenated_format() {
         let time_str = "20250225-15:15:00";
         let result = parse_execution_time(time_str);
@@ -458,8 +506,70 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_execution_time_with_unsupported_non_utc_timezone() {
-        let time_str = "20230223 00:43:36 America/New_York";
+    fn test_parse_execution_time_with_met_timezone() {
+        // Regression for European paper accounts that IB stamps with `MET`.
+        // MET (CET) in February observes standard time (UTC+1).
+        let met = parse_execution_time("20230223 00:43:36 MET").unwrap();
+        let utc = parse_execution_time("20230223 00:43:36 Universal").unwrap();
+        // Local 00:43:36 MET == 2023-02-22 23:43:36 UTC, i.e. 1 hour before UTC.
+        assert_eq!(
+            met.as_i64(),
+            utc.as_i64() - 3_600_000_000_000,
+            "MET (CET) should be 1h ahead of UTC in February"
+        );
+        assert!(met.as_i64() > 0);
+    }
+
+    #[rstest]
+    fn test_parse_execution_time_applies_dst_for_regional_timezone() {
+        // Same zone, two seasons: EST (UTC-5) in winter vs EDT (UTC-4) in summer.
+        // Equal offsets would mean DST is NOT being applied - a real regression.
+        let winter = parse_execution_time("20230223 00:43:36 America/New_York").unwrap();
+        let summer = parse_execution_time("20230715 00:43:36 America/New_York").unwrap();
+        let winter_utc = parse_execution_time("20230223 00:43:36 Universal").unwrap();
+        let summer_utc = parse_execution_time("20230715 00:43:36 Universal").unwrap();
+        assert_eq!(winter.as_i64(), winter_utc.as_i64() + 5 * 3_600_000_000_000); // EST
+        assert_eq!(summer.as_i64(), summer_utc.as_i64() + 4 * 3_600_000_000_000); // EDT
+    }
+
+    #[rstest]
+    fn test_parse_execution_time_dst_fall_back_fold_resolves_to_earliest() {
+        // CME US/Central account (bebop23's case): on 2023-11-05 fall-back night
+        // 01:30 America/Chicago occurs twice. Resolve to earliest (CDT, 06:30 UTC),
+        // don't drop the fill.
+        let fold = parse_execution_time("20231105 01:30:00 America/Chicago").unwrap();
+        assert_eq!(
+            fold.as_i64(),
+            parse_execution_time("20231105 06:30:00 Universal")
+                .unwrap()
+                .as_i64()
+        );
+        assert_ne!(
+            fold.as_i64(),
+            parse_execution_time("20231105 07:30:00 Universal")
+                .unwrap()
+                .as_i64()
+        );
+    }
+
+    #[rstest]
+    fn test_parse_execution_time_dst_spring_forward_gap_errors() {
+        // 02:30 America/Chicago never exists on 2023-03-12 spring-forward night.
+        let gap = parse_execution_time("20230312 02:30:00 America/Chicago");
+        assert!(gap.is_err());
+    }
+
+    #[rstest]
+    fn test_parse_execution_time_fixed_offset_zone_without_dst() {
+        // Asia/Tokyo is JST (UTC+9) year-round - guards the no-DST path.
+        let tokyo = parse_execution_time("20230223 00:43:36 Asia/Tokyo").unwrap();
+        let utc = parse_execution_time("20230223 00:43:36 Universal").unwrap();
+        assert_eq!(tokyo.as_i64(), utc.as_i64() - 9 * 3_600_000_000_000);
+    }
+
+    #[rstest]
+    fn test_parse_execution_time_with_unrecognised_timezone_errors() {
+        let time_str = "20230223 00:43:36 Mars/Olympus";
         let result = parse_execution_time(time_str);
         assert!(result.is_err());
     }
@@ -692,9 +802,9 @@ mod tests {
     }
 
     #[rstest]
-    fn test_ib_venue_order_id_prefers_order_id_and_falls_back_to_perm_id() {
-        assert_eq!(ib_venue_order_id(123, 456).to_string(), "123");
-        assert_eq!(ib_venue_order_id(0, 456).to_string(), "PERM-456");
+    fn test_ib_venue_order_id_prefers_perm_id_and_falls_back_to_order_id() {
+        assert_eq!(ib_venue_order_id(123, 456).to_string(), "PERM-456");
+        assert_eq!(ib_venue_order_id(123, 0).to_string(), "123");
     }
 
     #[rstest]
@@ -716,7 +826,7 @@ mod tests {
         None,
         None,
         None,
-        TrailingOffsetType::NoTrailingOffset
+        None
     )]
     #[case(
         "LMT",
@@ -729,7 +839,33 @@ mod tests {
         None,
         None,
         None,
-        TrailingOffsetType::NoTrailingOffset
+        None
+    )]
+    #[case(
+        "IBALGO",
+        Some(185.0),
+        None,
+        None,
+        None,
+        OrderType::Limit,
+        Some(Price::new(185.0, 0)),
+        None,
+        None,
+        None,
+        None
+    )]
+    #[case(
+        "IBALGO",
+        None,
+        None,
+        None,
+        None,
+        OrderType::Market,
+        None,
+        None,
+        None,
+        None,
+        None
     )]
     #[case(
         "MIT",
@@ -742,7 +878,7 @@ mod tests {
         Some(Price::new(180.0, 0)),
         None,
         None,
-        TrailingOffsetType::NoTrailingOffset
+        None
     )]
     #[case(
         "LIT",
@@ -755,7 +891,7 @@ mod tests {
         Some(Price::new(180.0, 0)),
         None,
         None,
-        TrailingOffsetType::NoTrailingOffset
+        None
     )]
     #[case(
         "STP",
@@ -768,7 +904,7 @@ mod tests {
         Some(Price::new(180.0, 0)),
         None,
         None,
-        TrailingOffsetType::NoTrailingOffset
+        None
     )]
     #[case(
         "STP LMT",
@@ -781,7 +917,7 @@ mod tests {
         Some(Price::new(180.0, 0)),
         None,
         None,
-        TrailingOffsetType::NoTrailingOffset
+        None
     )]
     #[case(
         "TRAIL LIMIT",
@@ -794,7 +930,7 @@ mod tests {
         Some(Price::new(185.0, 0)),
         Some(Decimal::from_str("0.25").unwrap()),
         Some(Decimal::from_str("2.5").unwrap()),
-        TrailingOffsetType::Price,
+        Some(TrailingOffsetType::Price),
     )]
     fn test_parse_order_status_to_report_maps_pricing_fields_by_order_type(
         #[case] ib_order_type: &str,
@@ -807,7 +943,7 @@ mod tests {
         #[case] expected_trigger_price: Option<Price>,
         #[case] expected_limit_offset: Option<Decimal>,
         #[case] expected_trailing_offset: Option<Decimal>,
-        #[case] expected_trailing_offset_type: TrailingOffsetType,
+        #[case] expected_trailing_offset_type: Option<TrailingOffsetType>,
     ) {
         let instrument_provider = create_test_instrument_provider();
         let instrument_id = create_test_instrument_id();
@@ -903,7 +1039,10 @@ mod tests {
             report.trailing_offset,
             Some(Decimal::from_str("250").unwrap())
         );
-        assert_eq!(report.trailing_offset_type, TrailingOffsetType::BasisPoints);
+        assert_eq!(
+            report.trailing_offset_type,
+            Some(TrailingOffsetType::BasisPoints),
+        );
         assert_eq!(report.limit_offset, None);
     }
 
@@ -963,6 +1102,56 @@ mod tests {
                 assert_eq!(fill.order_side, OrderSide::Buy);
                 assert_eq!(fill.trade_id.to_string(), "EXEC-001");
             }
+        }
+    }
+
+    #[rstest]
+    fn test_parse_execution_to_fill_report_clamps_only_pending_commission_sentinel() {
+        let instrument_provider = create_test_instrument_provider();
+        let instrument = equity_aapl();
+        let instrument_id = instrument.id();
+        instrument_provider.insert_test_instrument(InstrumentAny::from(instrument), 265598, 1);
+        let account_id = AccountId::from("IB-001");
+        let contract = Contract::default();
+
+        for (commission, expected) in [(-1.0, 0.0), (-0.25, -0.25)] {
+            let execution = Execution {
+                order_id: 12345,
+                client_id: 0,
+                execution_id: format!("EXEC-{commission}"),
+                time: String::from("20230223 00:43:36 Universal"),
+                account_number: String::new(),
+                exchange: String::new(),
+                side: ExecutionSide::Bought,
+                shares: 100.0,
+                price: 150.25,
+                perm_id: 0,
+                liquidation: 0,
+                cumulative_quantity: 100.0,
+                average_price: 150.25,
+                order_reference: String::from("ORDER-REF-001"),
+                ev_rule: String::new(),
+                ev_multiplier: None,
+                model_code: String::new(),
+                last_liquidity: Liquidity::None,
+                pending_price_revision: false,
+                submitter: String::new(),
+            };
+
+            let report = parse_execution_to_fill_report(
+                &execution,
+                &contract,
+                commission,
+                "USD",
+                instrument_id,
+                account_id,
+                &instrument_provider,
+                UnixNanos::new(0),
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(report.commission, Money::new(expected, Currency::USD()));
         }
     }
 

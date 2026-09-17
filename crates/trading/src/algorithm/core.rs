@@ -15,27 +15,24 @@
 
 //! Core component for execution algorithms.
 
-use std::{
-    cell::RefCell,
-    fmt::Debug,
-    ops::{Deref, DerefMut},
-    rc::Rc,
-};
+use std::{cell::RefCell, fmt::Debug, rc::Rc};
 
 use ahash::{AHashMap, AHashSet};
 use indexmap::IndexMap;
 use nautilus_common::{
-    actor::{DataActorConfig, DataActorCore},
+    actor::{DataActorConfig, DataActorCore, DataActorNative},
     cache::Cache,
     clock::Clock,
     msgbus::TypedHandler,
 };
+use nautilus_core::Params;
 use nautilus_model::{
     events::{OrderEventAny, PositionEvent},
     identifiers::{ActorId, ClientOrderId, ExecAlgorithmId, StrategyId, TraderId},
     orders::{OrderAny, OrderList},
     types::Quantity,
 };
+use nautilus_portfolio::portfolio::Portfolio;
 
 use super::config::ExecutionAlgorithmConfig;
 
@@ -58,8 +55,10 @@ pub struct StrategyEventHandlers {
 /// spawn ID tracking and strategy subscriptions. It wraps a [`DataActorCore`]
 /// to provide data actor capabilities.
 ///
-/// User algorithms should hold this as a member and implement `Deref`/`DerefMut`
-/// to satisfy the trait bounds of [`ExecutionAlgorithm`](super::ExecutionAlgorithm).
+/// User algorithms should hold this as a member and use the
+/// `nautilus_execution_algorithm!` macro to provide native runtime wiring.
+/// Direct access to this core is native runtime wiring and belongs behind
+/// [`ExecutionAlgorithmNative`].
 pub struct ExecutionAlgorithmCore {
     /// The underlying data actor core.
     pub actor: DataActorCore,
@@ -73,8 +72,43 @@ pub struct ExecutionAlgorithmCore {
     subscribed_strategies: AHashSet<StrategyId>,
     /// Tracks pending spawn reductions for quantity restoration on denial/rejection.
     pending_spawn_reductions: AHashMap<ClientOrderId, Quantity>,
+    /// Maps primary order client IDs to the command params supplied at submission.
+    submit_params: AHashMap<ClientOrderId, Params>,
+    /// The portfolio shared by the trader.
+    portfolio: Option<Rc<RefCell<Portfolio>>>,
     /// Maps strategies to their event handlers for cleanup on reset.
     strategy_event_handlers: IndexMap<StrategyId, StrategyEventHandlers>,
+}
+
+/// Native-only access to internal execution algorithm runtime state.
+///
+/// Use this trait from engine, runtime, testkit, or opt-in native algorithm
+/// code when direct access to host runtime objects matters for an explicit
+/// latency-sensitive path, or when host integration code needs access below
+/// the facade API.
+///
+/// Do not import this trait in code intended to run through Python or the
+/// plug-in authoring surface. Native borrows, `Rc<RefCell<_>>`, and core
+/// references do not cross those boundaries.
+pub trait ExecutionAlgorithmNative: DataActorNative {
+    /// Returns the execution algorithm core.
+    fn exec_algorithm_core(&self) -> &ExecutionAlgorithmCore;
+
+    /// Returns the mutable execution algorithm core.
+    fn exec_algorithm_core_mut(&mut self) -> &mut ExecutionAlgorithmCore;
+
+    /// Returns a clone of the reference-counted portfolio.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the execution algorithm has not been registered.
+    fn portfolio_rc(&self) -> Rc<RefCell<Portfolio>> {
+        self.exec_algorithm_core()
+            .portfolio
+            .as_ref()
+            .expect("ExecutionAlgorithm not registered: Portfolio not initialized")
+            .clone()
+    }
 }
 
 impl Debug for ExecutionAlgorithmCore {
@@ -89,6 +123,7 @@ impl Debug for ExecutionAlgorithmCore {
                 "pending_spawn_reductions",
                 &self.pending_spawn_reductions.len(),
             )
+            .field("submit_params", &self.submit_params.len())
             .field(
                 "strategy_event_handlers",
                 &self.strategy_event_handlers.len(),
@@ -122,6 +157,8 @@ impl ExecutionAlgorithmCore {
             exec_spawn_ids: AHashMap::new(),
             subscribed_strategies: AHashSet::new(),
             pending_spawn_reductions: AHashMap::new(),
+            submit_params: AHashMap::new(),
+            portfolio: None,
             strategy_event_handlers: IndexMap::new(),
         }
     }
@@ -144,6 +181,11 @@ impl ExecutionAlgorithmCore {
     #[must_use]
     pub fn id(&self) -> ExecAlgorithmId {
         self.exec_algorithm_id
+    }
+
+    /// Sets the portfolio shared by the trader.
+    pub fn set_portfolio(&mut self, portfolio: Rc<RefCell<Portfolio>>) {
+        self.portfolio = Some(portfolio);
     }
 
     /// Generates the next spawn client order ID for a primary order.
@@ -216,6 +258,33 @@ impl ExecutionAlgorithmCore {
         self.pending_spawn_reductions.clear();
     }
 
+    /// Stores the command params supplied with a primary order submission.
+    ///
+    /// A `None` or empty params map is ignored, so no lookup is created for orders without params.
+    pub fn remember_submit_params(&mut self, primary_id: ClientOrderId, params: Option<Params>) {
+        if let Some(params) = params
+            && !params.is_empty()
+        {
+            self.submit_params.insert(primary_id, params);
+        }
+    }
+
+    /// Returns a clone of the submit command params stored for a primary order, if any.
+    #[must_use]
+    pub fn submit_params(&self, primary_id: &ClientOrderId) -> Option<Params> {
+        self.submit_params.get(primary_id).cloned()
+    }
+
+    /// Removes the stored submit command params for a primary order.
+    pub fn remove_submit_params(&mut self, primary_id: &ClientOrderId) {
+        self.submit_params.remove(primary_id);
+    }
+
+    /// Clears all stored submit command params.
+    pub fn clear_submit_params(&mut self) {
+        self.submit_params.clear();
+    }
+
     /// Resets the core to its initial state.
     ///
     /// Note: This clears handler storage but does NOT unsubscribe from msgbus.
@@ -224,6 +293,7 @@ impl ExecutionAlgorithmCore {
         self.exec_spawn_ids.clear();
         self.subscribed_strategies.clear();
         self.pending_spawn_reductions.clear();
+        self.submit_params.clear();
         self.strategy_event_handlers.clear();
     }
 
@@ -233,10 +303,7 @@ impl ExecutionAlgorithmCore {
     ///
     /// Returns an error if the order is not found in the cache.
     pub fn get_order(&self, client_order_id: &ClientOrderId) -> anyhow::Result<OrderAny> {
-        self.cache()
-            .order(client_order_id)
-            .map(|o| o.clone())
-            .ok_or_else(|| anyhow::anyhow!("Order not found in cache for {client_order_id}"))
+        Ok(self.cache_ref().try_order_owned(client_order_id)?)
     }
 
     /// Returns all orders for the given order list from the cache.
@@ -253,16 +320,23 @@ impl ExecutionAlgorithmCore {
     }
 }
 
-impl Deref for ExecutionAlgorithmCore {
-    type Target = DataActorCore;
-    fn deref(&self) -> &Self::Target {
+impl DataActorNative for ExecutionAlgorithmCore {
+    fn core(&self) -> &DataActorCore {
         &self.actor
+    }
+
+    fn core_mut(&mut self) -> &mut DataActorCore {
+        &mut self.actor
     }
 }
 
-impl DerefMut for ExecutionAlgorithmCore {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.actor
+impl ExecutionAlgorithmNative for ExecutionAlgorithmCore {
+    fn exec_algorithm_core(&self) -> &ExecutionAlgorithmCore {
+        self
+    }
+
+    fn exec_algorithm_core_mut(&mut self) -> &mut ExecutionAlgorithmCore {
+        self
     }
 }
 
@@ -368,6 +442,31 @@ mod tests {
     }
 
     #[rstest]
+    fn test_remove_submit_params_only_removes_requested_primary() {
+        let config = create_test_config();
+        let mut core = ExecutionAlgorithmCore::new(config);
+        let primary1 = ClientOrderId::new("O-001");
+        let primary2 = ClientOrderId::new("O-002");
+        let mut params1 = Params::new();
+        params1.insert(
+            "route".to_string(),
+            serde_json::Value::String("A".to_string()),
+        );
+        let mut params2 = Params::new();
+        params2.insert(
+            "route".to_string(),
+            serde_json::Value::String("B".to_string()),
+        );
+
+        core.remember_submit_params(primary1, Some(params1));
+        core.remember_submit_params(primary2, Some(params2.clone()));
+        core.remove_submit_params(&primary1);
+
+        assert_eq!(core.submit_params(&primary1), None);
+        assert_eq!(core.submit_params(&primary2), Some(params2));
+    }
+
+    #[rstest]
     fn test_reset() {
         let config = create_test_config();
         let mut core = ExecutionAlgorithmCore::new(config);
@@ -385,11 +484,10 @@ mod tests {
     }
 
     #[rstest]
-    fn test_deref_to_data_actor_core() {
+    fn test_data_actor_core_available_through_native_trait() {
         let config = create_test_config();
         let core = ExecutionAlgorithmCore::new(config);
 
-        // Should be able to access DataActorCore methods via Deref
-        assert!(core.trader_id().is_none());
+        assert!(DataActorNative::core(&core).trader_id().is_none());
     }
 }

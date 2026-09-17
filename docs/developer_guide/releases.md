@@ -7,12 +7,13 @@ This guide covers the release process and the standards for writing release note
 NautilusTrader uses a three-branch model:
 
 - **`develop`**: active development; publishes dev wheels to Cloudflare R2 on every push.
-- **`nightly`**: pre-release testing; publishes alpha wheels and CLI binaries.
+- **`nightly`**: pre-release testing; publishes all supported pre-release wheels and CLI binaries.
 - **`master`**: stable releases; triggers the full release pipeline.
 
-Pushing to `master` automatically tags the version from `pyproject.toml`, creates a draft GitHub
-release, uploads release assets, publishes Cargo crates to crates.io, publishes wheels and sdist to
-PyPI, publishes the GitHub release, builds Docker images, and triggers a docs rebuild.
+Merging a release commit to `master` automatically tags the version from `python/pyproject.toml`,
+creates a draft GitHub release, uploads release assets, publishes Cargo crates to crates.io,
+publishes wheels and sdist to PyPI, publishes the GitHub release, builds Docker images, and triggers
+a docs rebuild.
 
 ## Stable release workflow
 
@@ -25,7 +26,8 @@ the registry verification and final integrity assets are complete.
 flowchart TD
     push["Push to master"]
     wheels["Build wheel artifacts<br/>Linux x86/ARM, macOS, Windows"]
-    audits["Release gates<br/>cargo-deny + cargo-vet"]
+    audits["Release gates<br/>Rust suite + cargo-deny + cargo-vet<br/>Cargo publish + docs/features preflights"]
+    security["security-audit<br/>Zizmor + supply chain"]
     tag["tag-release<br/>Create tag and draft GitHub release"]
     wheel_assets["publish-wheels-master<br/>Upload wheels to GitHub release and R2<br/>release env"]
     build_sdist["build-sdist<br/>Build sdist workflow artifact"]
@@ -38,8 +40,10 @@ flowchart TD
 
     push --> wheels
     push --> audits
+    push --> security
     wheels --> tag
     audits --> tag
+    security --> tag
     tag --> build_sdist
     build_sdist --> sdist_asset
     tag --> sdist_asset
@@ -61,30 +65,36 @@ flowchart TD
 Keep these sequencing rules intact when editing `.github/workflows/build.yml`:
 
 - The draft GitHub release must exist before any release asset upload or package registry publish.
+- `tag-release` must depend on `security-audit` so stable release tagging cannot proceed after an
+  audit failure.
 - Wheel and sdist assets must be attached to the GitHub release before package index publishing
   starts (`packages.nautechsystems.io`, PyPI, crates.io).
 - PyPI and crates.io Trusted Publishing jobs must keep `environment: release` and
   `id-token: write`; those registrations depend on the `release` environment.
 - Non-OIDC integrity and asset-upload jobs should avoid `environment: release` unless they need
   release environment secrets or approvals.
-- `publish-release-integrity` must run after PyPI and crates.io publishing so it verifies the
-  registries against the release manifest before attaching final integrity assets.
+- `publish-release-integrity` must run after PyPI and crates.io publishing. It generates the
+  release manifest first, verifies registries against that manifest, then attaches final integrity
+  assets only after verification passes.
 - `publish-github-release` must be the final stable release job. GitHub recommends creating a
   draft release, attaching all assets, then publishing the draft before enabling release
   immutability. Once GitHub release immutability is enabled for the repo, published release assets
   and the release tag cannot be changed; only the title and release notes remain editable. The job
-  verifies GitHub's release attestation after publishing the draft.
+  verifies the final draft asset set before publishing and verifies GitHub's release attestation
+  after publishing the draft.
 
 ## Versioning
 
 The project maintains two version numbers:
 
-| File                     | Scope          | Example   |
-|--------------------------|----------------|-----------|
-| `pyproject.toml`         | Python package | `1.223.0` |
-| `Cargo.toml` (workspace) | Rust crates    | `0.55.0`  |
+| File                     | Scope          |
+| ------------------------ | -------------- |
+| `python/pyproject.toml`  | Python package |
+| `Cargo.toml` (workspace) | Rust crates    |
 
-These are bumped independently. The Python version drives the release tag (`v1.223.0`).
+These are bumped independently. The Python version drives the `v<python-version>` release tag.
+Versions ending in `aN`, `bN`, or `rcN` create a GitHub pre-release; final versions create a normal
+release.
 
 ## Crates.io publishing
 
@@ -93,7 +103,7 @@ crates.io Trusted Publishing through GitHub Actions OIDC, so it does not use a p
 token. Configure each crate on crates.io with:
 
 | Field       | Value             |
-|-------------|-------------------|
+| ----------- | ----------------- |
 | Owner       | `nautechsystems`  |
 | Repository  | `nautilus_trader` |
 | Workflow    | `build.yml`       |
@@ -124,7 +134,7 @@ mismatches also fail.
 ### Pre-release (on `develop`)
 
 - [ ] Finalize `RELEASES.md`: review all items, remove empty sections
-- [ ] Ensure versions are set in `pyproject.toml` and `Cargo.toml` workspace
+- [ ] Ensure versions are set in `python/pyproject.toml` and the `Cargo.toml` workspace
 - [ ] Ensure crates.io Trusted Publishing is configured for every crate that CI publishes:
   `bash scripts/ci/check-crates-io-trusted-publishing.sh`
 - [ ] Ensure all CI checks pass on `develop`
@@ -136,11 +146,14 @@ mismatches also fail.
 - [ ] Verify the `build` workflow completes:
   - Wheels built for Linux x86/ARM, macOS, Windows
   - `cargo-deny` and `cargo-vet` pass
+  - `security-audit` passes its Zizmor and supply-chain checks
+  - Release docs/features and Cargo publish preflights pass before tagging
   - Tag and draft GitHub release created
   - Wheels and sdist attached to the GitHub release before package registry publishing
   - Cargo crates published to crates.io or skipped because the version already exists
   - Wheels and sdist published to PyPI
-  - Release checksums, registry verification, crates manifest, and attestation siblings published
+  - Registry verification passes before release checksums, crates manifest, and attestation siblings
+    are attached
   - GitHub release published after all release assets and integrity assets are attached
 - [ ] Verify the `docker` workflow completes (images built and pushed)
 - [ ] Verify the `build-docs` workflow completes (docs rebuild triggered)
@@ -150,7 +163,7 @@ mismatches also fail.
 - [ ] Update the release date in `RELEASES.md` for the published version
 - [ ] Add horizontal separator `---` below the completed release
 - [ ] Add the next version template at the top of `RELEASES.md` (see below)
-- [ ] Bump `pyproject.toml` version to the next release number
+- [ ] Bump `python/pyproject.toml` version to the next release number
 - [ ] Bump crate versions in tutorial and how-to `Cargo.toml` snippets
   (`docs/concepts/rust.md`, `docs/how_to/run_rust_backtest.md`,
   `docs/how_to/run_rust_live_trading.md`)
@@ -216,7 +229,6 @@ Includes significant hardening improvements elevated from Internal Improvements.
 **Format**:
 
 ```markdown
-- Fixed non-executable stack for Cython extensions to support hardened Linux systems
 - Fixed divide-by-zero and overflow bugs in model crate that could cause crashes
 - Fixed core arithmetic operations to reject NaN/Infinity values and improve overflow handling
 ```
@@ -303,8 +315,8 @@ Features marked for removal.
 **Be specific**:
 
 ```markdown
-❌ Improved Binance adapter
-✅ Improved Binance fill handling when instrument not cached
+Bad:  Improved Binance adapter
+Good: Improved Binance fill handling when instrument not cached
 ```
 
 ## Security classification
@@ -328,7 +340,7 @@ Note: Plain logic panics belong in Fixes unless they threaten system stability o
 
 ```markdown
 - Fixed divide-by-zero in margin calculations that could crash the engine
-- Fixed non-executable stack for Cython extensions to support hardened systems
+- Fixed integer overflow in model arithmetic that could crash the process
 ```
 
 **Fixes** (incorrect but safe):

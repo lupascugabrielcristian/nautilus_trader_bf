@@ -55,6 +55,7 @@ pub fn order_status_report_schema() -> Schema {
         utf8_field("contingency_type", false),
         timestamp_field("expire_time", true),
         float64_field("price", true),
+        float64_field("activation_price", true),
         float64_field("trigger_price", true),
         utf8_field("trigger_type", true),
         float64_field("limit_offset", true),
@@ -102,6 +103,7 @@ pub fn encode_order_status_reports(data: &[OrderStatusReport]) -> Result<RecordB
     let mut contingency_type = StringBuilder::new();
     let mut expire_time = TimestampNanosecondBuilder::with_capacity(data.len());
     let mut price = Float64Builder::with_capacity(data.len());
+    let mut activation_price = Float64Builder::with_capacity(data.len());
     let mut trigger_price = Float64Builder::with_capacity(data.len());
     let mut trigger_type = StringBuilder::new();
     let mut limit_offset = Float64Builder::with_capacity(data.len());
@@ -119,7 +121,12 @@ pub fn encode_order_status_reports(data: &[OrderStatusReport]) -> Result<RecordB
         instrument_id.append_value(report.instrument_id.to_string());
         client_order_id.append_option(report.client_order_id.map(|v| v.to_string()));
         venue_order_id.append_value(report.venue_order_id);
-        order_side.append_value(format!("{}", report.order_side));
+        order_side.append_value(
+            report
+                .order_side
+                .as_ref()
+                .map_or("NO_ORDER_SIDE", AsRef::as_ref),
+        );
         order_type.append_value(format!("{}", report.order_type));
         time_in_force.append_value(format!("{}", report.time_in_force));
         order_status.append_value(format!("{}", report.order_status));
@@ -136,14 +143,25 @@ pub fn encode_order_status_reports(data: &[OrderStatusReport]) -> Result<RecordB
             serde_json::to_string(&values).unwrap_or_default()
         }));
         parent_order_id.append_option(report.parent_order_id.map(|v| v.to_string()));
-        contingency_type.append_value(format!("{}", report.contingency_type));
+        contingency_type.append_value(
+            report
+                .contingency_type
+                .as_ref()
+                .map_or("NO_CONTINGENCY", AsRef::as_ref),
+        );
         expire_time.append_option(report.expire_time.map(|v| unix_nanos_to_i64(v.as_u64())));
         price.append_option(report.price.map(|v| v.as_f64()));
+        activation_price.append_option(report.activation_price.map(|v| v.as_f64()));
         trigger_price.append_option(report.trigger_price.map(|v| v.as_f64()));
         trigger_type.append_option(report.trigger_type.map(|v| format!("{v}")));
         limit_offset.append_option(report.limit_offset.and_then(|v| v.to_f64()));
         trailing_offset.append_option(report.trailing_offset.and_then(|v| v.to_f64()));
-        trailing_offset_type.append_value(format!("{}", report.trailing_offset_type));
+        trailing_offset_type.append_value(
+            report
+                .trailing_offset_type
+                .as_ref()
+                .map_or("NO_TRAILING_OFFSET", AsRef::as_ref),
+        );
         avg_px.append_option(report.avg_px.and_then(|v| v.to_f64()));
         display_qty.append_option(report.display_qty.map(|v| quantity_to_f64(&v)));
         post_only.append_value(report.post_only);
@@ -176,6 +194,7 @@ pub fn encode_order_status_reports(data: &[OrderStatusReport]) -> Result<RecordB
             Arc::new(contingency_type.finish()),
             Arc::new(expire_time.finish()),
             Arc::new(price.finish()),
+            Arc::new(activation_price.finish()),
             Arc::new(trigger_price.finish()),
             Arc::new(trigger_type.finish()),
             Arc::new(limit_offset.finish()),
@@ -199,9 +218,7 @@ mod tests {
     };
     use nautilus_core::UUID4;
     use nautilus_model::{
-        enums::{
-            ContingencyType, OrderSide, OrderStatus, OrderType, TimeInForce, TrailingOffsetType,
-        },
+        enums::{OrderSide, OrderStatus, OrderType, TimeInForce},
         identifiers::{AccountId, ClientOrderId, InstrumentId, VenueOrderId},
         types::{Price, Quantity},
     };
@@ -215,7 +232,7 @@ mod tests {
             instrument_id: InstrumentId::from(instrument_id),
             client_order_id: Some(ClientOrderId::from("O-001")),
             venue_order_id: VenueOrderId::from("V-001"),
-            order_side: OrderSide::Buy,
+            order_side: Some(OrderSide::Buy),
             order_type: OrderType::Limit,
             time_in_force: TimeInForce::Gtc,
             order_status: OrderStatus::Accepted,
@@ -229,14 +246,15 @@ mod tests {
             venue_position_id: None,
             linked_order_ids: None,
             parent_order_id: None,
-            contingency_type: ContingencyType::NoContingency,
+            contingency_type: None,
             expire_time: None,
             price: Some(Price::from("100.50")),
+            activation_price: None,
             trigger_price: None,
             trigger_type: None,
             limit_offset: None,
             trailing_offset: None,
-            trailing_offset_type: TrailingOffsetType::NoTrailingOffset,
+            trailing_offset_type: None,
             avg_px: None,
             display_qty: None,
             post_only: true,
@@ -251,7 +269,7 @@ mod tests {
         let batch = encode_order_status_reports(&[]).unwrap();
         let schema = batch.schema();
         let fields = schema.fields();
-        assert_eq!(fields.len(), 32);
+        assert_eq!(fields.len(), 33);
         assert_eq!(fields[0].name(), "account_id");
         assert_eq!(fields[0].data_type(), &DataType::Utf8);
         assert_eq!(fields[8].name(), "quantity");
@@ -261,8 +279,10 @@ mod tests {
             fields[11].data_type(),
             &DataType::Timestamp(TimeUnit::Nanosecond, None)
         );
-        assert_eq!(fields[28].name(), "post_only");
-        assert_eq!(fields[28].data_type(), &DataType::Boolean);
+        assert_eq!(fields[21].name(), "activation_price");
+        assert_eq!(fields[21].data_type(), &DataType::Float64);
+        assert_eq!(fields[29].name(), "post_only");
+        assert_eq!(fields[29].data_type(), &DataType::Boolean);
     }
 
     #[rstest]
@@ -288,7 +308,7 @@ mod tests {
             .downcast_ref::<Float64Array>()
             .unwrap();
         let post_only_col = batch
-            .column(28)
+            .column(29)
             .as_any()
             .downcast_ref::<BooleanArray>()
             .unwrap();
@@ -343,7 +363,7 @@ mod tests {
         let batch = encode_order_status_reports(&reports).unwrap();
 
         let trigger_price_col = batch
-            .column(21)
+            .column(22)
             .as_any()
             .downcast_ref::<Float64Array>()
             .unwrap();
@@ -358,10 +378,25 @@ mod tests {
     }
 
     #[rstest]
+    fn test_encode_order_status_reports_no_order_side() {
+        let mut report = make_report("AAPL.XNAS", 1_000);
+        report.order_side = None;
+
+        let batch = encode_order_status_reports(&[report]).unwrap();
+        let order_side_col = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        assert_eq!(order_side_col.value(0), "NO_ORDER_SIDE");
+    }
+
+    #[rstest]
     fn test_encode_order_status_reports_empty() {
         let batch = encode_order_status_reports(&[]).unwrap();
         assert_eq!(batch.num_rows(), 0);
-        assert_eq!(batch.schema().fields().len(), 32);
+        assert_eq!(batch.schema().fields().len(), 33);
     }
 
     #[rstest]

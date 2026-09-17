@@ -1,7 +1,7 @@
 # Delta-Neutral Options Strategy (Derive)
 
 :::note
-This is a **Rust-only** v2 system tutorial. It runs the live delta-neutral
+This is a **Rust-only** system tutorial. It runs the live delta-neutral
 short-volatility strategy on Derive using the Rust `LiveNode`.
 :::
 
@@ -34,19 +34,19 @@ positions, the strategy can submit hedge orders.
 
 For testnet:
 
-```fish
-set -gx DERIVE_TESTNET_WALLET_ADDRESS      "0x..."
-set -gx DERIVE_TESTNET_SESSION_PRIVATE_KEY "0x..."
-set -gx DERIVE_TESTNET_SUBACCOUNT_ID       "12345"
+```bash
+export DERIVE_TESTNET_WALLET_ADDRESS="0x..."
+export DERIVE_TESTNET_SESSION_PRIVATE_KEY="0x..."
+export DERIVE_TESTNET_SUBACCOUNT_ID="12345"
 ```
 
 For mainnet:
 
-```fish
-set -gx DERIVE_WALLET_ADDRESS      "0x..."
-set -gx DERIVE_SESSION_PRIVATE_KEY "0x..."
-set -gx DERIVE_SUBACCOUNT_ID       "12345"
-set -gx DERIVE_ENVIRONMENT         "mainnet"
+```bash
+export DERIVE_WALLET_ADDRESS="0x..."
+export DERIVE_SESSION_PRIVATE_KEY="0x..."
+export DERIVE_SUBACCOUNT_ID="12345"
+export DERIVE_ENVIRONMENT="mainnet"
 ```
 
 The example defaults to testnet. Set `DERIVE_ENVIRONMENT=mainnet` only for real-funds runs.
@@ -124,19 +124,22 @@ let rehedge_delta_threshold = if hedge_enabled {
 };
 
 let hedge_instrument_id = InstrumentId::from(hedge_instrument.as_str());
-let mut strategy_config =
-    DeltaNeutralVolConfig::new(option_family, hedge_instrument_id, client_id)
-        .with_target_call_delta(env_f64("DERIVE_DELTA_NEUTRAL_TARGET_CALL_DELTA", 0.20)?)
-        .with_target_put_delta(env_f64("DERIVE_DELTA_NEUTRAL_TARGET_PUT_DELTA", -0.20)?)
-        .with_contracts(env_u64("DERIVE_DELTA_NEUTRAL_CONTRACTS", 1)?)
-        .with_rehedge_delta_threshold(rehedge_delta_threshold)
-        .with_rehedge_interval_secs(env_u64("DERIVE_DELTA_NEUTRAL_REHEDGE_INTERVAL_SECS", 30)?)
-        .with_enter_strangle(enter_strangle)
-        .with_entry_iv_offset(env_f64("DERIVE_DELTA_NEUTRAL_ENTRY_IV_OFFSET", 0.0)?)
-        .with_entry_premium_offset_ticks(env_i32("DERIVE_DELTA_NEUTRAL_ENTRY_PREMIUM_OFFSET_TICKS", 1)?);
+let mut strategy_config = DeltaNeutralVolConfig::builder()
+    .option_family(option_family)
+    .hedge_instrument_id(hedge_instrument_id)
+    .client_id(client_id)
+    .target_call_delta(env_f64("DERIVE_DELTA_NEUTRAL_TARGET_CALL_DELTA", 0.20)?)
+    .target_put_delta(env_f64("DERIVE_DELTA_NEUTRAL_TARGET_PUT_DELTA", -0.20)?)
+    .contracts(env_u64("DERIVE_DELTA_NEUTRAL_CONTRACTS", 1)?)
+    .rehedge_delta_threshold(rehedge_delta_threshold)
+    .rehedge_interval_secs(env_u64("DERIVE_DELTA_NEUTRAL_REHEDGE_INTERVAL_SECS", 30)?)
+    .enter_strangle(enter_strangle)
+    .entry_iv_offset(env_f64("DERIVE_DELTA_NEUTRAL_ENTRY_IV_OFFSET", 0.0)?)
+    .entry_premium_offset_ticks(env_i32("DERIVE_DELTA_NEUTRAL_ENTRY_PREMIUM_OFFSET_TICKS", 1)?)
+    .build();
 
 if let Some(expiry) = env_optional_string("DERIVE_DELTA_NEUTRAL_EXPIRY")? {
-    strategy_config = strategy_config.with_expiry_filter(expiry);
+    strategy_config.expiry_filter = Some(expiry);
 }
 
 let strategy = DeltaNeutralVol::new(strategy_config);
@@ -145,7 +148,7 @@ let strategy = DeltaNeutralVol::new(strategy_config);
 Parameters:
 
 | Parameter                    | Default    | Derive runner | Description                                   |
-|------------------------------|------------|---------------|-----------------------------------------------|
+| ---------------------------- | ---------- | ------------- | --------------------------------------------- |
 | `option_family`              | required   | `"ETH"`       | Underlying filter for instrument discovery.   |
 | `hedge_instrument_id`        | required   | `ETH-PERP`    | Perpetual used for delta hedging.             |
 | `client_id`                  | required   | `"DERIVE"`    | Data and execution client identifier.         |
@@ -163,7 +166,7 @@ Parameters:
 The Derive runner reads these environment variables:
 
 | Variable                                          | Default                | Description                        |
-|---------------------------------------------------|------------------------|------------------------------------|
+| ------------------------------------------------- | ---------------------- | ---------------------------------- |
 | `DERIVE_DELTA_NEUTRAL_OPTION_FAMILY`              | `ETH`                  | Option family / Derive currency.   |
 | `DERIVE_DELTA_NEUTRAL_HEDGE_INSTRUMENT`           | `<family>-PERP.DERIVE` | Perpetual hedge instrument.        |
 | `DERIVE_DELTA_NEUTRAL_ENTER_STRANGLE`             | `false`                | Enable option entry orders.        |
@@ -171,12 +174,12 @@ The Derive runner reads these environment variables:
 | `DERIVE_DELTA_NEUTRAL_REHEDGE_DELTA_THRESHOLD`    | `0.5`                  | Portfolio delta hedge threshold.   |
 | `DERIVE_DELTA_NEUTRAL_REHEDGE_INTERVAL_SECS`      | `30`                   | Periodic hedge check interval.     |
 | `DERIVE_DELTA_NEUTRAL_CONTRACTS`                  | `1`                    | Contracts per option leg.          |
-| `DERIVE_DELTA_NEUTRAL_TARGET_CALL_DELTA`          | `0.20`                 | Call strike‑selection target.      |
-| `DERIVE_DELTA_NEUTRAL_TARGET_PUT_DELTA`           | `-0.20`                | Put strike‑selection target.       |
+| `DERIVE_DELTA_NEUTRAL_TARGET_CALL_DELTA`          | `0.20`                 | Call strike-selection target.      |
+| `DERIVE_DELTA_NEUTRAL_TARGET_PUT_DELTA`           | `-0.20`                | Put strike-selection target.       |
 | `DERIVE_DELTA_NEUTRAL_EXPIRY`                     | unset                  | Optional expiry substring filter.  |
-| `DERIVE_DELTA_NEUTRAL_ENTRY_PREMIUM_OFFSET_TICKS` | `1`                    | Sell‑entry ticks above option ask. |
+| `DERIVE_DELTA_NEUTRAL_ENTRY_PREMIUM_OFFSET_TICKS` | `1`                    | Sell-entry ticks above option ask. |
 | `DERIVE_DELTA_NEUTRAL_ENTRY_IV_OFFSET`            | `0.0`                  | Used only outside premium mode.    |
-| `DERIVE_DELTA_NEUTRAL_MAX_FEE_PER_CONTRACT`       | `1000`                 | Signed per‑contract fee cap.       |
+| `DERIVE_DELTA_NEUTRAL_MAX_FEE_PER_CONTRACT`       | `1000`                 | Signed per-contract fee cap.       |
 | `DERIVE_DELTA_NEUTRAL_MARKET_ORDER_SLIPPAGE_BPS`  | adapter default        | Market hedge slippage bound.       |
 
 Derive signs explicit premium limit prices. The runner enables the strategy's premium-entry mode
@@ -213,7 +216,8 @@ variables when the config fields are left unset. The example sets a fee cap and 
 protocol-constant overrides for local testing.
 
 ```rust
-let exec_config = DeriveExecClientConfig {
+let exec_config = DeriveExecutionClientConfig {
+    account_id,
     environment: derive_environment,
     max_fee_per_contract: Some(Decimal::from_str_exact("1000")?),
     domain_separator: env_override(
@@ -235,16 +239,6 @@ let exec_config = DeriveExecClientConfig {
 };
 ```
 
-Execution clients need `DeriveExecFactoryConfig`, which carries the trader and account IDs:
-
-```rust
-let exec_factory_config = DeriveExecFactoryConfig {
-    trader_id,
-    account_id,
-    config: exec_config,
-};
-```
-
 The node enables reconciliation so open orders, positions, balances, and reports are loaded before
 the strategy starts:
 
@@ -252,7 +246,7 @@ the strategy starts:
 let mut node = LiveNode::builder(trader_id, environment)?
     .with_name("DERIVE-DELTA-NEUTRAL-001".to_string())
     .add_data_client(None, Box::new(data_factory), Box::new(data_config))?
-    .add_exec_client(None, Box::new(exec_factory), Box::new(exec_factory_config))?
+    .add_exec_client(None, Box::new(exec_factory), Box::new(exec_config))?
     .with_reconciliation(true)
     .with_delay_post_stop_secs(5)
     .build()?;
@@ -365,14 +359,14 @@ sits near the `(1 - target_call_delta)` percentile and the put near `abs(target_
 
 ### Regenerate the panels
 
-```fish
-set -gx DERIVE_ENVIRONMENT mainnet
-set -gx DERIVE_DELTA_NEUTRAL_HEDGE_ENABLED false
+```bash
+export DERIVE_ENVIRONMENT=mainnet
+export DERIVE_DELTA_NEUTRAL_HEDGE_ENABLED=false
 timeout 45 cargo run --example derive-delta-neutral --package nautilus-derive --features examples \
     > /tmp/derive_dn.log 2>&1
 
 uv sync --extra visualization
-set -gx DN_LOG /tmp/derive_dn.log
+export DN_LOG=/tmp/derive_dn.log
 python3 docs/tutorials/assets/delta_neutral_options_derive/render_panels.py
 ```
 
@@ -395,7 +389,7 @@ smoke configuration disables entry and hedge submissions.
 
 ## Running the example
 
-```fish
+```bash
 cargo run --example derive-delta-neutral --package nautilus-derive --features examples
 ```
 
@@ -404,18 +398,18 @@ close positions.
 
 For a mainnet smoke test that loads the venue and account without submitting orders:
 
-```fish
-set -gx DERIVE_ENVIRONMENT mainnet
-set -gx DERIVE_DELTA_NEUTRAL_HEDGE_ENABLED false
+```bash
+export DERIVE_ENVIRONMENT=mainnet
+export DERIVE_DELTA_NEUTRAL_HEDGE_ENABLED=false
 timeout 45 cargo run --example derive-delta-neutral --package nautilus-derive --features examples
 ```
 
 For a mainnet smoke test that submits Derive-premium option entry orders:
 
-```fish
-set -gx DERIVE_ENVIRONMENT mainnet
-set -gx DERIVE_DELTA_NEUTRAL_ENTER_STRANGLE true
-set -gx DERIVE_DELTA_NEUTRAL_ENTRY_PREMIUM_OFFSET_TICKS 1
+```bash
+export DERIVE_ENVIRONMENT=mainnet
+export DERIVE_DELTA_NEUTRAL_ENTER_STRANGLE=true
+export DERIVE_DELTA_NEUTRAL_ENTRY_PREMIUM_OFFSET_TICKS=1
 timeout --signal=INT 45 cargo run --example derive-delta-neutral --package nautilus-derive \
     --features examples
 ```

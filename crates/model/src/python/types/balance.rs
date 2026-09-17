@@ -20,6 +20,7 @@ use std::{
 };
 
 use nautilus_core::python::{
+    correctness_error_to_pyvalue_err,
     parsing::{get_optional_parsed, get_required_string},
     to_pyvalue_err,
 };
@@ -30,8 +31,8 @@ use crate::{
     types::{AccountBalance, Currency, MarginBalance, Money},
 };
 
-#[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
+#[pymethods]
 impl AccountBalance {
     /// Represents an account balance denominated in a particular currency.
     #[new]
@@ -54,6 +55,30 @@ impl AccountBalance {
         self.free.raw.hash(&mut h);
         self.currency.code.hash(&mut h);
         h.finish() as isize
+    }
+
+    #[getter]
+    #[pyo3(name = "total")]
+    fn py_total(&self) -> Money {
+        self.total
+    }
+
+    #[getter]
+    #[pyo3(name = "locked")]
+    fn py_locked(&self) -> Money {
+        self.locked
+    }
+
+    #[getter]
+    #[pyo3(name = "free")]
+    fn py_free(&self) -> Money {
+        self.free
+    }
+
+    #[getter]
+    #[pyo3(name = "currency")]
+    fn py_currency(&self) -> Currency {
+        self.currency
     }
 
     /// Returns a copy of this balance.
@@ -85,9 +110,9 @@ impl AccountBalance {
         })?;
         let currency = Currency::from_str(currency_str.as_str()).map_err(to_pyvalue_err)?;
         Self::new_checked(
-            Money::new(total, currency),
-            Money::new(locked, currency),
-            Money::new(free, currency),
+            Money::new_checked(total, currency).map_err(correctness_error_to_pyvalue_err)?,
+            Money::new_checked(locked, currency).map_err(correctness_error_to_pyvalue_err)?,
+            Money::new_checked(free, currency).map_err(correctness_error_to_pyvalue_err)?,
         )
         .map_err(to_pyvalue_err)
     }
@@ -130,8 +155,8 @@ impl AccountBalance {
     }
 }
 
-#[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
+#[pymethods]
 impl MarginBalance {
     /// Represents a margin balance.
     ///
@@ -170,6 +195,30 @@ impl MarginBalance {
         h.finish() as isize
     }
 
+    #[getter]
+    #[pyo3(name = "initial")]
+    fn py_initial(&self) -> Money {
+        self.initial
+    }
+
+    #[getter]
+    #[pyo3(name = "maintenance")]
+    fn py_maintenance(&self) -> Money {
+        self.maintenance
+    }
+
+    #[getter]
+    #[pyo3(name = "currency")]
+    fn py_currency(&self) -> Currency {
+        self.currency
+    }
+
+    #[getter]
+    #[pyo3(name = "instrument_id")]
+    fn py_instrument_id(&self) -> Option<InstrumentId> {
+        self.instrument_id
+    }
+
     /// Returns a copy of this margin balance.
     #[pyo3(name = "copy")]
     fn py_copy(&self) -> Self {
@@ -202,8 +251,8 @@ impl MarginBalance {
         })?;
         let currency = Currency::from_str(currency_str.as_str()).map_err(to_pyvalue_err)?;
         Self::new_checked(
-            Money::new(initial, currency),
-            Money::new(maintenance, currency),
+            Money::new_checked(initial, currency).map_err(correctness_error_to_pyvalue_err)?,
+            Money::new_checked(maintenance, currency).map_err(correctness_error_to_pyvalue_err)?,
             instrument_id,
         )
         .map_err(to_pyvalue_err)
@@ -214,7 +263,6 @@ impl MarginBalance {
     /// # Errors
     ///
     /// Returns a `PyErr` if serialization fails.
-    ///
     #[pyo3(name = "to_dict")]
     pub fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
@@ -250,6 +298,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::types::money::{MONEY_MAX, MONEY_MIN};
 
     #[rstest]
     #[case(
@@ -284,6 +333,28 @@ mod tests {
     }
 
     #[rstest]
+    fn test_account_balance_from_dict_rejects_out_of_range_money_value() {
+        Python::initialize();
+        Python::attach(|py| {
+            let value = MONEY_MAX + 1.0;
+            let values = PyDict::new(py);
+            values.set_item("currency", "USD").unwrap();
+            values.set_item("total", value.to_string()).unwrap();
+            values.set_item("free", "1.00").unwrap();
+            values.set_item("locked", "0.00").unwrap();
+
+            let error = AccountBalance::py_from_dict(&values).unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "ValueError: invalid f64 for 'amount' not in range [{MONEY_MIN}, {MONEY_MAX}], was {value}"
+                )
+            );
+        });
+    }
+
+    #[rstest]
     #[case(
         "initial",
         "ValueError: invalid MarginBalance initial 'not-a-number': invalid float literal"
@@ -308,6 +379,28 @@ mod tests {
             let error = MarginBalance::py_from_dict(&values).unwrap_err();
 
             assert_eq!(error.to_string(), expected);
+        });
+    }
+
+    #[rstest]
+    fn test_margin_balance_from_dict_rejects_out_of_range_money_value() {
+        Python::initialize();
+        Python::attach(|py| {
+            let value = MONEY_MIN - 1.0;
+            let values = PyDict::new(py);
+            values.set_item("currency", "USD").unwrap();
+            values.set_item("initial", value.to_string()).unwrap();
+            values.set_item("maintenance", "0.50").unwrap();
+            values.set_item("instrument_id", py.None()).unwrap();
+
+            let error = MarginBalance::py_from_dict(&values).unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "ValueError: invalid f64 for 'amount' not in range [{MONEY_MIN}, {MONEY_MAX}], was {value}"
+                )
+            );
         });
     }
 }

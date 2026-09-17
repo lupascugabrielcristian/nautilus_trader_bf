@@ -12,12 +12,33 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
+"""
+Integration adapter for Polymarket.
+"""
 
 from __future__ import annotations
 
 from nautilus_trader._fixup import fixup_module_names
 from nautilus_trader._libnautilus.polymarket import *  # noqa: F403 (undefined-local-with-import-star)
 
+
+__all__ = [
+    "POLYMARKET",
+    "POLYMARKET_CLIENT_ID",
+    "POLYMARKET_VENUE",
+    "PolymarketDataClientConfig",
+    "PolymarketDataClientFactory",
+    "PolymarketDataLoader",
+    "PolymarketExecutionClientConfig",
+    "PolymarketExecutionClientFactory",
+    "PolymarketFeeModel",
+    "PolymarketInstrumentProviderConfig",
+    "PolymarketRtdsCryptoPrice",
+    "PolymarketRtdsCryptoTwap",
+    "PolymarketRtdsEquityPrice",
+    "PolymarketUpDownEventSlugConfig",
+    "SignatureType",
+]
 
 fixup_module_names(globals(), __name__)
 del fixup_module_names

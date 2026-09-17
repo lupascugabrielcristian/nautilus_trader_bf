@@ -80,6 +80,8 @@ fn build_place_limit() -> OKXPlaceOrderRequest {
         speed_bump: None,
         outcome: None,
         slippage_pct: None,
+        rpi_taker_access: None,
+        rpi_px_round: None,
     }
 }
 
@@ -103,6 +105,8 @@ fn build_place_market() -> OKXPlaceOrderRequest {
         speed_bump: None,
         outcome: None,
         slippage_pct: None,
+        rpi_taker_access: None,
+        rpi_px_round: None,
     }
 }
 
@@ -300,7 +304,7 @@ fn build_status_report(
         btc_usdt_swap().id(),
         Some(cid),
         voi,
-        OrderSide::Buy,
+        OrderSide::Buy.into(),
         OrderType::Limit,
         TimeInForce::Gtc,
         status,

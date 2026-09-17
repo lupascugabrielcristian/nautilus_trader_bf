@@ -15,7 +15,7 @@
 
 //! Configuration structures for the Deribit adapter.
 
-use nautilus_model::identifiers::{AccountId, TraderId};
+use nautilus_model::identifiers::AccountId;
 use nautilus_network::websocket::TransportBackend;
 use serde::{Deserialize, Serialize};
 
@@ -33,7 +33,7 @@ use crate::{
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.deribit", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.deribit", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -71,6 +71,9 @@ pub struct DeribitDataClientConfig {
     /// Heartbeat interval in seconds for WebSocket connection.
     #[builder(default = 30)]
     pub heartbeat_interval_secs: u64,
+    /// Optional WebSocket authentication timeout (seconds), defaulting to
+    /// `AUTHENTICATION_TIMEOUT_SECS` when unset.
+    pub auth_timeout_secs: Option<u64>,
     /// Interval for refreshing instruments (in minutes).
     #[builder(default = 60)]
     pub update_instruments_interval_mins: u64,
@@ -81,6 +84,23 @@ pub struct DeribitDataClientConfig {
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(DeribitDataClientConfig {
+    product_types: Vec<DeribitProductType>,
+    environment: DeribitEnvironment,
+    base_url_http: Option<String>,
+    base_url_ws: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    heartbeat_interval_secs: u64,
+    auth_timeout_secs: Option<u64>,
+    update_instruments_interval_mins: u64,
+    auto_load_missing_instruments: bool,
+    transport_backend: TransportBackend,
+});
 
 impl Default for DeribitDataClientConfig {
     fn default() -> Self {
@@ -126,16 +146,13 @@ impl DeribitDataClientConfig {
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.deribit", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.deribit", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deribit")
 )]
-pub struct DeribitExecClientConfig {
-    /// The trader ID for this client.
-    #[builder(default)]
-    pub trader_id: TraderId,
+pub struct DeribitExecutionClientConfig {
     /// The account ID for this client.
     #[builder(default = AccountId::from("DERIBIT-001"))]
     pub account_id: AccountId,
@@ -167,18 +184,36 @@ pub struct DeribitExecClientConfig {
     /// Maximum retry delay in milliseconds.
     #[builder(default = 10_000)]
     pub retry_delay_max_ms: u64,
+    /// Optional WebSocket authentication timeout (seconds), defaulting to
+    /// `AUTHENTICATION_TIMEOUT_SECS` when unset.
+    pub auth_timeout_secs: Option<u64>,
     /// WebSocket transport backend (defaults to `Tungstenite`).
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
 
-impl Default for DeribitExecClientConfig {
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(DeribitExecutionClientConfig {
+    account_id: AccountId,
+    product_types: Vec<DeribitProductType>,
+    environment: DeribitEnvironment,
+    base_url_http: Option<String>,
+    base_url_ws: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    auth_timeout_secs: Option<u64>,
+    transport_backend: TransportBackend,
+});
+
+impl Default for DeribitExecutionClientConfig {
     fn default() -> Self {
         Self::builder().build()
     }
 }
 
-impl DeribitExecClientConfig {
+impl DeribitExecutionClientConfig {
     /// Returns `true` when API credentials are available (in config or env vars).
     #[must_use]
     pub fn has_api_credentials(&self) -> bool {
@@ -282,10 +317,8 @@ auto_load_missing_instruments = true
 
     #[rstest]
     fn test_exec_config_toml_empty_uses_defaults() {
-        let config: DeribitExecClientConfig = toml::from_str("").unwrap();
-        let expected = DeribitExecClientConfig::default();
-
-        assert_eq!(config.trader_id, expected.trader_id);
+        let config: DeribitExecutionClientConfig = toml::from_str("").unwrap();
+        let expected = DeribitExecutionClientConfig::default();
         assert_eq!(config.account_id, expected.account_id);
         assert_eq!(config.environment, expected.environment);
         assert_eq!(config.product_types, expected.product_types);

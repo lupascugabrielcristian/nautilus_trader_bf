@@ -42,9 +42,10 @@
 //! or as part of a Rust only build.
 //!
 //! - `examples`: Enables example strategies and the EMA crossover backtest example.
+//! - `mimalloc`: Uses [mimalloc](https://github.com/microsoft/mimalloc) as the global allocator for
+//!   bundled Rust examples.
 //! - `defi`: Enables DeFi replay APIs and data-engine routing.
 //! - `streaming`: Enables `persistence` dependency for streaming configuration.
-//! - `ffi`: Enables the C foreign function interface (FFI) from [cbindgen](https://github.com/mozilla/cbindgen).
 //! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
 //! - `extension-module`: Builds the crate as a Python extension module.
 
@@ -61,6 +62,13 @@
     clippy::too_many_lines,
     reason = "backtest engine, node, and Python registration flows exceed the default threshold by design"
 )]
+#![allow(
+    clippy::assert_is_empty,
+    reason = "`assert!(x.is_empty())` is clearer than comparing against an empty value"
+)]
+// pyo3's `from_py_object` generates `.clone()` on `Copy` fields that clippy flags from the
+// macro expansion; an item-level `allow` cannot reach the expansion
+#![allow(clippy::clone_on_copy)]
 
 pub mod accumulator;
 pub mod config;
@@ -79,6 +87,3 @@ pub mod node;
 
 #[cfg(feature = "python")]
 pub mod python;
-
-#[cfg(feature = "ffi")]
-pub mod ffi;

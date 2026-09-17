@@ -31,7 +31,7 @@ use crate::common::{
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.bybit", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.bybit", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -77,19 +77,36 @@ pub struct BybitDataClientConfig {
     /// Interval in minutes for instrument refresh from REST.
     /// When `None`, instrument refresh is disabled.
     pub update_instruments_interval_mins: Option<u64>,
-    /// Interval in seconds for polling instrument status changes.
-    /// When `None`, status polling is disabled.
-    pub instrument_status_poll_secs: Option<u64>,
+    /// Interval in seconds for polling instrument definitions and status changes from REST.
+    /// When `None`, instrument/status polling is disabled.
+    pub instrument_poll_interval_secs: Option<u64>,
     /// WebSocket transport backend (defaults to `Tungstenite`).
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
 
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(BybitDataClientConfig {
+    product_types: Vec<BybitProductType>,
+    environment: BybitEnvironment,
+    base_url_http: Option<String>,
+    base_url_ws_public: Option<String>,
+    base_url_ws_private: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    heartbeat_interval_secs: u64,
+    recv_window_ms: u64,
+    update_instruments_interval_mins: Option<u64>,
+    transport_backend: TransportBackend,
+});
+
 impl Default for BybitDataClientConfig {
     fn default() -> Self {
         Self {
             update_instruments_interval_mins: Some(60),
-            instrument_status_poll_secs: Some(60),
+            instrument_poll_interval_secs: Some(60),
             ..Self::builder().build()
         }
     }
@@ -159,13 +176,13 @@ impl BybitDataClientConfig {
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.bybit", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.bybit", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bybit")
 )]
-pub struct BybitExecClientConfig {
+pub struct BybitExecutionClientConfig {
     /// API key for authenticated requests.
     pub api_key: Option<String>,
     /// API secret for authenticated requests.
@@ -197,16 +214,27 @@ pub struct BybitExecClientConfig {
     #[builder(default = 10_000)]
     pub retry_delay_max_ms: u64,
     /// Heartbeat interval in seconds for WebSocket clients.
-    #[builder(default = 5)]
+    #[builder(default = 20)]
     pub heartbeat_interval_secs: u64,
+    /// Optional WebSocket authentication wait timeout (seconds), defaulting to
+    /// the client default when unset.
+    pub auth_timeout_secs: Option<u64>,
     /// Receive window in milliseconds for signed requests.
     #[builder(default = 5_000)]
     pub recv_window_ms: u64,
     /// Optional account identifier to associate with the execution client.
     pub account_id: Option<AccountId>,
-    /// Whether to generate position reports from wallet balances for SPOT positions.
+    /// Whether scoped execution-client SPOT position requests derive positions from wallet
+    /// balances. The HTTP client rejects enabled unscoped SPOT requests because balances cannot be
+    /// attributed to pairs. The execution client omits SPOT from bulk requests and reports its bulk
+    /// coverage as unavailable.
     #[builder(default)]
     pub use_spot_position_reports: bool,
+    /// Whether to automatically repay SPOT margin borrows after BUY orders tracked by
+    /// this client and reported on the standard `execution` channel (not `execution.fast`)
+    /// fully fill.
+    #[builder(default)]
+    pub auto_repay_spot_borrows: bool,
     /// Leverage configuration for futures (symbol -> leverage).
     pub futures_leverages: Option<HashMap<String, u32>>,
     /// Position mode configuration for symbols (symbol -> mode).
@@ -218,13 +246,34 @@ pub struct BybitExecClientConfig {
     pub transport_backend: TransportBackend,
 }
 
-impl Default for BybitExecClientConfig {
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(BybitExecutionClientConfig {
+    product_types: Vec<BybitProductType>,
+    environment: BybitEnvironment,
+    base_url_http: Option<String>,
+    base_url_ws_private: Option<String>,
+    base_url_ws_trade: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    heartbeat_interval_secs: u64,
+    auth_timeout_secs: Option<u64>,
+    recv_window_ms: u64,
+    account_id: Option<AccountId>,
+    use_spot_position_reports: bool,
+    auto_repay_spot_borrows: bool,
+    margin_mode: Option<BybitMarginMode>,
+    transport_backend: TransportBackend,
+});
+
+impl Default for BybitExecutionClientConfig {
     fn default() -> Self {
         Self::builder().build()
     }
 }
 
-impl BybitExecClientConfig {
+impl BybitExecutionClientConfig {
     /// Creates a configuration with default values.
     #[must_use]
     pub fn new() -> Self {
@@ -381,17 +430,17 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_default() {
-        let config = BybitExecClientConfig::default();
+        let config = BybitExecutionClientConfig::default();
 
         assert!(!config.has_api_credentials());
         assert_eq!(config.product_types, vec![BybitProductType::Linear]);
         assert_eq!(config.http_timeout_secs, 60);
-        assert_eq!(config.heartbeat_interval_secs, 5);
+        assert_eq!(config.heartbeat_interval_secs, 20);
     }
 
     #[rstest]
     fn test_exec_config_with_credentials() {
-        let config = BybitExecClientConfig {
+        let config = BybitExecutionClientConfig {
             api_key: Some("test_key".to_string()),
             api_secret: Some("test_secret".to_string()),
             ..Default::default()
@@ -402,7 +451,7 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_urls() {
-        let config = BybitExecClientConfig {
+        let config = BybitExecutionClientConfig {
             environment: BybitEnvironment::Mainnet,
             ..Default::default()
         };
@@ -414,7 +463,7 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_urls_testnet() {
-        let config = BybitExecClientConfig {
+        let config = BybitExecutionClientConfig {
             environment: BybitEnvironment::Testnet,
             ..Default::default()
         };
@@ -432,7 +481,7 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_custom_urls() {
-        let config = BybitExecClientConfig {
+        let config = BybitExecutionClientConfig {
             base_url_http: Some("https://custom-http.bybit.com".to_string()),
             base_url_ws_private: Some("wss://custom-private.bybit.com".to_string()),
             base_url_ws_trade: Some("wss://custom-trade.bybit.com".to_string()),
@@ -465,8 +514,8 @@ http_timeout_secs = 45
 
     #[rstest]
     fn test_exec_config_toml_empty_uses_defaults() {
-        let config: BybitExecClientConfig = toml::from_str("").unwrap();
-        let expected = BybitExecClientConfig::default();
+        let config: BybitExecutionClientConfig = toml::from_str("").unwrap();
+        let expected = BybitExecutionClientConfig::default();
 
         assert_eq!(config.environment, expected.environment);
         assert_eq!(config.product_types, expected.product_types);

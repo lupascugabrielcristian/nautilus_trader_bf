@@ -18,7 +18,10 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use nautilus_core::python::{IntoPyObjectNautilusExt, serialization::from_dict_pyo3};
+use nautilus_core::python::{
+    IntoPyObjectNautilusExt,
+    serialization::{from_dict_pyo3, to_dict_pyo3},
+};
 use nautilus_model::{
     enums::OrderSide,
     identifiers::InstrumentId,
@@ -49,6 +52,7 @@ impl DatabentoImbalance {
     }
 
     fn __repr__(&self) -> String {
+        let side = self.side.as_ref().map_or("NO_ORDER_SIDE", AsRef::as_ref);
         format!(
             "{}(instrument_id={}, ref_price={}, cont_book_clr_price={}, auct_interest_clr_price={}, paired_qty={}, total_imbalance_qty={}, side={}, significant_imbalance={}, ts_event={}, ts_recv={}, ts_init={})",
             stringify!(DatabentoImbalance),
@@ -58,7 +62,7 @@ impl DatabentoImbalance {
             self.auct_interest_clr_price,
             self.paired_qty,
             self.total_imbalance_qty,
-            self.side,
+            side,
             self.significant_imbalance,
             self.ts_event,
             self.ts_recv,
@@ -108,7 +112,7 @@ impl DatabentoImbalance {
 
     #[getter]
     #[pyo3(name = "side")]
-    const fn py_side(&self) -> OrderSide {
+    const fn py_side(&self) -> Option<OrderSide> {
         self.side
     }
 
@@ -142,15 +146,10 @@ impl DatabentoImbalance {
         from_dict_pyo3(py, values)
     }
 
-    // TODO
-    /// # Errors
-    ///
-    /// Returns a `PyErr` if generating the Python dictionary fails.
+    /// Return a dictionary representation of the object.
     #[pyo3(name = "to_dict")]
-    pub fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let dict = PyDict::new(py);
-        dict.set_item("type", stringify!(DatabentoImbalance))?;
-        Ok(dict.into())
+    pub fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        to_dict_pyo3(py, self)
     }
 }
 
@@ -281,25 +280,17 @@ impl DatabentoStatistics {
         from_dict_pyo3(py, values)
     }
 
-    // TODO
-    /// # Errors
-    ///
-    /// Returns a `PyErr` if generating the Python dictionary fails.
+    /// Return a dictionary representation of the object.
     #[pyo3(name = "to_dict")]
-    pub fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let dict = PyDict::new(py);
-        dict.set_item("type", stringify!(DatabentoStatistics))?;
-        Ok(dict.into())
+    pub fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        to_dict_pyo3(py, self)
     }
 }
 
 /// Subscription acknowledgement from the Databento gateway.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.databento",
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.adapters.databento", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",

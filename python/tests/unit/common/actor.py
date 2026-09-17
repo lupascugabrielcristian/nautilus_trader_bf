@@ -20,40 +20,392 @@ automatically and should not define __init__.
 
 """
 
+from typing import ClassVar
+from typing import Never
+
 from nautilus_trader.common import DataActor
 from nautilus_trader.common import DataActorConfig
+from nautilus_trader.common import ImportableActorConfig
 from nautilus_trader.core import UUID4
 from nautilus_trader.model import ClientOrderId
-from nautilus_trader.model import ContingencyType
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import MarketOrder
 from nautilus_trader.model import OrderSide
+from nautilus_trader.model import Price
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import TimeInForce
 from nautilus_trader.model import Venue
+from nautilus_trader.trading import Controller
+from nautilus_trader.trading import ImportableStrategyConfig
 from nautilus_trader.trading import Strategy
+from nautilus_trader.trading import StrategyConfig
 
 
 class TestActorConfig(DataActorConfig):
-    pass
+    """
+    Collect actor config tests.
+    """
 
 
 class TestActor(DataActor):
-    pass
+    """
+    Collect actor tests.
+    """
 
 
 class TestStrategy(Strategy):
-    pass
+    """
+    Collect strategy tests.
+    """
+
+
+class FailingStartStrategy(Strategy):
+    """
+    Collect failing start strategy tests.
+    """
+
+    def on_start(self) -> Never:
+        """
+        On start.
+        """
+        raise RuntimeError("simulated live node strategy start failure")
+
+
+class LifecycleProbeStrategy(Strategy):
+    """
+    Collect lifecycle probe strategy tests.
+    """
+
+    started = 0
+    stopped = 0
+    disposed = 0
+
+    @classmethod
+    def reset(cls) -> None:
+        """
+        Reset.
+        """
+        cls.started = 0
+        cls.stopped = 0
+        cls.disposed = 0
+
+    def on_start(self) -> None:
+        """
+        On start.
+        """
+        type(self).started += 1
+
+    def on_stop(self) -> None:
+        """
+        On stop.
+        """
+        type(self).stopped += 1
+
+    def on_dispose(self) -> None:
+        """
+        On dispose.
+        """
+        type(self).disposed += 1
+
+
+class TestStrategyConfig(StrategyConfig):
+    """
+    Collect strategy config tests.
+    """
+
+    def __new__(cls, *args: object, strategy_id: str | None = None, **kwargs: object) -> object:
+        """
+        Create a new instance.
+        """
+        instance = super().__new__(cls, *args, **kwargs)
+        instance._strategy_id_override = strategy_id
+        return instance
+
+    def __init__(self, _strategy_id: str | None = None, **_kwargs: object) -> None:
+        """
+        Initialize the helper.
+        """
+        super().__init__()
+
+    @property
+    def strategy_id(self) -> object:
+        """
+        Strategy id.
+        """
+        if self._strategy_id_override is not None:
+            return self._strategy_id_override
+        return super().strategy_id
+
+
+class TestControllerConfig(DataActorConfig):
+    """
+    Collect controller config tests.
+    """
+
+
+class ControllerRegistrationProbeConfig(DataActorConfig):
+    """
+    Collect controller registration probe config tests.
+    """
+
+    def __init__(
+        self,
+        actor_id: object = None,
+        log_events: bool = True,
+        log_commands: bool = True,
+    ) -> None:
+        """
+        Initialize the helper.
+        """
+        self.actor_id = actor_id
+        self.log_events = log_events
+        self.log_commands = log_commands
+
+
+class ControllerRegistrationProbe(Controller):
+    """
+    Collect controller registration probe tests.
+    """
+
+    constructed = 0
+    received_actor_id = None
+
+    @classmethod
+    def reset(cls) -> None:
+        """
+        Reset.
+        """
+        cls.constructed = 0
+        cls.received_actor_id = None
+
+    def __init__(self, config: object) -> None:
+        """
+        Initialize the helper.
+        """
+        super().__init__(config)
+        type(self).constructed += 1
+        type(self).received_actor_id = str(config.actor_id)
+
+
+class ControllerCreatedStrategy(Strategy):
+    """
+    Collect controller created strategy tests.
+    """
+
+    started = 0
+    stopped = 0
+
+    @classmethod
+    def reset(cls) -> None:
+        """
+        Reset.
+        """
+        cls.started = 0
+        cls.stopped = 0
+
+    def on_start(self) -> None:
+        """
+        On start.
+        """
+        type(self).started += 1
+
+    def on_stop(self) -> None:
+        """
+        On stop.
+        """
+        type(self).stopped += 1
+
+
+class StrategyCreatingController(Controller):
+    """
+    Collect strategy creating controller tests.
+    """
+
+    started = 0
+    created_strategy_id = None
+
+    @classmethod
+    def reset(cls) -> None:
+        """
+        Reset.
+        """
+        cls.started = 0
+        cls.created_strategy_id = None
+
+    def on_start(self) -> None:
+        """
+        On start.
+        """
+        type(self).started += 1
+        type(self).created_strategy_id = self.create_strategy_from_config(
+            ImportableStrategyConfig(
+                strategy_path="tests.unit.common.actor:ControllerCreatedStrategy",
+                config_path="tests.unit.common.actor:TestStrategyConfig",
+                config={"strategy_id": "ControllerCreatedStrategy-001"},
+            ),
+        )
+
+
+class ControllerCreatedActor(DataActor):
+    """
+    Collect controller created actor tests.
+    """
+
+    started = 0
+    stopped = 0
+
+    @classmethod
+    def reset(cls) -> None:
+        """
+        Reset.
+        """
+        cls.started = 0
+        cls.stopped = 0
+
+    def on_start(self) -> None:
+        """
+        On start.
+        """
+        type(self).started += 1
+
+    def on_stop(self) -> None:
+        """
+        On stop.
+        """
+        type(self).stopped += 1
+
+
+class ActorLifecycleController(Controller):
+    """
+    Drives a created actor through the `*_from_id` control aliases.
+
+    Also attempts to remove itself, which the controller must ignore.
+
+    """
+
+    created_actor_id = None
+    steps: ClassVar[list[str]] = []
+
+    @classmethod
+    def reset(cls) -> None:
+        """
+        Reset.
+        """
+        cls.created_actor_id = None
+        cls.steps = []
+
+    def on_start(self) -> None:
+        """
+        On start.
+        """
+        actor_id = self.create_actor_from_config(
+            ImportableActorConfig(
+                actor_path="tests.unit.common.actor:ControllerCreatedActor",
+                config_path="tests.unit.common.actor:TestControllerConfig",
+                config={"actor_id": "ControllerCreatedActor-001"},
+            ),
+            start=False,
+        )
+        type(self).created_actor_id = actor_id
+        type(self).steps.append("created")
+
+        self.start_actor_from_id(actor_id)
+        type(self).steps.append("started")
+
+        self.stop_actor_from_id(actor_id)
+        type(self).steps.append("stopped")
+
+        # A wrong controller identity would stop and dispose this controller instead
+        self.remove_actor(self.actor_id)
+        type(self).steps.append("self_remove_ignored")
+
+        self.remove_actor_from_id(actor_id)
+        type(self).steps.append("removed")
+
+    def on_stop(self) -> None:
+        """
+        On stop.
+        """
+        # Recorded in the same sequence so a premature self-stop is ordered before "removed"
+        type(self).steps.append("controller_stopped")
+
+
+class StrategyLifecycleController(Controller):
+    """
+    Drives a created strategy through one alias and two canonical control methods.
+    """
+
+    created_strategy_id = None
+    steps: ClassVar[list[str]] = []
+
+    @classmethod
+    def reset(cls) -> None:
+        """
+        Reset.
+        """
+        cls.created_strategy_id = None
+        cls.steps = []
+
+    def on_start(self) -> None:
+        """
+        On start.
+        """
+        strategy_id = self.create_strategy_from_config(
+            ImportableStrategyConfig(
+                strategy_path="tests.unit.common.actor:ControllerCreatedStrategy",
+                config_path="tests.unit.common.actor:TestStrategyConfig",
+                config={"strategy_id": "ControllerCreatedStrategy-001"},
+            ),
+            start=False,
+        )
+        type(self).created_strategy_id = strategy_id
+        type(self).steps.append("created")
+
+        self.start_strategy_from_id(strategy_id)
+        type(self).steps.append("started")
+
+        self.stop_strategy(strategy_id)
+        type(self).steps.append("stopped")
+
+        self.remove_strategy(strategy_id)
+        type(self).steps.append("removed")
+
+
+class NonStartingStrategyCreatingController(StrategyCreatingController):
+    """
+    Collect non starting strategy creating controller tests.
+    """
+
+    def on_start(self) -> None:
+        """
+        On start.
+        """
+        type(self).started += 1
+        type(self).created_strategy_id = self.create_strategy_from_config(
+            ImportableStrategyConfig(
+                strategy_path="tests.unit.common.actor:ControllerCreatedStrategy",
+                config_path="tests.unit.common.actor:TestStrategyConfig",
+                config={"strategy_id": "ControllerCreatedStrategy-001"},
+            ),
+            start=False,
+        )
 
 
 class PortfolioProbeStrategy(Strategy):
+    """
+    Collect portfolio probe strategy tests.
+    """
+
     observed_portfolio = None
     observed_account = None
     observed_equity_by_venue = None
     observed_equity_by_account = None
     observed_initialized = None
 
-    def on_start(self):
+    def on_start(self) -> None:
+        """
+        On start.
+        """
         portfolio = self.portfolio
         account = portfolio.account(venue=Venue("SIM"))
 
@@ -62,6 +414,72 @@ class PortfolioProbeStrategy(Strategy):
         type(self).observed_initialized = portfolio.is_initialized()
         type(self).observed_equity_by_venue = portfolio.equity(venue=Venue("SIM"))
         type(self).observed_equity_by_account = portfolio.equity(account_id=account.id)
+
+
+class OrderFactoryProbeStrategy(Strategy):
+    """
+    Collect order factory probe strategy tests.
+    """
+
+    observed_order = None
+    observed_invalid_order_error = None
+    observed_next_client_order_id = None
+    observed_client_order_id_count = None
+    observed_order_list_id_count = None
+
+    def on_start(self) -> None:
+        """
+        On start.
+        """
+        order_factory = self.order_factory
+
+        try:
+            order_factory.market(
+                InstrumentId.from_str("AUD/USD.SIM"),
+                OrderSide.BUY,
+                Quantity.from_str("100000"),
+                time_in_force=TimeInForce.GTD,
+            )
+        except ValueError as e:
+            type(self).observed_invalid_order_error = str(e)
+
+        type(self).observed_order = order_factory.market(
+            InstrumentId.from_str("AUD/USD.SIM"),
+            OrderSide.BUY,
+            Quantity.from_str("100000"),
+        )
+        type(self).observed_next_client_order_id = self.order_factory.generate_client_order_id()
+        type(self).observed_client_order_id_count = order_factory.get_client_order_id_count()
+        type(self).observed_order_list_id_count = order_factory.get_order_list_id_count()
+
+
+class OrderFactoryConfigProbeStrategy(Strategy):
+    """
+    Collect order factory config probe strategy tests.
+    """
+
+    observed_factory = None
+    observed_config = None
+    observed_client_order_id = None
+
+    @classmethod
+    def reset(cls) -> None:
+        """
+        Reset.
+        """
+        cls.observed_factory = None
+        cls.observed_config = None
+        cls.observed_client_order_id = None
+
+    def on_start(self) -> None:
+        """
+        On start.
+        """
+        order_factory = self.order_factory
+
+        type(self).observed_factory = order_factory
+        type(self).observed_config = self.config
+        type(self).observed_client_order_id = order_factory.generate_client_order_id()
 
 
 def _market_order(
@@ -82,20 +500,79 @@ def _market_order(
         time_in_force=TimeInForce.GTC,
         reduce_only=False,
         quote_quantity=False,
-        contingency_type=ContingencyType.NO_CONTINGENCY,
+        contingency_type=None,
     )
 
 
+class OrderListCacheProbeStrategy(Strategy):
+    """
+    Collect order list cache probe strategy tests.
+    """
+
+    observed_order_list = None
+    observed_order_lists = None
+    observed_order_list_id = None
+    observed_client_order_ids = None
+    observed_strategy_id = None
+
+    @classmethod
+    def reset(cls) -> None:
+        """
+        Reset.
+        """
+        cls.observed_order_list = None
+        cls.observed_order_lists = None
+        cls.observed_order_list_id = None
+        cls.observed_client_order_ids = None
+        cls.observed_strategy_id = None
+
+    def on_start(self) -> None:
+        """
+        On start.
+        """
+        instrument_id = InstrumentId.from_str("AUD/USD.SIM")
+        orders = self.order_factory.bracket(
+            instrument_id=instrument_id,
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_str("100000"),
+            tp_price=Price.from_str("1.10000"),
+            sl_trigger_price=Price.from_str("0.90000"),
+        )
+
+        type(self).observed_client_order_ids = [order.client_order_id for order in orders]
+        type(self).observed_strategy_id = self.strategy_id
+        self.submit_order_list(orders)
+
+        order_lists = self.cache.order_lists(
+            instrument_id=instrument_id,
+            strategy_id=self.strategy_id,
+        )
+        cached = order_lists[0]
+        type(self).observed_order_lists = order_lists
+        type(self).observed_order_list_id = cached.id
+        type(self).observed_order_list = self.cache.order_list(cached.id)
+
+
 class PortfolioHedgedProbeStrategy(Strategy):
+    """
+    Collect portfolio hedged probe strategy tests.
+    """
+
     observed_portfolio = None
     observed_account = None
 
-    def on_start(self):
+    def on_start(self) -> None:
+        """
+        On start.
+        """
         self._instrument_id = InstrumentId.from_str("AUD/USD.SIM")
         self._quote_count = 0
         self.subscribe_quotes(self._instrument_id)
 
-    def on_quote(self, tick):
+    def on_quote(self, _tick: object) -> None:
+        """
+        On quote.
+        """
         if self._quote_count == 0:
             self.submit_order(
                 _market_order(
@@ -116,7 +593,10 @@ class PortfolioHedgedProbeStrategy(Strategy):
             )
         self._quote_count += 1
 
-    def on_stop(self):
+    def on_stop(self) -> None:
+        """
+        On stop.
+        """
         portfolio = self.portfolio
         account = portfolio.account(venue=Venue("SIM"))
 
@@ -124,9 +604,114 @@ class PortfolioHedgedProbeStrategy(Strategy):
         type(self).observed_account = account
 
 
-class TestExecAlgorithmConfig(DataActorConfig):
-    pass
+class PortfolioPositionProbeStrategy(Strategy):
+    """
+    Collect portfolio position probe strategy tests.
+    """
+
+    observed_portfolio = None
+    observed_account = None
+    observed_initial_account = None
+
+    def on_start(self) -> None:
+        """
+        On start.
+        """
+        self._instrument_id = InstrumentId.from_str("AUD/USD.SIM")
+        self._submitted = False
+        type(self).observed_initial_account = self.portfolio.account(venue=Venue("SIM"))
+        self.subscribe_quotes(self._instrument_id)
+
+    def on_quote(self, _tick: object) -> None:
+        """
+        On quote.
+        """
+        if self._submitted:
+            return
+
+        self._submitted = True
+        self.submit_order(
+            _market_order(
+                self,
+                self._instrument_id,
+                OrderSide.BUY,
+                Quantity.from_str("100000"),
+            ),
+        )
+
+    def on_stop(self) -> None:
+        """
+        On stop.
+        """
+        portfolio = self.portfolio
+        account = portfolio.account(venue=Venue("SIM"))
+
+        type(self).observed_portfolio = portfolio
+        type(self).observed_account = account
 
 
-class TestExecAlgorithm(DataActor):
-    pass
+class PortfolioMultiVenueProbeStrategy(Strategy):
+    """
+    Collect portfolio multi venue probe strategy tests.
+    """
+
+    observed_portfolio = None
+    observed_accounts = None
+
+    def on_start(self) -> None:
+        """
+        On start.
+        """
+        self._sides = {
+            InstrumentId.from_str("AUD/USD.SIM"): [OrderSide.BUY],
+            InstrumentId.from_str("GBP/USD.OTHER"): [OrderSide.SELL],
+            InstrumentId.from_str("NZD/USD.CLOSED"): [OrderSide.BUY, OrderSide.SELL],
+        }
+        self._quote_counts = dict.fromkeys(self._sides, 0)
+
+        for instrument_id in self._sides:
+            self.subscribe_quotes(instrument_id)
+
+    def on_quote(self, tick: object) -> None:
+        """
+        On quote.
+        """
+        sides = self._sides.get(tick.instrument_id)
+        if sides is None:
+            return
+
+        quote_count = self._quote_counts[tick.instrument_id]
+        if quote_count < len(sides):
+            self.submit_order(
+                _market_order(
+                    self,
+                    tick.instrument_id,
+                    sides[quote_count],
+                    Quantity.from_str("100000"),
+                ),
+            )
+        self._quote_counts[tick.instrument_id] += 1
+
+    def on_stop(self) -> None:
+        """
+        On stop.
+        """
+        portfolio = self.portfolio
+
+        type(self).observed_portfolio = portfolio
+        type(self).observed_accounts = {
+            venue: portfolio.account(venue=venue)
+            for venue in (Venue("SIM"), Venue("OTHER"), Venue("CLOSED"))
+        }
+
+
+class TestExecutionAlgorithmConfig(DataActorConfig):
+    """
+    Collect execution algorithm config tests.
+    """
+
+
+class TestExecutionAlgorithm(DataActor):
+    """
+    Collect execution algorithm tests.
+    """

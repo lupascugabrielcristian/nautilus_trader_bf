@@ -26,7 +26,7 @@ use crate::indicator::{Indicator, MovingAverage};
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.indicators")
+    pyo3::pyclass(module = "nautilus_trader.indicators")
 )]
 #[cfg_attr(
     feature = "python",
@@ -61,8 +61,9 @@ impl Indicator for ExponentialMovingAverage {
         self.initialized
     }
 
-    fn handle_quote(&mut self, quote: &QuoteTick) {
-        self.update_raw(quote.extract_price(self.price_type).into());
+    fn handle_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
+        self.update_raw(quote.extract_price(self.price_type)?.into());
+        Ok(())
     }
 
     fn handle_trade(&mut self, trade: &TradeTick) {
@@ -148,6 +149,7 @@ mod tests {
         average::ema::ExponentialMovingAverage,
         indicator::{Indicator, MovingAverage},
         stubs::*,
+        testing::assert_approx_equal,
     };
 
     #[rstest]
@@ -157,7 +159,7 @@ mod tests {
         assert_eq!(display_str, "ExponentialMovingAverage(10)");
         assert_eq!(ema.period, 10);
         assert_eq!(ema.price_type, PriceType::Mid);
-        assert_eq!(ema.alpha, 0.181_818_181_818_181_82);
+        assert_approx_equal(ema.alpha, 0.181818181818);
         assert!(!ema.initialized);
     }
 
@@ -186,7 +188,7 @@ mod tests {
         assert!(ema.has_inputs());
         assert!(ema.initialized());
         assert_eq!(ema.count, 10);
-        assert_eq!(ema.value, 6.239_368_480_121_215_5);
+        assert_approx_equal(ema.value, 6.23936848012);
     }
 
     #[rstest]
@@ -206,7 +208,7 @@ mod tests {
         stub_quote: QuoteTick,
     ) {
         let mut ema = indicator_ema_10;
-        ema.handle_quote(&stub_quote);
+        ema.handle_quote(&stub_quote).unwrap();
         assert!(ema.has_inputs());
         assert_eq!(ema.value, 1501.0);
     }
@@ -216,10 +218,10 @@ mod tests {
         let tick1 = stub_quote("1500.0", "1502.0");
         let tick2 = stub_quote("1502.0", "1504.0");
 
-        indicator_ema_10.handle_quote(&tick1);
-        indicator_ema_10.handle_quote(&tick2);
+        indicator_ema_10.handle_quote(&tick1).unwrap();
+        indicator_ema_10.handle_quote(&tick2).unwrap();
         assert_eq!(indicator_ema_10.count, 2);
-        assert_eq!(indicator_ema_10.value, 1_501.363_636_363_636_3);
+        assert_approx_equal(indicator_ema_10.value, 1501.36363636);
     }
 
     #[rstest]

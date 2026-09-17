@@ -17,43 +17,49 @@
 
 use std::{
     fmt::Debug,
+    num::NonZeroU32,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering},
     },
     time::Duration,
 };
 
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
-use nautilus_common::live::get_runtime;
+use dashmap::{DashMap, mapref::entry::Entry};
+use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::{
     AtomicMap,
     consts::NAUTILUS_USER_AGENT,
     nanos::UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
+use nautilus_live::{
+    SocketControl,
+    task::{SharedTaskSlot, TaskJoinOutcome},
+};
 use nautilus_model::{
-    enums::{OrderSide, OrderType, TimeInForce},
+    enums::{OrderSide, TimeInForce},
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     types::{Price, Quantity},
 };
 use nautilus_network::{
-    backoff::ExponentialBackoff,
+    http::USER_AGENT,
     mode::ConnectionMode,
     websocket::{
-        AuthTracker, PingHandler, TransportBackend, WebSocketClient, WebSocketConfig,
-        channel_message_handler,
+        AuthTracker, InitialConnectRetryPolicy, PingHandler, ReconnectHeaders, TransportBackend,
+        WebSocketClient, WebSocketConfig, channel_message_handler,
     },
 };
+use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
 use super::handler::{AxOrdersWsFeedHandler, HandlerCommand, WsOrderInfo};
 use crate::{
     common::{
         consts::AX_NAUTILUS_TAG,
-        enums::{AxOrderRequestType, AxOrderSide, AxOrderType, AxTimeInForce},
+        enums::{AxOrderRequestType, AxOrderSide, AxTimeInForce},
         parse::{client_order_id_to_cid, quantity_to_contracts},
     },
     websocket::messages::{AxOrdersWsMessage, AxWsPlaceOrder, OrderMetadata},
@@ -123,11 +129,14 @@ pub struct AxOrdersWebSocketClient {
     clock: &'static AtomicTime,
     url: String,
     heartbeat: Option<u64>,
+    reconnect_headers: Arc<Mutex<Option<ReconnectHeaders>>>,
     connection_mode: Arc<ArcSwap<AtomicU8>>,
     cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
     out_rx: Option<Arc<tokio::sync::mpsc::UnboundedReceiver<AxOrdersWsMessage>>>,
     signal: Arc<AtomicBool>,
-    task_handle: Option<tokio::task::JoinHandle<()>>,
+    cancellation_token: Arc<ArcSwap<CancellationToken>>,
+    task_handle: Arc<SharedTaskSlot<()>>,
+    connect_lock: Arc<tokio::sync::Mutex<()>>,
     auth_tracker: AuthTracker,
     instruments_cache: Arc<AtomicMap<Ustr, InstrumentAny>>,
     caches: OrdersCaches,
@@ -136,6 +145,7 @@ pub struct AxOrdersWebSocketClient {
     trader_id: TraderId,
     transport_backend: TransportBackend,
     proxy_url: Option<String>,
+    socket_control: Option<SocketControl>,
 }
 
 impl Debug for AxOrdersWebSocketClient {
@@ -154,11 +164,14 @@ impl Clone for AxOrdersWebSocketClient {
             clock: self.clock,
             url: self.url.clone(),
             heartbeat: self.heartbeat,
+            reconnect_headers: Arc::clone(&self.reconnect_headers),
             connection_mode: Arc::clone(&self.connection_mode),
             cmd_tx: Arc::clone(&self.cmd_tx),
             out_rx: None, // Each clone gets its own receiver
             signal: Arc::clone(&self.signal),
-            task_handle: None,
+            cancellation_token: Arc::clone(&self.cancellation_token),
+            task_handle: Arc::clone(&self.task_handle),
+            connect_lock: Arc::clone(&self.connect_lock),
             auth_tracker: self.auth_tracker.clone(),
             instruments_cache: Arc::clone(&self.instruments_cache),
             caches: self.caches.clone(),
@@ -167,11 +180,22 @@ impl Clone for AxOrdersWebSocketClient {
             trader_id: self.trader_id,
             transport_backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
+            socket_control: self.socket_control.clone(),
         }
     }
 }
 
 impl AxOrdersWebSocketClient {
+    fn initial_connect_retry_policy() -> InitialConnectRetryPolicy {
+        InitialConnectRetryPolicy {
+            max_attempts: NonZeroU32::new(5).expect("initial connect attempts must be non-zero"),
+            delay_initial: Duration::from_millis(500),
+            delay_max: Duration::from_secs(5),
+            backoff_factor: 2.0,
+            jitter_ms: 250,
+        }
+    }
+
     /// Creates a new Ax orders WebSocket client.
     #[must_use]
     pub fn new(
@@ -191,11 +215,14 @@ impl AxOrdersWebSocketClient {
             clock: get_atomic_clock_realtime(),
             url,
             heartbeat: Some(heartbeat),
+            reconnect_headers: Arc::new(Mutex::new(None)),
             connection_mode,
             cmd_tx: Arc::new(tokio::sync::RwLock::new(cmd_tx)),
             out_rx: None,
             signal: Arc::new(AtomicBool::new(false)),
-            task_handle: None,
+            cancellation_token: Arc::new(ArcSwap::from_pointee(CancellationToken::new())),
+            task_handle: Arc::new(SharedTaskSlot::new()),
+            connect_lock: Arc::new(tokio::sync::Mutex::new(())),
             auth_tracker: AuthTracker::default(),
             instruments_cache: Arc::new(AtomicMap::new()),
             caches: OrdersCaches::default(),
@@ -204,7 +231,15 @@ impl AxOrdersWebSocketClient {
             trader_id,
             transport_backend,
             proxy_url,
+            socket_control: None,
         }
+    }
+
+    /// Configures socket state reporting and reconnect control.
+    #[must_use]
+    pub fn with_socket_control(mut self, control: SocketControl) -> Self {
+        self.socket_control = Some(control);
+        self
     }
 
     fn generate_ts_init(&self) -> UnixNanos {
@@ -257,6 +292,29 @@ impl AxOrdersWebSocketClient {
                 m.insert(inst.symbol().inner(), inst.clone());
             }
         });
+    }
+
+    /// Updates the token used by future automatic reconnect attempts.
+    ///
+    /// Updating the token does not interrupt the active WebSocket connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reconnect header cannot be updated.
+    pub fn update_auth_token(&self, token: &str) -> AxOrdersWsResult<()> {
+        let value = format!("Bearer {token}");
+
+        if let Some(headers) = self
+            .reconnect_headers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            headers
+                .update("Authorization", &value)
+                .map_err(|e| AxOrdersWsClientError::Transport(e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Returns a cached instrument by symbol.
@@ -332,7 +390,6 @@ impl AxOrdersWebSocketClient {
             size_precision: instrument.size_precision(),
             price_precision: instrument.price_precision(),
             quote_currency: instrument.quote_currency(),
-            pending_trigger_price: None,
         };
 
         self.caches
@@ -359,10 +416,40 @@ impl AxOrdersWebSocketClient {
     ///
     /// Returns an error if the connection cannot be established.
     pub async fn connect(&mut self, bearer_token: &str) -> AxOrdersWsResult<()> {
-        const MAX_RETRIES: u32 = 5;
-        const CONNECTION_TIMEOUT_SECS: u64 = 10;
+        let connect_lock = Arc::clone(&self.connect_lock);
+        let _guard = connect_lock.lock().await;
+
+        if !self.task_handle.is_empty() && !self.task_handle.is_finished() {
+            return Err(AxOrdersWsClientError::ClientError(
+                "WebSocket handler is already running".to_string(),
+            ));
+        }
+
+        if let Some(outcome) = self
+            .task_handle
+            .finish(Duration::from_secs(2), Duration::from_secs(2))
+            .await
+        {
+            match outcome {
+                TaskJoinOutcome::Completed(()) | TaskJoinOutcome::Aborted => {}
+                TaskJoinOutcome::Failed(error) => {
+                    return Err(AxOrdersWsClientError::ClientError(format!(
+                        "Previous WebSocket handler failed: {error}"
+                    )));
+                }
+                TaskJoinOutcome::Incomplete => {
+                    return Err(AxOrdersWsClientError::ClientError(
+                        "Previous WebSocket handler did not stop within shutdown bounds"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
 
         self.signal.store(false, Ordering::Release);
+        let cancellation_token = CancellationToken::new();
+        self.cancellation_token
+            .store(Arc::new(cancellation_token.clone()));
 
         let (raw_handler, raw_rx) = channel_message_handler();
 
@@ -374,97 +461,45 @@ impl AxOrdersWebSocketClient {
         let config = WebSocketConfig {
             url: self.url.clone(),
             headers: vec![
-                ("User-Agent".to_string(), NAUTILUS_USER_AGENT.to_string()),
+                (USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string()),
                 (
                     "Authorization".to_string(),
                     format!("Bearer {bearer_token}"),
                 ),
             ],
-            heartbeat: self.heartbeat,
-            heartbeat_msg: None, // Ax server sends heartbeats
-            reconnect_timeout_ms: Some(5_000),
+            heartbeat_interval_secs: self.heartbeat,
+            heartbeat_payload: None, // Ax server sends heartbeats
+            connect_timeout_ms: Some(5_000),
             reconnect_delay_initial_ms: Some(500),
             reconnect_delay_max_ms: Some(5_000),
             reconnect_backoff_factor: Some(1.5),
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
         };
 
-        // Retry initial connection with exponential backoff
-        let mut backoff = ExponentialBackoff::new(
-            Duration::from_millis(500),
-            Duration::from_millis(5000),
-            2.0,
-            250,
-            false,
-        )
-        .map_err(|e| AxOrdersWsClientError::Transport(e.to_string()))?;
-
-        let mut last_error: String;
-        let mut attempt = 0;
-
-        let client = loop {
-            attempt += 1;
-
-            match tokio::time::timeout(
-                Duration::from_secs(CONNECTION_TIMEOUT_SECS),
-                WebSocketClient::connect(
-                    config.clone(),
-                    Some(raw_handler.clone()),
-                    Some(ping_handler.clone()),
-                    None,
-                    vec![],
-                    None,
-                ),
-            )
+        let client = WebSocketClient::builder()
+            .config(config.clone())
+            .message_handler(raw_handler.clone())
+            .ping_handler(ping_handler.clone())
+            .initial_connect_retry_policy(Self::initial_connect_retry_policy())
+            .cancellation_token(cancellation_token)
+            .maybe_state_sink(self.socket_control.as_ref().map(SocketControl::sink))
+            .connect()
             .await
-            {
-                Ok(Ok(client)) => {
-                    if attempt > 1 {
-                        log::info!("WebSocket connection established after {attempt} attempts");
-                    }
-                    break client;
-                }
-                Ok(Err(e)) => {
-                    last_error = e.to_string();
-                    log::warn!(
-                        "WebSocket connection attempt failed: attempt={attempt}, max_retries={MAX_RETRIES}, url={}, error={last_error}",
-                        self.url
-                    );
-                }
-                Err(_) => {
-                    last_error = format!("Connection timeout after {CONNECTION_TIMEOUT_SECS}s");
-                    log::warn!(
-                        "WebSocket connection attempt timed out: attempt={attempt}, max_retries={MAX_RETRIES}, url={}",
-                        self.url
-                    );
-                }
-            }
-
-            if attempt >= MAX_RETRIES {
-                return Err(AxOrdersWsClientError::Transport(format!(
-                    "Failed to connect to {} after {MAX_RETRIES} attempts: {}",
-                    self.url,
-                    if last_error.is_empty() {
-                        "unknown error"
-                    } else {
-                        &last_error
-                    }
-                )));
-            }
-
-            let delay = backoff.next_duration();
-            log::debug!(
-                "Retrying in {delay:?} (attempt {}/{MAX_RETRIES})",
-                attempt + 1
-            );
-            tokio::time::sleep(delay).await;
-        };
+            .map_err(|e| {
+                AxOrdersWsClientError::Transport(format!("Failed to connect to {}: {e}", self.url))
+            })?;
 
         self.connection_mode.store(client.connection_mode_atomic());
+        let reconnect_handle = client.reconnect_handle();
+        *self
+            .reconnect_headers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(client.reconnect_headers());
 
         let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<AxOrdersWsMessage>();
         self.out_rx = Some(Arc::new(out_rx));
@@ -474,24 +509,22 @@ impl AxOrdersWebSocketClient {
 
         self.send_cmd(HandlerCommand::SetClient(client)).await?;
 
-        // Bearer token is passed in connection headers
-        self.send_cmd(HandlerCommand::Authenticate {
-            token: bearer_token.to_string(),
-        })
-        .await?;
+        self.send_cmd(HandlerCommand::SessionAuthenticated).await?;
 
         let signal = Arc::clone(&self.signal);
         let auth_tracker = self.auth_tracker.clone();
         let orders_metadata = Arc::clone(&self.caches.orders_metadata);
+        let venue_to_client_order_id = Arc::clone(&self.caches.venue_to_client_id);
         let cid_to_client_order_id = Arc::clone(&self.caches.cid_to_client_order_id);
 
-        let stream_handle = get_runtime().spawn(async move {
+        if let Err(e) = self.task_handle.spawn(async move {
             let mut handler = AxOrdersWsFeedHandler::new(
                 signal.clone(),
                 cmd_rx,
                 raw_rx,
                 auth_tracker.clone(),
                 orders_metadata,
+                venue_to_client_order_id,
                 cid_to_client_order_id,
             );
 
@@ -507,14 +540,21 @@ impl AxOrdersWebSocketClient {
             }
 
             log::debug!("Handler loop exited");
-        });
+        }) {
+            self.out_rx = None;
+            return Err(AxOrdersWsClientError::Transport(format!(
+                "Failed to start WebSocket handler task: {e}"
+            )));
+        }
 
-        self.task_handle = Some(stream_handle);
+        if let Some(control) = &self.socket_control {
+            control.register(move || reconnect_handle.request_reconnect());
+        }
 
         Ok(())
     }
 
-    /// Submits an order using Nautilus domain types.
+    /// Submits the AX priced order shape using Nautilus domain types.
     ///
     /// This method handles conversion from Nautilus domain types to AX-specific
     /// types and stores order metadata for event correlation.
@@ -522,11 +562,8 @@ impl AxOrdersWebSocketClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The order type is not supported (only MARKET (simulated), LIMIT and STOP_LIMIT).
     /// - The time-in-force is not supported.
     /// - The instrument is not found in the cache.
-    /// - A limit order is missing a price.
-    /// - A stop-loss order is missing a trigger price.
     /// - The order command cannot be sent.
     #[expect(clippy::too_many_arguments)]
     pub async fn submit_order(
@@ -536,87 +573,29 @@ impl AxOrdersWebSocketClient {
         instrument_id: InstrumentId,
         client_order_id: ClientOrderId,
         order_side: OrderSide,
-        order_type: OrderType,
         quantity: Quantity,
         time_in_force: TimeInForce,
-        price: Option<Price>,
-        trigger_price: Option<Price>,
+        price: Price,
         post_only: bool,
     ) -> AxOrdersWsResult<i64> {
-        if !matches!(
-            order_type,
-            OrderType::Market | OrderType::Limit | OrderType::StopLimit
-        ) {
-            return Err(AxOrdersWsClientError::ClientError(format!(
-                "Unsupported order type: {order_type:?}. AX supports MARKET, LIMIT and STOP_LIMIT."
-            )));
-        }
-
         // Get instrument from cache for precision
         let symbol = instrument_id.symbol.inner();
         let instrument = self.get_cached_instrument(&symbol).ok_or_else(|| {
-            AxOrdersWsClientError::ClientError(format!(
-                "Instrument {instrument_id} not found in cache"
-            ))
+            AxOrdersWsClientError::ClientError(
+                InstrumentLookupError::not_found(instrument_id).to_string(),
+            )
         })?;
 
-        let ax_side = AxOrderSide::try_from(order_side)?;
+        let ax_side = AxOrderSide::from(order_side);
 
         let qty_contracts = quantity_to_contracts(quantity)
             .map_err(|e| AxOrdersWsClientError::ClientError(e.to_string()))?;
 
-        // Market orders are simulated as IOC limit orders with aggressive pricing
-        // because Architect does not support native market orders
         let request_id = self.next_request_id();
+        let ax_tif = AxTimeInForce::try_from(time_in_force)?;
+        let cid = client_order_id_to_cid(&client_order_id);
 
-        let (ax_price, ax_tif, ax_post_only, ax_order_type, ax_trigger_price) = match order_type {
-            OrderType::Market => {
-                let market_price = price.ok_or_else(|| {
-                    AxOrdersWsClientError::ClientError(
-                        "Market order requires price (calculated from quote)".to_string(),
-                    )
-                })?;
-                (
-                    market_price.as_decimal(),
-                    AxTimeInForce::Ioc,
-                    false,
-                    None,
-                    None,
-                )
-            }
-            OrderType::Limit => {
-                let ax_tif = AxTimeInForce::try_from(time_in_force)?;
-                let limit_price = price.ok_or_else(|| {
-                    AxOrdersWsClientError::ClientError("Limit order requires price".to_string())
-                })?;
-                (limit_price.as_decimal(), ax_tif, post_only, None, None)
-            }
-            OrderType::StopLimit => {
-                let ax_tif = AxTimeInForce::try_from(time_in_force)?;
-                let limit_price = price.ok_or_else(|| {
-                    AxOrdersWsClientError::ClientError(
-                        "Stop-limit order requires price".to_string(),
-                    )
-                })?;
-                let stop_price = trigger_price.ok_or_else(|| {
-                    AxOrdersWsClientError::ClientError(
-                        "Stop-limit order requires trigger price".to_string(),
-                    )
-                })?;
-                (
-                    limit_price.as_decimal(),
-                    ax_tif,
-                    false,
-                    Some(AxOrderType::StopLossLimit),
-                    Some(stop_price.as_decimal()),
-                )
-            }
-            _ => {
-                return Err(AxOrdersWsClientError::ClientError(format!(
-                    "Unsupported order type: {order_type:?}"
-                )));
-            }
-        };
+        reserve_cid_mapping(&self.caches, cid, client_order_id)?;
 
         // Store order metadata for event correlation (after validation to avoid stale entries)
         let metadata = OrderMetadata {
@@ -629,17 +608,10 @@ impl AxOrdersWebSocketClient {
             size_precision: instrument.size_precision(),
             price_precision: instrument.price_precision(),
             quote_currency: instrument.quote_currency(),
-            pending_trigger_price: None,
         };
         self.caches
             .orders_metadata
             .insert(client_order_id, metadata);
-
-        // Store cid -> client_order_id mapping for correlation
-        let cid = client_order_id_to_cid(&client_order_id);
-        self.caches
-            .cid_to_client_order_id
-            .insert(cid, client_order_id);
 
         let order = AxWsPlaceOrder {
             rid: request_id,
@@ -647,18 +619,17 @@ impl AxOrdersWebSocketClient {
             s: symbol,
             d: ax_side,
             q: qty_contracts,
-            p: ax_price,
+            p: price.as_decimal(),
             tif: ax_tif,
-            po: ax_post_only,
+            po: post_only,
             tag: Some(AX_NAUTILUS_TAG.to_string()),
             cid: Some(cid),
-            order_type: ax_order_type,
-            trigger_price: ax_trigger_price,
         };
 
         let order_info = WsOrderInfo {
             client_order_id,
             symbol,
+            cid,
         };
 
         let result = self
@@ -741,6 +712,11 @@ impl AxOrdersWebSocketClient {
         }
     }
 
+    pub(crate) fn begin_shutdown(&self) {
+        self.cancellation_token.load().cancel();
+        self.signal.store(true, Ordering::Release);
+    }
+
     /// Disconnects the WebSocket connection gracefully.
     pub async fn disconnect(&self) {
         log::debug!("Disconnecting WebSocket");
@@ -748,26 +724,42 @@ impl AxOrdersWebSocketClient {
     }
 
     /// Closes the WebSocket connection and cleans up resources.
-    pub async fn close(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the handler task fails or does not stop after abort.
+    pub async fn close(&mut self) -> anyhow::Result<()> {
+        let connect_lock = Arc::clone(&self.connect_lock);
+        let _guard = connect_lock.lock().await;
         log::debug!("Closing WebSocket client");
 
         // Send disconnect first to allow graceful cleanup before signal
+        self.cancellation_token.load().cancel();
         let _ = self.send_cmd(HandlerCommand::Disconnect).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         self.signal.store(true, Ordering::Release);
 
-        if let Some(handle) = self.task_handle.take() {
-            const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
-            let abort_handle = handle.abort_handle();
+        let outcome = self
+            .task_handle
+            .finish(Duration::from_secs(2), Duration::from_secs(2))
+            .await;
+        *self
+            .reconnect_headers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 
-            match tokio::time::timeout(CLOSE_TIMEOUT, handle).await {
-                Ok(Ok(())) => log::debug!("Handler task completed gracefully"),
-                Ok(Err(e)) => log::warn!("Handler task panicked: {e}"),
-                Err(_) => {
-                    log::warn!("Handler task did not complete within timeout, aborting");
-                    abort_handle.abort();
-                }
-            }
+        if let Some(control) = &self.socket_control {
+            control.deregister();
+        }
+
+        match outcome {
+            None | Some(TaskJoinOutcome::Completed(()) | TaskJoinOutcome::Aborted) => Ok(()),
+            Some(TaskJoinOutcome::Failed(error)) => Err(anyhow::anyhow!(
+                "Architect AX orders WebSocket handler failed: {error}"
+            )),
+            Some(TaskJoinOutcome::Incomplete) => Err(anyhow::anyhow!(
+                "Architect AX orders WebSocket handler did not stop after abort"
+            )),
         }
     }
 
@@ -779,11 +771,98 @@ impl AxOrdersWebSocketClient {
     }
 }
 
+impl Drop for AxOrdersWebSocketClient {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.task_handle) == 1 && !self.task_handle.is_empty() {
+            self.cancellation_token.load().cancel();
+            self.signal.store(true, Ordering::Release);
+            self.task_handle.abort();
+
+            if let Some(control) = &self.socket_control {
+                control.deregister();
+            }
+        }
+    }
+}
+
+fn reserve_cid_mapping(
+    caches: &OrdersCaches,
+    cid: u64,
+    client_order_id: ClientOrderId,
+) -> AxOrdersWsResult<()> {
+    match caches.cid_to_client_order_id.entry(cid) {
+        Entry::Vacant(entry) => {
+            entry.insert(client_order_id);
+            Ok(())
+        }
+        Entry::Occupied(entry) => Err(AxOrdersWsClientError::ClientError(format!(
+            "AX cid {cid} is already mapped to {}",
+            entry.get(),
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
+    use rstest::rstest;
+
     use super::*;
+
+    #[tokio::test]
+    async fn test_drop_aborts_handler_task() {
+        let client = AxOrdersWebSocketClient::new(
+            "wss://example.com/orders/ws".to_string(),
+            AccountId::from("AX-001"),
+            TraderId::from("TRADER-001"),
+            30,
+            TransportBackend::default(),
+            None,
+        );
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            started_tx.send(()).expect("started receiver");
+            std::future::pending::<()>().await;
+        });
+        let abort_handle = handle.abort_handle();
+        client.task_handle.insert(handle);
+        started_rx.await.expect("handler task started");
+
+        drop(client);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !abort_handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("handler task aborted");
+    }
+
+    #[rstest]
+    fn test_reserve_cid_mapping_rejects_collision() {
+        let caches = OrdersCaches::default();
+        let cid = 123;
+        let first_client_order_id = ClientOrderId::from("CID-123-A");
+        let second_client_order_id = ClientOrderId::from("CID-123-B");
+
+        reserve_cid_mapping(&caches, cid, first_client_order_id).unwrap();
+        let result = reserve_cid_mapping(&caches, cid, second_client_order_id);
+
+        assert!(matches!(
+            result,
+            Err(AxOrdersWsClientError::ClientError(msg))
+                if msg == "AX cid 123 is already mapped to CID-123-A"
+        ));
+        assert_eq!(
+            caches
+                .cid_to_client_order_id
+                .get(&cid)
+                .map(|client_order_id| *client_order_id),
+            Some(first_client_order_id),
+        );
+    }
 
     #[tokio::test]
     async fn test_cancel_order_rejects_without_venue_order_id() {

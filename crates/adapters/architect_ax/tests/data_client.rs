@@ -21,7 +21,7 @@
 
 mod common;
 
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 
 use futures_util::StreamExt;
 use nautilus_architect_ax::{
@@ -36,20 +36,26 @@ use nautilus_architect_ax::{
 };
 use nautilus_common::{
     clients::DataClient as DataClientTrait,
-    live::runner::set_data_event_sender,
+    live::runner::{replace_system_event_sender, set_data_event_sender},
     messages::{
-        DataEvent,
-        data::{SubscribeBars, SubscribeBookDeltas, SubscribeQuotes, SubscribeTrades},
+        DataEvent, DataResponse, SystemEvent,
+        data::{
+            RequestInstrument, SubscribeBars, SubscribeBookDeltas, SubscribeQuotes, SubscribeTrades,
+        },
+        system::SocketState,
     },
 };
 use nautilus_core::UUID4;
+use nautilus_live::{SocketReconnectRegistry, SocketReconnectRequestOutcome};
 use nautilus_model::{
     data::{BarType, Data},
     enums::BookType,
     identifiers::{ClientId, InstrumentId},
+    instruments::Instrument,
 };
 use nautilus_network::websocket::TransportBackend;
 use rstest::rstest;
+use ustr::Ustr;
 
 use crate::common::server::{start_test_server, wait_for_connection};
 
@@ -94,7 +100,7 @@ async fn test_handler_emits_l1_md_message() {
         Err(_) => panic!("Timeout waiting for L1 message"),
     }
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -136,7 +142,7 @@ async fn test_handler_emits_trade_md_message() {
     .expect("Timeout waiting for trade message");
 
     assert_eq!(trade.s.as_str(), "EURUSD-PERP");
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -174,7 +180,7 @@ async fn test_handler_emits_l2_md_message() {
         Err(_) => panic!("Timeout waiting for order book message"),
     }
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -215,7 +221,7 @@ async fn test_handler_emits_candle_md_message() {
 
     assert_eq!(candle.symbol.as_str(), "EURUSD-PERP");
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -257,7 +263,7 @@ async fn test_handler_forwards_raw_message_even_when_instrument_missing() {
         other => panic!("expected BookL1, was {other:?}"),
     }
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -391,6 +397,8 @@ async fn test_data_client_emits_trade_tick_via_channel() {
 #[tokio::test]
 async fn test_data_client_connect_disconnect() {
     let _rx = setup_data_channel();
+    let (system_tx, mut system_rx) = tokio::sync::mpsc::unbounded_channel();
+    replace_system_event_sender(system_tx);
 
     let (addr, state) = start_test_server().await.unwrap();
     let http_url = format!("http://{addr}");
@@ -407,17 +415,42 @@ async fn test_data_client_connect_disconnect() {
 
     let config = AxDataClientConfig::default();
     let client_id = ClientId::from("AX-TEST");
-    let mut client = AxDataClient::new(client_id, config, http_client, ws_client)
+    let registry = SocketReconnectRegistry::default();
+    let mut client = registry
+        .scope(|| AxDataClient::new(client_id, config, http_client, ws_client))
         .expect("Failed to create data client");
 
     assert!(!client.is_connected());
 
     client.connect().await.expect("Failed to connect");
     wait_for_connection(&state).await;
+    let event = tokio::time::timeout(Duration::from_secs(2), system_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let SystemEvent::SocketState(change) = event;
+    let endpoint = Ustr::from("architect-ax-data-streams");
+    let handle = registry.handle(client_id, endpoint).unwrap();
+
     assert!(client.is_connected());
+    assert_eq!(change.client_id, client_id);
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Connected);
+    assert_eq!(
+        handle.request_reconnect(),
+        SocketReconnectRequestOutcome::Accepted
+    );
+    let event = tokio::time::timeout(Duration::from_secs(2), system_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let SystemEvent::SocketState(change) = event;
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Disconnected);
 
     client.disconnect().await.expect("Failed to disconnect");
     assert!(!client.is_connected());
+    assert!(registry.handle(client_id, endpoint).is_none());
 }
 
 #[rstest]
@@ -621,4 +654,161 @@ async fn test_data_client_reset_clears_state() {
 
     // Reset after connect should clear state
     client.reset().expect("Reset failed");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_data_client_request_instrument_emits_response() {
+    let mut rx = setup_data_channel();
+
+    let (addr, state) = start_test_server().await.unwrap();
+    let client_id = ClientId::from("AX-TEST");
+    let mut client = create_data_client(addr, client_id);
+
+    client.connect().await.expect("Failed to connect");
+    wait_for_connection(&state).await;
+
+    while rx.try_recv().is_ok() {}
+
+    let instrument_id = InstrumentId::from("EURUSD-PERP.AX");
+    let request_id = UUID4::new();
+    client
+        .request_instrument(RequestInstrument::new(
+            instrument_id,
+            None,
+            None,
+            Some(client_id),
+            request_id,
+            0.into(),
+            None,
+        ))
+        .expect("Instrument request failed");
+
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("Timeout waiting for instrument response")
+        .expect("Channel closed unexpectedly");
+    let DataEvent::Response(DataResponse::Instrument(response)) = event else {
+        panic!("Expected instrument response, was {event:?}");
+    };
+
+    assert_eq!(response.correlation_id, request_id);
+    assert_eq!(response.client_id, client_id);
+    assert_eq!(response.instrument_id, instrument_id);
+    assert_eq!(response.data.id(), instrument_id);
+
+    client.disconnect().await.expect("Failed to disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_data_client_disconnect_aborts_instrument_request() {
+    let mut rx = setup_data_channel();
+
+    let (addr, state) = start_test_server().await.unwrap();
+    let client_id = ClientId::from("AX-TEST");
+    let mut client = create_data_client(addr, client_id);
+
+    client.connect().await.expect("Failed to connect");
+    wait_for_connection(&state).await;
+
+    while rx.try_recv().is_ok() {}
+
+    state
+        .instrument_response_delay
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let instrument_id = InstrumentId::from("EURUSD-PERP.AX");
+    let request_id = UUID4::new();
+    let entered = state.instrument_response_entered.notified();
+    client
+        .request_instrument(RequestInstrument::new(
+            instrument_id,
+            None,
+            None,
+            Some(client_id),
+            request_id,
+            0.into(),
+            None,
+        ))
+        .expect("Instrument request failed");
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("Instrument request did not enter the server");
+
+    let dropped = state.instrument_response_dropped.notified();
+    client.disconnect().await.expect("Failed to disconnect");
+    let request_aborted = tokio::time::timeout(Duration::from_secs(5), dropped)
+        .await
+        .is_ok();
+    state.instrument_response_release.notify_one();
+
+    assert!(
+        request_aborted,
+        "Instrument request remained active after disconnect"
+    );
+
+    while let Ok(event) = rx.try_recv() {
+        if let DataEvent::Response(DataResponse::Instrument(response)) = event {
+            assert_ne!(
+                response.correlation_id, request_id,
+                "Disconnected request emitted a late response"
+            );
+        }
+    }
+
+    state
+        .instrument_response_delay
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    client.connect().await.expect("Failed to reconnect");
+    wait_for_connection(&state).await;
+
+    while rx.try_recv().is_ok() {}
+
+    let reconnect_request_id = UUID4::new();
+    client
+        .request_instrument(RequestInstrument::new(
+            instrument_id,
+            None,
+            None,
+            Some(client_id),
+            reconnect_request_id,
+            0.into(),
+            None,
+        ))
+        .expect("Instrument request after reconnect failed");
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("Timeout waiting for instrument response after reconnect")
+        .expect("Channel closed unexpectedly");
+    let DataEvent::Response(DataResponse::Instrument(response)) = event else {
+        panic!("Expected instrument response after reconnect, was {event:?}");
+    };
+
+    assert_eq!(response.correlation_id, reconnect_request_id);
+    assert_eq!(response.client_id, client_id);
+    assert_eq!(response.instrument_id, instrument_id);
+    assert_eq!(response.data.id(), instrument_id);
+
+    client.disconnect().await.expect("Failed to disconnect");
+}
+
+fn create_data_client(addr: SocketAddr, client_id: ClientId) -> AxDataClient {
+    let http_url = format!("http://{addr}");
+    let ws_url = format!("ws://{addr}/md/ws");
+    let http_client = AxHttpClient::new(Some(http_url), None, 60, 3, 1000, 10_000, None).unwrap();
+    let ws_client = AxMdWebSocketClient::new(
+        ws_url,
+        "test_token".to_string(),
+        30,
+        TransportBackend::default(),
+        None,
+    );
+
+    AxDataClient::new(
+        client_id,
+        AxDataClientConfig::default(),
+        http_client,
+        ws_client,
+    )
+    .expect("Failed to create data client")
 }

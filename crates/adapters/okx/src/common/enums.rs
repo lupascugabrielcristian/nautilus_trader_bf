@@ -16,8 +16,8 @@
 //! Enumerations mapping OKX concepts onto idiomatic Nautilus variants.
 
 use nautilus_model::enums::{
-    AggressorSide, GreeksConvention, LiquiditySide, OptionKind, OrderSide, OrderSideSpecified,
-    OrderStatus, OrderType, PositionSide, TriggerType,
+    AggressorSide, GreeksConvention, LiquiditySide, OptionKind, OrderSide, OrderStatus, OrderType,
+    PositionSide, TriggerType,
 };
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display, EnumIter, EnumString};
@@ -94,11 +94,11 @@ pub enum OKXSide {
     Sell,
 }
 
-impl From<OrderSideSpecified> for OKXSide {
-    fn from(value: OrderSideSpecified) -> Self {
+impl From<OrderSide> for OKXSide {
+    fn from(value: OrderSide) -> Self {
         match value {
-            OrderSideSpecified::Buy => Self::Buy,
-            OrderSideSpecified::Sell => Self::Sell,
+            OrderSide::Buy => Self::Buy,
+            OrderSide::Sell => Self::Sell,
         }
     }
 }
@@ -106,8 +106,8 @@ impl From<OrderSideSpecified> for OKXSide {
 impl From<OKXSide> for AggressorSide {
     fn from(value: OKXSide) -> Self {
         match value {
-            OKXSide::Buy => Self::Buyer,
-            OKXSide::Sell => Self::Seller,
+            OKXSide::Buy => Self::Buy,
+            OKXSide::Sell => Self::Sell,
         }
     }
 }
@@ -133,6 +133,9 @@ pub enum OKXOrderType {
     Market,
     /// Limit order, executed only at specified price or better.
     Limit,
+    /// Retail Price Improvement order.
+    #[serde(alias = "elp")]
+    Rpi,
     PostOnly,        // limit only, requires "px" to be provided
     Fok,             // Market order if "px" is not provided, otherwise limit order
     Ioc,             // Market order if "px" is not provided, otherwise limit order
@@ -141,6 +144,9 @@ pub enum OKXOrderType {
     MmpAndPostOnly, // Market Maker Protection and Post-only order(only applicable to Option in Portfolio Margin mode)
     OpFok,          // Fill-or-Kill for options (only applicable to Option)
     Trigger,        // Conditional/algo order (stop orders, etc.)
+    /// Forward-compatible fallback for order types OKX adds later.
+    #[serde(other)]
+    Other,
 }
 
 /// Represents the possible states of an order throughout its lifecycle.
@@ -164,7 +170,7 @@ pub enum OKXOrderType {
     pyo3::pyclass(
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.okx",
+        module = "nautilus_trader.adapters.okx",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -179,6 +185,9 @@ pub enum OKXOrderStatus {
     PartiallyFilled,
     Filled,
     MmpCanceled,
+    /// Forward-compatible fallback for order states OKX adds later.
+    #[serde(other)]
+    Unknown,
 }
 
 impl TryFrom<OrderStatus> for OKXOrderStatus {
@@ -258,7 +267,7 @@ impl From<LiquiditySide> for OKXExecType {
     pyo3::pyclass(
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.okx",
+        module = "nautilus_trader.adapters.okx",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -435,7 +444,7 @@ pub enum OKXSpreadState {
     pyo3::pyclass(
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.okx",
+        module = "nautilus_trader.adapters.okx",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -521,7 +530,7 @@ impl TryFrom<OKXOptionType> for OptionKind {
     pyo3::pyclass(
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.okx",
+        module = "nautilus_trader.adapters.okx",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -592,7 +601,7 @@ impl From<OKXGreeksType> for GreeksConvention {
     pyo3::pyclass(
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.okx",
+        module = "nautilus_trader.adapters.okx",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -668,7 +677,7 @@ pub enum OKXAccountMode {
     pyo3::pyclass(
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.okx",
+        module = "nautilus_trader.adapters.okx",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -710,7 +719,7 @@ pub enum OKXMarginMode {
     pyo3::pyclass(
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.okx",
+        module = "nautilus_trader.adapters.okx",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -838,10 +847,13 @@ impl From<TriggerType> for OKXTriggerType {
 mod tests {
     use std::str::FromStr;
 
-    use nautilus_model::enums::{GreeksConvention, OptionKind, OrderStatus};
+    use nautilus_model::enums::{GreeksConvention, OptionKind, OrderStatus, OrderType};
     use rstest::rstest;
 
-    use super::{OKXGreeksType, OKXOptionType, OKXOrderStatus, OKXOrderType, OKXTriggerType};
+    use super::{
+        OKXAlgoOrderStatus, OKXAlgoOrderType, OKXGreeksType, OKXOptionType, OKXOrderStatus,
+        OKXOrderType, OKXRpiPermission, OKXTriggerType,
+    };
 
     #[rstest]
     fn test_okx_trigger_type_from_str_accepts_snake_case_values() {
@@ -908,9 +920,38 @@ mod tests {
 
     #[rstest]
     fn test_op_fok_converts_to_limit_order_type() {
-        use nautilus_model::enums::OrderType;
-        let order_type: OrderType = OKXOrderType::OpFok.into();
+        let order_type: OrderType = OKXOrderType::OpFok.try_into().unwrap();
         assert_eq!(order_type, OrderType::Limit);
+    }
+
+    #[rstest]
+    fn test_rpi_order_type_serializes_current_name_and_reads_legacy_alias() {
+        assert_eq!(
+            serde_json::to_string(&OKXOrderType::Rpi).unwrap(),
+            "\"rpi\""
+        );
+        assert_eq!(
+            serde_json::from_str::<OKXOrderType>("\"elp\"").unwrap(),
+            OKXOrderType::Rpi
+        );
+        assert_eq!(
+            OrderType::try_from(OKXOrderType::Rpi).unwrap(),
+            OrderType::Limit
+        );
+    }
+
+    #[rstest]
+    #[case("\"0\"", OKXRpiPermission::Disabled)]
+    #[case("\"1\"", OKXRpiPermission::Enabled)]
+    #[case("\"2\"", OKXRpiPermission::Permitted)]
+    fn test_rpi_permission_deserializes_string_codes(
+        #[case] json: &str,
+        #[case] expected: OKXRpiPermission,
+    ) {
+        assert_eq!(
+            serde_json::from_str::<OKXRpiPermission>(json).unwrap(),
+            expected
+        );
     }
 
     #[rstest]
@@ -942,6 +983,70 @@ mod tests {
     ) {
         let actual: Result<OKXOrderStatus, OrderStatus> = input.try_into();
         assert_eq!(actual, expected);
+    }
+
+    #[rstest]
+    #[case::live(OKXOrderStatus::Live, Ok(OrderStatus::Accepted))]
+    #[case::partially_filled(OKXOrderStatus::PartiallyFilled, Ok(OrderStatus::PartiallyFilled))]
+    #[case::filled(OKXOrderStatus::Filled, Ok(OrderStatus::Filled))]
+    #[case::canceled(OKXOrderStatus::Canceled, Ok(OrderStatus::Canceled))]
+    #[case::mmp_canceled(OKXOrderStatus::MmpCanceled, Ok(OrderStatus::Canceled))]
+    #[case::unknown(OKXOrderStatus::Unknown, Err(OKXOrderStatus::Unknown))]
+    fn test_try_from_okx_order_status(
+        #[case] input: OKXOrderStatus,
+        #[case] expected: Result<OrderStatus, OKXOrderStatus>,
+    ) {
+        let actual: Result<OrderStatus, OKXOrderStatus> = input.try_into();
+        assert_eq!(actual, expected);
+    }
+
+    #[rstest]
+    #[case::live(OKXAlgoOrderStatus::Live, Ok(OrderStatus::Accepted))]
+    #[case::pause(OKXAlgoOrderStatus::Pause, Ok(OrderStatus::Accepted))]
+    #[case::effective(OKXAlgoOrderStatus::Effective, Ok(OrderStatus::Triggered))]
+    #[case::order_placed(OKXAlgoOrderStatus::OrderPlaced, Ok(OrderStatus::Triggered))]
+    #[case::partially_effective(OKXAlgoOrderStatus::PartiallyEffective, Ok(OrderStatus::Triggered))]
+    #[case::filled(OKXAlgoOrderStatus::Filled, Ok(OrderStatus::Filled))]
+    #[case::canceled(OKXAlgoOrderStatus::Canceled, Ok(OrderStatus::Canceled))]
+    #[case::order_failed(OKXAlgoOrderStatus::OrderFailed, Ok(OrderStatus::Rejected))]
+    #[case::partially_failed(OKXAlgoOrderStatus::PartiallyFailed, Ok(OrderStatus::Rejected))]
+    #[case::unknown(OKXAlgoOrderStatus::Unknown, Err(OKXAlgoOrderStatus::Unknown))]
+    fn test_try_from_okx_algo_order_status(
+        #[case] input: OKXAlgoOrderStatus,
+        #[case] expected: Result<OrderStatus, OKXAlgoOrderStatus>,
+    ) {
+        let actual: Result<OrderStatus, OKXAlgoOrderStatus> = input.try_into();
+        assert_eq!(actual, expected);
+    }
+
+    #[rstest]
+    fn test_okx_order_status_deserializes_unknown_state_as_unknown() {
+        let parsed: OKXOrderStatus = serde_json::from_str("\"future_state\"").unwrap();
+        assert_eq!(parsed, OKXOrderStatus::Unknown);
+
+        let parsed: OKXOrderStatus = serde_json::from_str("\"mmp_canceled\"").unwrap();
+        assert_eq!(parsed, OKXOrderStatus::MmpCanceled);
+    }
+
+    #[rstest]
+    fn test_okx_algo_order_status_deserializes_unknown_state_as_unknown() {
+        let parsed: OKXAlgoOrderStatus = serde_json::from_str("\"future_state\"").unwrap();
+        assert_eq!(parsed, OKXAlgoOrderStatus::Unknown);
+    }
+
+    #[rstest]
+    fn test_okx_order_type_deserializes_unknown_type_as_other() {
+        let parsed: OKXOrderType = serde_json::from_str("\"future_ord_type\"").unwrap();
+        assert_eq!(parsed, OKXOrderType::Other);
+    }
+
+    #[rstest]
+    fn test_okx_algo_order_type_deserializes_chase_and_unknown() {
+        let parsed: OKXAlgoOrderType = serde_json::from_str("\"chase\"").unwrap();
+        assert_eq!(parsed, OKXAlgoOrderType::Chase);
+
+        let parsed: OKXAlgoOrderType = serde_json::from_str("\"future_algo_type\"").unwrap();
+        assert_eq!(parsed, OKXAlgoOrderType::Other);
     }
 }
 
@@ -978,6 +1083,37 @@ pub enum OKXBookChannel {
     BookL2Tbt,
     /// Low-latency 50-depth channel (`books50-l2-tbt`).
     Books50L2Tbt,
+    /// Retail Price Improvement 400-depth channel (`books-rpi`).
+    BooksRpi,
+    /// Spread 5-depth snapshot channel (`sprd-books5`).
+    SprdBooks5,
+}
+
+/// Represents an account's RPI permission for an instrument.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+pub enum OKXRpiPermission {
+    /// RPI is not enabled for the instrument.
+    #[serde(rename = "0")]
+    Disabled,
+    /// RPI is enabled, but the account cannot place RPI orders.
+    #[serde(rename = "1")]
+    Enabled,
+    /// RPI is enabled and the account can place RPI orders.
+    #[serde(rename = "2")]
+    Permitted,
 }
 
 /// Represents OKX VIP level tiers for trading fee structure and API limits.
@@ -1012,7 +1148,7 @@ pub enum OKXBookChannel {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.okx",
+        module = "nautilus_trader.adapters.okx",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -1114,44 +1250,68 @@ impl From<OKXPositionSide> for PositionSide {
     }
 }
 
-impl From<OKXOrderStatus> for OrderStatus {
-    fn from(status: OKXOrderStatus) -> Self {
-        match status {
-            OKXOrderStatus::Live => Self::Accepted,
-            OKXOrderStatus::PartiallyFilled => Self::PartiallyFilled,
-            OKXOrderStatus::Filled => Self::Filled,
-            OKXOrderStatus::Canceled | OKXOrderStatus::MmpCanceled => Self::Canceled,
+impl TryFrom<OKXOrderStatus> for OrderStatus {
+    type Error = OKXOrderStatus;
+
+    /// Converts an OKX order status into the matching Nautilus [`OrderStatus`].
+    ///
+    /// Returns the source variant in the error case for [`OKXOrderStatus::Unknown`],
+    /// which carries any order state OKX adds after this mapping was written.
+    fn try_from(value: OKXOrderStatus) -> Result<Self, Self::Error> {
+        match value {
+            OKXOrderStatus::Live => Ok(Self::Accepted),
+            OKXOrderStatus::PartiallyFilled => Ok(Self::PartiallyFilled),
+            OKXOrderStatus::Filled => Ok(Self::Filled),
+            OKXOrderStatus::Canceled | OKXOrderStatus::MmpCanceled => Ok(Self::Canceled),
+            OKXOrderStatus::Unknown => Err(value),
         }
     }
 }
 
-impl From<OKXAlgoOrderStatus> for OrderStatus {
-    fn from(status: OKXAlgoOrderStatus) -> Self {
-        match status {
-            OKXAlgoOrderStatus::Live | OKXAlgoOrderStatus::Pause => Self::Accepted,
+impl TryFrom<OKXAlgoOrderStatus> for OrderStatus {
+    type Error = OKXAlgoOrderStatus;
+
+    /// Converts an OKX algo order status into the matching Nautilus [`OrderStatus`].
+    ///
+    /// Returns the source variant in the error case for [`OKXAlgoOrderStatus::Unknown`],
+    /// which carries any algo order state OKX adds after this mapping was written.
+    fn try_from(value: OKXAlgoOrderStatus) -> Result<Self, Self::Error> {
+        match value {
+            OKXAlgoOrderStatus::Live | OKXAlgoOrderStatus::Pause => Ok(Self::Accepted),
             OKXAlgoOrderStatus::Effective
             | OKXAlgoOrderStatus::OrderPlaced
-            | OKXAlgoOrderStatus::PartiallyEffective => Self::Triggered,
-            OKXAlgoOrderStatus::Filled => Self::Filled,
-            OKXAlgoOrderStatus::Canceled => Self::Canceled,
-            OKXAlgoOrderStatus::OrderFailed | OKXAlgoOrderStatus::PartiallyFailed => Self::Rejected,
+            | OKXAlgoOrderStatus::PartiallyEffective => Ok(Self::Triggered),
+            OKXAlgoOrderStatus::Filled => Ok(Self::Filled),
+            OKXAlgoOrderStatus::Canceled => Ok(Self::Canceled),
+            OKXAlgoOrderStatus::OrderFailed | OKXAlgoOrderStatus::PartiallyFailed => {
+                Ok(Self::Rejected)
+            }
+            OKXAlgoOrderStatus::Unknown => Err(value),
         }
     }
 }
 
-impl From<OKXOrderType> for OrderType {
-    fn from(ord_type: OKXOrderType) -> Self {
-        match ord_type {
-            OKXOrderType::Market => Self::Market,
+impl TryFrom<OKXOrderType> for OrderType {
+    type Error = OKXOrderType;
+
+    /// Converts an OKX order type into the matching Nautilus [`OrderType`].
+    ///
+    /// Returns the source variant in the error case for [`OKXOrderType::Other`],
+    /// which carries any order type OKX adds after this mapping was written.
+    fn try_from(value: OKXOrderType) -> Result<Self, Self::Error> {
+        match value {
+            OKXOrderType::Market => Ok(Self::Market),
             OKXOrderType::Limit
+            | OKXOrderType::Rpi
             | OKXOrderType::PostOnly
             | OKXOrderType::OptimalLimitIoc
             | OKXOrderType::Mmp
             | OKXOrderType::MmpAndPostOnly
             | OKXOrderType::Fok
             | OKXOrderType::OpFok
-            | OKXOrderType::Ioc => Self::Limit,
-            OKXOrderType::Trigger => Self::StopMarket,
+            | OKXOrderType::Ioc => Ok(Self::Limit),
+            OKXOrderType::Trigger => Ok(Self::StopMarket),
+            OKXOrderType::Other => Err(value),
         }
     }
 }
@@ -1180,7 +1340,7 @@ impl From<PositionSide> for OKXPositionSide {
         match value {
             PositionSide::Long => Self::Long,
             PositionSide::Short => Self::Short,
-            _ => Self::None,
+            PositionSide::Flat => Self::None,
         }
     }
 }
@@ -1207,6 +1367,10 @@ pub enum OKXAlgoOrderType {
     MoveOrderStop,
     Iceberg,
     Twap,
+    Chase,
+    /// Forward-compatible fallback for algo order types OKX adds later.
+    #[serde(other)]
+    Other,
 }
 
 /// Helper to determine if an order type requires algo order handling.
@@ -1251,6 +1415,20 @@ pub fn conditional_order_to_algo_type(order_type: OrderType) -> anyhow::Result<O
     Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.adapters.okx",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
+)]
 pub enum OKXAlgoOrderStatus {
     Live,
     Pause,
@@ -1261,6 +1439,9 @@ pub enum OKXAlgoOrderStatus {
     Filled,
     OrderFailed,
     PartiallyFailed,
+    /// Forward-compatible fallback for algo order states OKX adds later.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Represents the category of an order on OKX.
@@ -1479,7 +1660,7 @@ pub enum OKXQuickMarginType {
     pyo3::pyclass(
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.okx",
+        module = "nautilus_trader.adapters.okx",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -1494,4 +1675,50 @@ pub enum OKXEnvironment {
     Live,
     /// Demo trading environment.
     Demo,
+}
+
+/// OKX API region.
+///
+/// Selects the regional endpoint set. OKX serves region-specific hosts and an
+/// API key registered in one region is rejected by another region's endpoints
+/// (returning `API key doesn't exist`).
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(ascii_case_insensitive, serialize_all = "lowercase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.adapters.okx",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
+)]
+pub enum OKXRegion {
+    /// Global endpoints (accounts registered on www.okx.com).
+    #[default]
+    Global,
+    /// European Economic Area endpoints (accounts registered on my.okx.com).
+    Eea,
+    /// United States and Australia endpoints (accounts registered on app.okx.com).
+    Us,
 }

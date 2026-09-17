@@ -27,6 +27,7 @@ use axum::{
 };
 use nautilus_binance::{
     common::enums::{BinanceEnvironment, BinanceSide, BinanceTimeInForce},
+    config::BinanceInstrumentProviderConfig,
     spot::{
         enums::BinanceSpotOrderType,
         http::{
@@ -36,16 +37,19 @@ use nautilus_binance::{
         sbe::spot::{SBE_SCHEMA_ID, SBE_SCHEMA_VERSION},
     },
 };
-use nautilus_common::testing::wait_until_async;
+use nautilus_common::{cache::InstrumentLookupError, testing::wait_until_async};
 use nautilus_core::time::get_atomic_clock_realtime;
 use nautilus_model::{
     data::BarType,
     enums::{AggregationSource, OrderSide, OrderType, TimeInForce},
     identifiers::{AccountId, ClientOrderId, InstrumentId, VenueOrderId},
+    instruments::Instrument,
     types::{Price, Quantity},
 };
 use nautilus_network::http::HttpClient;
 use rstest::rstest;
+use rust_decimal_macros::dec;
+use ustr::Ustr;
 
 const PING_TEMPLATE_ID: u16 = 101;
 const SERVER_TIME_TEMPLATE_ID: u16 = 102;
@@ -73,6 +77,12 @@ const CANCEL_ORDER_BLOCK_LENGTH: u16 = 137;
 // Filter template IDs (from Binance SBE schema)
 const PRICE_FILTER_TEMPLATE_ID: u16 = 1;
 const LOT_SIZE_FILTER_TEMPLATE_ID: u16 = 4;
+
+#[derive(Debug, Clone, Copy)]
+enum RequiredInstrumentCachePath {
+    Trades,
+    Bars,
+}
 
 fn create_sbe_header(block_length: u16, template_id: u16) -> [u8; 8] {
     let mut header = [0u8; 8];
@@ -607,8 +617,7 @@ fn has_auth_headers(headers: &HeaderMap) -> bool {
 
 async fn wait_for_server(addr: SocketAddr, path: &str) {
     let health_url = format!("http://{addr}{path}");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    let http_client = HttpClient::builder().build().unwrap();
     wait_until_async(
         || {
             let url = health_url.clone();
@@ -660,6 +669,7 @@ fn create_router(state: Arc<TestServerState>) -> Router {
     let klines_state = state.clone();
     let exchange_info_state = state.clone();
     let account_state = state.clone();
+    let account_commission_state = state.clone();
     let open_orders_state = state.clone();
     let all_orders_state = state.clone();
     let order_query_state = state.clone();
@@ -690,7 +700,7 @@ fn create_router(state: Arc<TestServerState>) -> Router {
                         return rate_limit_response().into_response();
                     }
                     // Current time in microseconds
-                    let time_us = chrono::Utc::now().timestamp_micros();
+                    let time_us = jiff::Timestamp::now().as_microsecond();
                     sbe_response(build_server_time_response(time_us)).into_response()
                 }
             }),
@@ -856,6 +866,38 @@ fn create_router(state: Arc<TestServerState>) -> Router {
             ),
         )
         .route(
+            "/api/v3/account/commission",
+            get(
+                move |headers: HeaderMap, Query(params): Query<HashMap<String, String>>| {
+                    let state = account_commission_state.clone();
+                    async move {
+                        if !has_auth_headers(&headers) {
+                            return unauthorized_response().into_response();
+                        }
+
+                        if state.increment_and_check() {
+                            return rate_limit_response().into_response();
+                        }
+
+                        let symbol = params.get("symbol").cloned().unwrap_or_default();
+                        let response = serde_json::json!({
+                            "symbol": symbol,
+                            "standardCommission": {
+                                "maker": "0.000123",
+                                "taker": "0.000456"
+                            }
+                        });
+                        (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            Body::from(response.to_string()),
+                        )
+                            .into_response()
+                    }
+                },
+            ),
+        )
+        .route(
             "/api/v3/myTrades",
             get(
                 move |headers: HeaderMap, Query(params): Query<HashMap<String, String>>| {
@@ -955,6 +997,7 @@ fn create_router(state: Arc<TestServerState>) -> Router {
                         if state.increment_and_check() {
                             return rate_limit_response().into_response();
                         }
+
                         let symbol = params
                             .get("symbol")
                             .cloned()
@@ -987,6 +1030,7 @@ fn create_router(state: Arc<TestServerState>) -> Router {
                         if state.increment_and_check() {
                             return rate_limit_response().into_response();
                         }
+
                         let symbol = params
                             .get("symbol")
                             .cloned()
@@ -1026,6 +1070,7 @@ fn create_router(state: Arc<TestServerState>) -> Router {
                         if state.increment_and_check() {
                             return rate_limit_response().into_response();
                         }
+
                         let symbol = params
                             .get("symbol")
                             .cloned()
@@ -1065,6 +1110,7 @@ fn create_router(state: Arc<TestServerState>) -> Router {
                         if state.increment_and_check() {
                             return rate_limit_response().into_response();
                         }
+
                         let symbol = params
                             .get("symbol")
                             .cloned()
@@ -1443,6 +1489,93 @@ async fn test_domain_client_request_instruments() {
 
 #[rstest]
 #[tokio::test]
+async fn test_domain_client_applies_instrument_selection_fallback_fees_and_cache_replacement() {
+    let addr = start_test_server(Arc::new(TestServerState::default())).await;
+    let base_url = format!("http://{addr}");
+    let client = BinanceSpotHttpClient::new(
+        BinanceEnvironment::Live,
+        get_atomic_clock_realtime(),
+        None,
+        None,
+        Some(base_url),
+        None,
+        Some(60),
+        None,
+    )
+    .unwrap();
+    let eth_only = BinanceInstrumentProviderConfig {
+        load_all: false,
+        load_ids: Some(vec!["ETHUSDT.BINANCE".to_string()]),
+        filters: HashMap::from([
+            ("bases".to_string(), serde_json::json!("ETH")),
+            ("quotes".to_string(), serde_json::json!(["USDT"])),
+        ]),
+        ..Default::default()
+    };
+
+    let instruments = client
+        .request_instruments_with_config(&eth_only, false)
+        .await
+        .unwrap();
+
+    assert_eq!(instruments.len(), 1);
+    assert_eq!(instruments[0].id(), InstrumentId::from("ETHUSDT.BINANCE"));
+    assert_eq!(instruments[0].maker_fee(), dec!(0.001));
+    assert_eq!(instruments[0].taker_fee(), dec!(0.001));
+    assert!(client.get_instrument(&Ustr::from("ETHUSDT")).is_some());
+    assert!(client.get_instrument(&Ustr::from("BTCUSDT")).is_none());
+
+    let btc_only = BinanceInstrumentProviderConfig {
+        load_all: false,
+        load_ids: Some(vec!["BTCUSDT.BINANCE".to_string()]),
+        ..Default::default()
+    };
+    let refreshed = client
+        .request_instruments_with_config(&btc_only, false)
+        .await
+        .unwrap();
+
+    assert_eq!(refreshed.len(), 1);
+    assert_eq!(refreshed[0].id(), InstrumentId::from("BTCUSDT.BINANCE"));
+    assert!(client.get_instrument(&Ustr::from("ETHUSDT")).is_none());
+    assert!(client.get_instrument(&Ustr::from("BTCUSDT")).is_some());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_domain_client_uses_exact_spot_commission_rates_when_enabled() {
+    let addr = start_test_server(Arc::new(TestServerState::default())).await;
+    let base_url = format!("http://{addr}");
+    let client = BinanceSpotHttpClient::new(
+        BinanceEnvironment::Live,
+        get_atomic_clock_realtime(),
+        Some("test-key".to_string()),
+        Some("test-secret".to_string()),
+        Some(base_url),
+        None,
+        Some(60),
+        None,
+    )
+    .unwrap();
+    let config = BinanceInstrumentProviderConfig {
+        filters: HashMap::from([("symbols".to_string(), serde_json::json!("BTCUSDT"))]),
+        query_commission_rates: true,
+        ..Default::default()
+    };
+
+    let instruments = client
+        .request_instruments_with_config(&config, false)
+        .await
+        .unwrap();
+
+    assert_eq!(instruments.len(), 1);
+    assert_eq!(instruments[0].id(), InstrumentId::from("BTCUSDT.BINANCE"));
+    assert_eq!(instruments[0].maker_fee(), dec!(0.000123));
+    assert_eq!(instruments[0].taker_fee(), dec!(0.000456));
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_new_order_requires_credentials() {
     let addr = start_test_server(Arc::new(TestServerState::default())).await;
     let base_url = format!("http://{addr}");
@@ -1627,6 +1760,45 @@ async fn create_domain_client_with_instruments(
 }
 
 #[rstest]
+#[case::trades(RequiredInstrumentCachePath::Trades)]
+#[case::bars(RequiredInstrumentCachePath::Bars)]
+#[tokio::test]
+async fn test_public_market_data_request_missing_cached_instrument_returns_lookup_error(
+    #[case] path: RequiredInstrumentCachePath,
+) {
+    let client = BinanceSpotHttpClient::new(
+        BinanceEnvironment::Live,
+        get_atomic_clock_realtime(),
+        None,
+        None,
+        Some("http://127.0.0.1:9".to_string()),
+        None,
+        Some(1),
+        None,
+    )
+    .unwrap();
+    let instrument_id = InstrumentId::from("BTCUSDT.BINANCE");
+
+    let result = match path {
+        RequiredInstrumentCachePath::Trades => {
+            client.request_trades(instrument_id, None).await.map(|_| ())
+        }
+        RequiredInstrumentCachePath::Bars => {
+            let bar_type = BarType::from("BTCUSDT.BINANCE-1-MINUTE-LAST-EXTERNAL");
+            client
+                .request_bars(bar_type, None, None, None)
+                .await
+                .map(|_| ())
+        }
+    };
+
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        InstrumentLookupError::not_found(instrument_id).to_string()
+    );
+}
+
+#[rstest]
 #[tokio::test]
 async fn test_domain_request_trades() {
     let addr = start_test_server(Arc::new(TestServerState::default())).await;
@@ -1723,6 +1895,7 @@ async fn test_domain_submit_order() {
             false,
             false,
             None,
+            true,
         )
         .await
         .unwrap();

@@ -33,7 +33,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -41,44 +41,55 @@ use std::{
 use axum::{
     Router,
     extract::{
-        State,
+        Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
 };
-use chrono::{TimeZone, Utc};
 use futures_util::{SinkExt, StreamExt};
+use jiff::Timestamp;
 use nautilus_common::{
     clients::DataClient,
-    live::runner::replace_data_event_sender,
+    live::runner::{replace_data_event_sender, replace_system_event_sender},
     messages::{
-        DataEvent,
+        DataEvent, SystemEvent,
         data::{
             DataResponse, RequestBars, RequestBookDepth, RequestBookSnapshot, RequestFundingRates,
             RequestInstrument, RequestInstruments, RequestQuotes, RequestTrades, SubscribeBars,
             SubscribeBookDeltas, SubscribeBookDepth10, SubscribeFundingRates, SubscribeIndexPrices,
-            SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades, UnsubscribeBars,
-            UnsubscribeBookDeltas, UnsubscribeBookDepth10, UnsubscribeIndexPrices,
+            SubscribeInstrument, SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades,
+            UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth10, UnsubscribeIndexPrices,
             UnsubscribeInstrument, UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
         },
+        system::{SocketState, SocketStateChange},
     },
     testing::wait_until_async,
 };
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_lighter::{
-    common::consts::LIGHTER_VENUE, config::LighterDataClientConfig, data::LighterDataClient,
+    common::{consts::LIGHTER_VENUE, enums::LighterFundingResolution},
+    config::LighterDataClientConfig,
+    data::LighterDataClient,
+    http::{client::LIGHTER_FUNDINGS_MAX_LIMIT, query::LighterFundingsQuery},
 };
+use nautilus_live::{SocketReconnectRegistry, SocketReconnectRequestOutcome};
 use nautilus_model::{
-    data::{BarSpecification, BarType, Data},
-    enums::{AggregationSource, BarAggregation, BookType, PriceType},
-    identifiers::{ClientId, InstrumentId},
+    data::{BarSpecification, BarType, Data, OrderBookDeltas},
+    enums::{AggregationSource, BarAggregation, BookAction, BookType, PriceType, RecordFlag},
+    identifiers::{ClientId, InstrumentId, Venue},
     instruments::Instrument,
+    orderbook::{OrderBook, analysis::book_check_integrity},
+    types::Price,
 };
 use rstest::rstest;
 use serde_json::{Value, json};
+use ustr::Ustr;
 const ETH_PERP_SYMBOL: &str = "ETH-PERP";
+const HISTORY_REQUEST_PAGE_CAP: usize = 500;
+const PRIVATE_KEY_HEX: &str =
+    "0b8e0f63c24d8baacd9d29ad4e9a4b73c4a8d2bb8b16dc4fa9d7c2e1d3a8b1f0e8d3a4c5b6e7f001";
 
 fn data_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data")
@@ -88,6 +99,22 @@ fn load_json(filename: &str) -> Value {
     let content = std::fs::read_to_string(data_path().join(filename))
         .unwrap_or_else(|_| panic!("failed to read {filename}"));
     serde_json::from_str(&content).expect("invalid json")
+}
+
+fn sequential_book_update() -> Value {
+    let mut frame = load_json("ws_order_book_update.json");
+    frame["last_updated_at"] = json!(1_778_138_389_656_150_u64);
+    frame["offset"] = json!(2_165);
+    frame["timestamp"] = json!(1_778_138_583_602_u64);
+    frame["order_book"]["offset"] = json!(2_165);
+    frame["order_book"]["nonce"] = json!(904_846);
+    frame["order_book"]["last_updated_at"] = json!(1_778_138_389_656_150_u64);
+    frame["order_book"]["begin_nonce"] = json!(904_845);
+    frame["order_book"]["bids"] = json!([
+        {"price": "2000.00", "size": "0.0500"},
+        {"price": "1999.00", "size": "0.0100"}
+    ]);
+    frame
 }
 
 fn eth_perp_id() -> InstrumentId {
@@ -103,10 +130,13 @@ struct TestServerState {
     connection_count: Arc<tokio::sync::Mutex<usize>>,
     subscribes: Arc<tokio::sync::Mutex<Vec<Value>>>,
     unsubscribes: Arc<tokio::sync::Mutex<Vec<Value>>>,
+    subscribe_errors: Arc<tokio::sync::Mutex<Vec<u64>>>,
     /// Frames queued by tests, drained one per `subscribe` ack in FIFO order.
     push_after_subscribe: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// When set, the server closes the socket after sending the next subscribe ack.
     drop_after_next_subscribe: Arc<AtomicBool>,
+    funding_cap: Arc<AtomicBool>,
+    funding_calls: Arc<AtomicUsize>,
 }
 
 impl TestServerState {
@@ -123,6 +153,19 @@ impl TestServerState {
             .lock()
             .await
             .push(frame.to_string());
+    }
+
+    async fn enqueue_subscribe_error(&self, code: u64) {
+        self.subscribe_errors.lock().await.push(code);
+    }
+
+    async fn pop_subscribe_error(&self) -> Option<u64> {
+        let mut errors = self.subscribe_errors.lock().await;
+        if errors.is_empty() {
+            None
+        } else {
+            Some(errors.remove(0))
+        }
     }
 
     async fn pop_push(&self) -> Option<String> {
@@ -159,7 +202,21 @@ async fn recent_trades() -> Response {
         .into_response()
 }
 
-async fn fundings() -> Response {
+async fn fundings(
+    State(state): State<Arc<TestServerState>>,
+    Query(query): Query<LighterFundingsQuery>,
+) -> Response {
+    if state.funding_cap.load(Ordering::SeqCst) {
+        assert_eq!(query.resolution, LighterFundingResolution::OneHour,);
+        assert_eq!(query.count_back, i64::from(LIGHTER_FUNDINGS_MAX_LIMIT));
+        state.funding_calls.fetch_add(1, Ordering::SeqCst);
+        return (
+            StatusCode::OK,
+            json!({"code": 200, "resolution": "1h", "fundings": []}).to_string(),
+        )
+            .into_response();
+    }
+
     (
         StatusCode::OK,
         std::fs::read_to_string(data_path().join("http_fundings.json")).unwrap(),
@@ -206,6 +263,23 @@ async fn handle_socket(socket: WebSocket, state: Arc<TestServerState>) {
                 match kind {
                     "subscribe" => {
                         state.subscribes.lock().await.push(value.clone());
+
+                        if let Some(code) = state.pop_subscribe_error().await {
+                            let error = json!({
+                                "type": "error",
+                                "code": code,
+                                "message": "injected subscribe failure",
+                            });
+
+                            if sink
+                                .send(Message::Text(error.to_string().into()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            continue;
+                        }
 
                         let channel = value
                             .get("channel")
@@ -290,8 +364,11 @@ async fn start_server() -> (SocketAddr, Arc<TestServerState>) {
     tokio::spawn(async move {
         axum::serve(listener, router).await.expect("serve");
     });
-    // Give axum a moment to start accepting connections before tests dial in.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_until_async(
+        || async { tokio::net::TcpStream::connect(addr).await.is_ok() },
+        Duration::from_secs(2),
+    )
+    .await;
     (addr, state)
 }
 
@@ -299,6 +376,9 @@ fn build_config(addr: SocketAddr) -> LighterDataClientConfig {
     LighterDataClientConfig {
         base_url_http: Some(format!("http://{addr}")),
         base_url_ws: Some(format!("ws://{addr}/stream")),
+        account_index: Some(12_345),
+        api_key_index: Some(5),
+        private_key: Some(PRIVATE_KEY_HEX.to_string()),
         // Disable the periodic refresh loop; tests drive bootstrap directly
         // via `connect()` and request_instruments(). A nonzero interval would
         // leak a background task across the entire crate's test run.
@@ -322,6 +402,34 @@ fn build_client(
     replace_data_event_sender(sender);
     let client = LighterDataClient::new(client_id(), config).expect("construct data client");
     (client, receiver)
+}
+
+/// Installs a fresh system event sender before building the client, so the data
+/// client captures it and attaches a socket state sink to its WebSocket client.
+fn build_client_with_system_events(
+    config: LighterDataClientConfig,
+) -> (
+    LighterDataClient,
+    tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    tokio::sync::mpsc::UnboundedReceiver<SystemEvent>,
+) {
+    let (system_sender, system_receiver) = tokio::sync::mpsc::unbounded_channel();
+    replace_system_event_sender(system_sender);
+    let (client, receiver) = build_client(config);
+    (client, receiver, system_receiver)
+}
+
+/// Awaits the next socket state change emitted on the system event channel.
+async fn next_socket_state(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<SystemEvent>,
+) -> SocketStateChange {
+    let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timed out waiting for a socket state change")
+        .expect("system event channel closed");
+    let SystemEvent::SocketState(change) = event;
+
+    change
 }
 
 /// Pulls every event currently sitting in the receiver, returning the count.
@@ -373,6 +481,17 @@ async fn await_subscribe_count(state: &TestServerState, target: usize) {
     .await;
 }
 
+async fn await_connection_count(state: &TestServerState, target: usize) {
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { *state.connection_count.lock().await == target }
+        },
+        Duration::from_secs(2),
+    )
+    .await;
+}
+
 async fn await_unsubscribe_count(state: &TestServerState, target: usize) {
     wait_until_async(
         || {
@@ -382,6 +501,67 @@ async fn await_unsubscribe_count(state: &TestServerState, target: usize) {
         Duration::from_secs(2),
     )
     .await;
+}
+
+async fn collect_managed_book_batches(
+    client: &mut LighterDataClient,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    state: &TestServerState,
+) -> (OrderBookDeltas, OrderBookDeltas) {
+    state
+        .enqueue_push(load_json("ws_order_book_subscribed.json"))
+        .await;
+
+    let instrument_id = eth_perp_id();
+    client
+        .subscribe_book_deltas(SubscribeBookDeltas::new(
+            instrument_id,
+            BookType::L2_MBP,
+            Some(client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            NonZeroUsize::new(10),
+            true,
+            None,
+            None,
+        ))
+        .expect("subscribe managed book deltas");
+
+    await_subscribe_count(state, 1).await;
+    let snapshot = next_event_matching(rx, Duration::from_secs(2), |event| {
+        matches!(event, DataEvent::Data(Data::Deltas(_)))
+    })
+    .await
+    .expect("expected snapshot deltas");
+    let DataEvent::Data(Data::Deltas(snapshot)) = snapshot else {
+        unreachable!("event predicate requires deltas")
+    };
+
+    state.enqueue_push(sequential_book_update()).await;
+    client
+        .subscribe_quotes(SubscribeQuotes::new(
+            instrument_id,
+            Some(client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .expect("trigger incremental book push");
+
+    await_subscribe_count(state, 2).await;
+    let incremental = next_event_matching(rx, Duration::from_secs(2), |event| {
+        matches!(event, DataEvent::Data(Data::Deltas(_)))
+    })
+    .await
+    .expect("expected incremental deltas");
+    let DataEvent::Data(Data::Deltas(incremental)) = incremental else {
+        unreachable!("event predicate requires deltas")
+    };
+
+    (*snapshot, *incremental)
 }
 
 #[rstest]
@@ -395,26 +575,71 @@ async fn test_connect_disconnect_lifecycle() {
     client.connect().await.expect("connect");
     assert!(client.is_connected());
 
-    wait_until_async(
-        || {
-            let state = Arc::clone(&state);
-            async move { *state.connection_count.lock().await == 1 }
-        },
-        Duration::from_secs(2),
-    )
-    .await;
+    await_connection_count(&state, 1).await;
 
     client.disconnect().await.expect("disconnect");
     assert!(!client.is_connected());
 
-    wait_until_async(
-        || {
-            let state = Arc::clone(&state);
-            async move { *state.connection_count.lock().await == 0 }
-        },
-        Duration::from_secs(2),
-    )
-    .await;
+    await_connection_count(&state, 0).await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_stop_disconnects_websocket_client() {
+    let (addr, state) = start_server().await;
+    let (mut client, _rx) = build_client(build_config(addr));
+
+    client.connect().await.expect("connect");
+    await_connection_count(&state, 1).await;
+
+    client.stop().expect("stop");
+
+    assert!(!client.is_connected());
+    await_connection_count(&state, 0).await;
+
+    client.connect().await.expect("reconnect");
+    assert!(client.is_connected());
+    await_connection_count(&state, 1).await;
+
+    client.disconnect().await.expect("disconnect");
+    await_connection_count(&state, 0).await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_reset_disconnects_websocket_client_and_allows_reconnect() {
+    let (addr, state) = start_server().await;
+    let (mut client, _rx) = build_client(build_config(addr));
+
+    client.connect().await.expect("connect");
+    await_connection_count(&state, 1).await;
+
+    client.reset().expect("reset");
+
+    assert!(!client.is_connected());
+    await_connection_count(&state, 0).await;
+
+    client.connect().await.expect("reconnect");
+    assert!(client.is_connected());
+    await_connection_count(&state, 1).await;
+
+    client.disconnect().await.expect("disconnect");
+    await_connection_count(&state, 0).await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_dispose_disconnects_websocket_client() {
+    let (addr, state) = start_server().await;
+    let (mut client, _rx) = build_client(build_config(addr));
+
+    client.connect().await.expect("connect");
+    await_connection_count(&state, 1).await;
+
+    client.dispose().expect("dispose");
+
+    assert!(!client.is_connected());
+    await_connection_count(&state, 0).await;
 }
 
 #[rstest]
@@ -438,6 +663,45 @@ async fn test_connect_emits_instrument_event() {
         }
         other => panic!("expected Instrument event, was {other:?}"),
     }
+
+    client.disconnect().await.expect("disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_subscribe_instrument_replays_cached_instrument() {
+    let (addr, state) = start_server().await;
+    let (mut client, mut rx) = build_client(build_config(addr));
+
+    client.connect().await.expect("connect");
+    drain_pending(&mut rx);
+
+    client
+        .subscribe_instrument(SubscribeInstrument::new(
+            eth_perp_id(),
+            Some(client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .expect("subscribe_instrument");
+
+    let event = next_event_matching(&mut rx, Duration::from_secs(2), |event| {
+        matches!(event, DataEvent::Instrument(_))
+    })
+    .await
+    .expect("expected cached instrument replay");
+    let DataEvent::Instrument(instrument) = event else {
+        unreachable!("event predicate requires instrument")
+    };
+
+    assert_eq!(instrument.id(), eth_perp_id());
+    assert_eq!(instrument.price_precision(), 2);
+    assert_eq!(instrument.size_precision(), 4);
+    assert!(!instrument.size_increment().is_zero());
+    assert!(state.subscribes().await.is_empty());
 
     client.disconnect().await.expect("disconnect");
 }
@@ -518,6 +782,85 @@ async fn test_subscribe_book_deltas_emits_deltas() {
         }
         other => panic!("expected Deltas event, was {other:?}"),
     }
+
+    client.disconnect().await.expect("disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_interval_snapshot_managed_feed_emits_snapshot_then_incremental_deltas() {
+    let (addr, state) = start_server().await;
+    let (mut client, mut rx) = build_client(build_config(addr));
+
+    client.connect().await.expect("connect");
+    drain_pending(&mut rx);
+
+    let (snapshot, incremental) = collect_managed_book_batches(&mut client, &mut rx, &state).await;
+
+    assert_eq!(snapshot.instrument_id, eth_perp_id());
+    assert_eq!(snapshot.sequence, 904_845);
+    assert_eq!(snapshot.deltas[0].action, BookAction::Clear);
+    assert!(
+        snapshot
+            .deltas
+            .iter()
+            .any(|delta| delta.flags & RecordFlag::F_SNAPSHOT as u8 != 0),
+    );
+    assert_eq!(incremental.instrument_id, eth_perp_id());
+    assert_eq!(incremental.sequence, 904_846);
+    assert!(
+        incremental
+            .deltas
+            .iter()
+            .all(|delta| delta.flags & RecordFlag::F_SNAPSHOT as u8 == 0),
+    );
+
+    client.disconnect().await.expect("disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_managed_book_applies_snapshot_and_incremental_with_integrity() {
+    let (addr, state) = start_server().await;
+    let (mut client, mut rx) = build_client(build_config(addr));
+
+    client.connect().await.expect("connect");
+    drain_pending(&mut rx);
+
+    let (snapshot, incremental) = collect_managed_book_batches(&mut client, &mut rx, &state).await;
+    let mut book = OrderBook::new(eth_perp_id(), BookType::L2_MBP);
+
+    book.apply_deltas(&snapshot)
+        .expect("apply initial book snapshot");
+    let updates_after_snapshot = book.update_count;
+
+    assert_eq!(book.best_bid_price(), Some(Price::from("2000.00")));
+    assert_eq!(book.best_ask_price(), Some(Price::from("2325.00")));
+    assert!(book.bids(None).next().is_some());
+    assert!(book.asks(None).next().is_some());
+    assert_eq!(book_check_integrity(&book), Ok(()));
+
+    book.apply_deltas(&incremental)
+        .expect("apply incremental book update");
+    let bid_prices: Vec<_> = book.bids(None).map(|level| level.price.value).collect();
+    let ask_prices: Vec<_> = book.asks(None).map(|level| level.price.value).collect();
+
+    assert!(book.update_count > updates_after_snapshot);
+    assert_eq!(book.sequence, 904_846);
+    assert_eq!(book.best_ask_price(), Some(Price::from("2064.54")));
+    assert_eq!(
+        bid_prices,
+        vec![Price::from("2000.00"), Price::from("1999.00")],
+    );
+    assert_eq!(
+        ask_prices,
+        vec![
+            Price::from("2064.54"),
+            Price::from("2325.00"),
+            Price::from("2341.25"),
+        ],
+    );
+    assert_eq!(book_check_integrity(&book), Ok(()));
 
     client.disconnect().await.expect("disconnect");
 }
@@ -751,11 +1094,11 @@ async fn test_subscribe_mark_index_funding_share_one_ws_subscription() {
         };
 
         match event {
-            DataEvent::Data(Data::MarkPriceUpdate(update)) => {
+            DataEvent::Data(Data::MarkPrice(update)) => {
                 saw_mark = true;
                 assert_eq!(update.instrument_id, instrument_id);
             }
-            DataEvent::Data(Data::IndexPriceUpdate(update)) => {
+            DataEvent::Data(Data::IndexPrice(update)) => {
                 saw_index = true;
                 assert_eq!(update.instrument_id, instrument_id);
             }
@@ -774,6 +1117,91 @@ async fn test_subscribe_mark_index_funding_share_one_ws_subscription() {
     assert!(saw_mark, "expected mark price event");
     assert!(saw_index, "expected index price event");
     assert!(saw_funding, "expected funding rate event");
+
+    client.disconnect().await.expect("disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_market_stats_retry_preserves_kinds_piggybacked_on_failed_attempt() {
+    let (addr, state) = start_server().await;
+    let (mut client, mut rx) = build_client(build_config(addr));
+
+    client.connect().await.expect("connect");
+    drain_pending(&mut rx);
+
+    state.enqueue_subscribe_error(30_009).await;
+    state
+        .enqueue_push(load_json("ws_market_stats_update_single.json"))
+        .await;
+
+    let instrument_id = eth_perp_id();
+    client
+        .subscribe_mark_prices(SubscribeMarkPrices::new(
+            instrument_id,
+            Some(client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .expect("subscribe_mark_prices");
+    client
+        .subscribe_index_prices(SubscribeIndexPrices::new(
+            instrument_id,
+            Some(client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .expect("subscribe_index_prices");
+
+    await_subscribe_count(&state, 2).await;
+    let subscribes = state.subscribes().await;
+    assert_eq!(subscribes.len(), 2);
+    assert_eq!(subscribes[0]["channel"], "market_stats/0");
+    assert_eq!(subscribes[1]["channel"], "market_stats/0");
+
+    let mut saw_mark = false;
+    let mut saw_index = false;
+
+    for _ in 0..4 {
+        let Some(event) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .ok()
+            .flatten()
+        else {
+            break;
+        };
+
+        match event {
+            DataEvent::Data(Data::MarkPrice(update)) => {
+                saw_mark = true;
+                assert_eq!(update.instrument_id, instrument_id);
+            }
+            DataEvent::Data(Data::IndexPrice(update)) => {
+                saw_index = true;
+                assert_eq!(update.instrument_id, instrument_id);
+            }
+            _ => {}
+        }
+
+        if saw_mark && saw_index {
+            break;
+        }
+    }
+
+    assert!(
+        saw_mark,
+        "mark-price request must survive the failed attempt"
+    );
+    assert!(
+        saw_index,
+        "piggybacked index-price request must survive the retry"
+    );
 
     client.disconnect().await.expect("disconnect");
 }
@@ -1406,14 +1834,8 @@ async fn test_request_bars_emits_response() {
         BarSpecification::new(1, BarAggregation::Minute, PriceType::Last),
         AggregationSource::External,
     );
-    let start = Utc
-        .timestamp_millis_opt(1_700_000_000_000)
-        .single()
-        .unwrap();
-    let end = Utc
-        .timestamp_millis_opt(1_700_000_120_000)
-        .single()
-        .unwrap();
+    let start = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
+    let end = Timestamp::from_millisecond(1_700_000_120_000).unwrap();
 
     client
         .request_bars(RequestBars::new(
@@ -1451,14 +1873,8 @@ async fn test_request_funding_rates_emits_response() {
     client.connect().await.expect("connect");
     drain_pending(&mut rx);
 
-    let start = Utc
-        .timestamp_millis_opt(1_778_702_400_000)
-        .single()
-        .unwrap();
-    let end = Utc
-        .timestamp_millis_opt(1_778_706_000_000)
-        .single()
-        .unwrap();
+    let start = Timestamp::from_millisecond(1_778_702_400_000).unwrap();
+    let end = Timestamp::from_millisecond(1_778_706_000_000).unwrap();
 
     client
         .request_funding_rates(RequestFundingRates::new(
@@ -1483,6 +1899,59 @@ async fn test_request_funding_rates_emits_response() {
         assert_eq!(response.instrument_id, eth_perp_id());
         assert_eq!(response.data.len(), 2);
     }
+
+    client.disconnect().await.expect("disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_funding_rates_does_not_emit_partial_response_at_page_cap() {
+    let (addr, state) = start_server().await;
+    let mut config = build_config(addr);
+    config.rest_quota_per_min = Some(600_000);
+    let (mut client, mut rx) = build_client(config);
+
+    client.connect().await.expect("connect");
+    drain_pending(&mut rx);
+    state.funding_cap.store(true, Ordering::SeqCst);
+
+    let start = Timestamp::from_millisecond(0).unwrap();
+    let interval_ms = LighterFundingResolution::OneHour.interval_millis();
+    let page_span_ms = i64::from(LIGHTER_FUNDINGS_MAX_LIMIT - 1) * interval_ms;
+    let end_ms = i64::try_from(HISTORY_REQUEST_PAGE_CAP + 1).unwrap() * page_span_ms;
+    let end = Timestamp::from_millisecond(end_ms).unwrap();
+
+    client
+        .request_funding_rates(RequestFundingRates::new(
+            eth_perp_id(),
+            Some(start),
+            Some(end),
+            None,
+            Some(client_id()),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        ))
+        .expect("request_funding_rates");
+
+    wait_until_async(
+        || {
+            let state = Arc::clone(&state);
+            async move { state.funding_calls.load(Ordering::SeqCst) == HISTORY_REQUEST_PAGE_CAP }
+        },
+        Duration::from_secs(2),
+    )
+    .await;
+    let response = next_event_matching(&mut rx, Duration::from_millis(100), |e| {
+        matches!(e, DataEvent::Response(DataResponse::FundingRates(_)))
+    })
+    .await;
+
+    assert_eq!(
+        state.funding_calls.load(Ordering::SeqCst),
+        HISTORY_REQUEST_PAGE_CAP,
+    );
+    assert!(response.is_none());
 
     client.disconnect().await.expect("disconnect");
 }
@@ -1601,6 +2070,120 @@ async fn test_unsubscribe_bars_is_noop_for_unsupported_resolution() {
             None,
         ))
         .expect("unsubscribe_bars must not error on unsupported resolution");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_socket_state_events_use_configured_venue() {
+    let (addr, state) = start_server().await;
+    let venue = Venue::new("LIGHTER_CUSTOM");
+    let mut config = build_config(addr);
+    config.venue = Some(venue);
+    let (mut client, _rx, mut system_rx) = build_client_with_system_events(config);
+
+    client.connect().await.expect("connect");
+    await_connection_count(&state, 1).await;
+
+    let change = next_socket_state(&mut system_rx).await;
+    let endpoint = Ustr::from("lighter-data-streams");
+
+    assert_eq!(DataClient::client_id(&client), client_id());
+    assert_eq!(DataClient::venue(&client), Some(venue));
+    assert_eq!(change.client_id, client_id());
+    assert_eq!(change.venue, Some(venue));
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Connected);
+
+    client.disconnect().await.expect("disconnect");
+    await_connection_count(&state, 0).await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_socket_state_events_survive_websocket_client_replacement() {
+    let (addr, state) = start_server().await;
+    let registry = SocketReconnectRegistry::default();
+    let (mut client, _rx, mut system_rx) =
+        registry.scope(|| build_client_with_system_events(build_config(addr)));
+
+    client.connect().await.expect("connect");
+    await_connection_count(&state, 1).await;
+
+    let change = next_socket_state(&mut system_rx).await;
+
+    // `stop()` swaps in a freshly built WebSocket client. The replacement must
+    // carry the sink, or socket state reporting dies after the first cycle.
+    client.stop().expect("stop");
+    await_connection_count(&state, 0).await;
+
+    client.connect().await.expect("reconnect");
+    await_connection_count(&state, 1).await;
+
+    let replacement = next_socket_state(&mut system_rx).await;
+    let endpoint = Ustr::from("lighter-data-streams");
+    let handle = registry.handle(client_id(), endpoint).unwrap();
+
+    assert_eq!(change.client_id, client_id());
+    assert_eq!(change.venue, Some(*LIGHTER_VENUE));
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Connected);
+    assert_eq!(replacement.client_id, client_id());
+    assert_eq!(replacement.venue, Some(*LIGHTER_VENUE));
+    assert_eq!(replacement.endpoint, endpoint);
+    assert_eq!(replacement.state, SocketState::Connected);
+    assert_eq!(
+        handle.request_reconnect(),
+        SocketReconnectRequestOutcome::Accepted
+    );
+
+    let reconnect = next_socket_state(&mut system_rx).await;
+    assert_eq!(reconnect.client_id, client_id());
+    assert_eq!(reconnect.venue, Some(*LIGHTER_VENUE));
+    assert_eq!(reconnect.endpoint, endpoint);
+    assert_eq!(reconnect.state, SocketState::Disconnected);
+
+    client.disconnect().await.expect("disconnect");
+    assert!(registry.handle(client_id(), endpoint).is_none());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_socket_state_events_report_connection_loss_and_recovery() {
+    let (addr, state) = start_server().await;
+    let (mut client, mut rx, mut system_rx) = build_client_with_system_events(build_config(addr));
+
+    client.connect().await.expect("connect");
+    drain_pending(&mut rx);
+    assert_eq!(
+        next_socket_state(&mut system_rx).await.state,
+        SocketState::Connected
+    );
+
+    // The server acks this subscribe and then closes, so the client observes a
+    // connection loss rather than a deliberate disconnect.
+    state
+        .drop_after_next_subscribe
+        .store(true, Ordering::Relaxed);
+    client
+        .subscribe_trades(SubscribeTrades::new(
+            eth_perp_id(),
+            Some(client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .expect("subscribe_trades");
+    await_subscribe_count(&state, 1).await;
+
+    let lost = next_socket_state(&mut system_rx).await;
+    let recovered = next_socket_state(&mut system_rx).await;
+
+    assert_eq!(lost.endpoint.as_str(), "lighter-data-streams");
+    assert_eq!(lost.state, SocketState::Disconnected);
+    assert_eq!(recovered.endpoint.as_str(), "lighter-data-streams");
+    assert_eq!(recovered.state, SocketState::Connected);
 }
 
 #[rstest]

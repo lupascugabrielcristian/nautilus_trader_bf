@@ -18,7 +18,7 @@ use std::sync::Arc;
 use nautilus_blockchain::{
     config::BlockchainDataClientConfig,
     data::core::BlockchainDataClientCore,
-    exchanges::{find_dex_type_case_insensitive, get_supported_dexes_for_chain},
+    exchanges::{find_dex_type_case_insensitive, get_dex_extended, get_supported_dexes_for_chain},
     rpc::providers::check_infura_rpc_provider,
 };
 use nautilus_core::string::secret::mask_api_key;
@@ -47,6 +47,22 @@ pub(crate) async fn run_sync_dex(
         }
     })?;
 
+    // Fail before connecting to the RPC/database when the DEX cannot discover pools from
+    // PoolCreated logs; without a parser sync-dex would otherwise find zero pools silently.
+    let dex_extended = get_dex_extended(chain.name, &dex_type).ok_or_else(|| {
+        anyhow::anyhow!(
+            "DEX '{dex_type}' is not registered on chain '{}'",
+            chain.name
+        )
+    })?;
+
+    if !dex_extended.supports_pool_discovery() {
+        anyhow::bail!(
+            "DEX '{dex_type}' on chain '{}' cannot be synced: missing a PoolCreated parser for pool discovery.",
+            chain.name
+        );
+    }
+
     let postgres_connect_options = get_postgres_connect_options(
         database.host,
         database.port,
@@ -58,21 +74,20 @@ pub(crate) async fn run_sync_dex(
     let rpc_http_url = rpc_url
         .or_else(|| check_infura_rpc_provider(&chain.name))
         .or_else(|| std::env::var("RPC_HTTP_URL").ok())
-        .unwrap_or_else(|| {
-            panic!(
+        .ok_or_else(|| {
+            anyhow::anyhow!(
                 "No RPC URL provided for {name}. Set --rpc-url, INFURA_API_KEY, or RPC_HTTP_URL",
                 name = chain.name
             )
-        });
+        })?;
 
     // Mask potential API key in URL for logging (key is typically the last path segment)
-    let masked_url = if let Some(idx) = rpc_http_url.rfind('/') {
-        let (base, key) = rpc_http_url.split_at(idx + 1);
+    let masked_url = if let Some((base, key)) = rpc_http_url.rsplit_once('/') {
         if key.is_empty() {
             rpc_http_url.clone()
         } else {
             let masked_key = mask_api_key(key);
-            format!("{base}{masked_key}")
+            format!("{base}/{masked_key}")
         }
     } else {
         // URL without path separator - mask entirely as it may contain credentials

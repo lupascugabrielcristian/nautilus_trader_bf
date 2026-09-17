@@ -20,7 +20,7 @@ use std::{collections::HashMap, str::FromStr, sync::Arc};
 #[allow(unused_imports)]
 use arrow::{
     array::{
-        BinaryArray, BinaryBuilder, Float64Array, Float64Builder, Int64Array, Int64Builder,
+        Array, BinaryArray, BinaryBuilder, Float64Array, Float64Builder, Int64Array, Int64Builder,
         StringArray, StringBuilder, UInt8Array, UInt64Array,
     },
     datatypes::{DataType, Field, Schema},
@@ -30,9 +30,9 @@ use arrow::{
 #[allow(unused_imports)]
 use nautilus_core::Params;
 use nautilus_model::{
-    identifiers::InstrumentId,
+    identifiers::{InstrumentId, Symbol},
     instruments::betting::BettingInstrument,
-    types::{price::Price, quantity::Quantity},
+    types::{money::Money, price::Price, quantity::Quantity},
 };
 #[allow(unused)]
 use rust_decimal::Decimal;
@@ -42,13 +42,15 @@ use ustr::Ustr;
 
 use crate::arrow::{
     ArrowSchemaProvider, EncodeToRecordBatch, EncodingError, KEY_INSTRUMENT_ID,
-    KEY_PRICE_PRECISION, KEY_SIZE_PRECISION, extract_column,
+    KEY_PRICE_PRECISION, KEY_SIZE_PRECISION, extract_column, extract_column_by_name_or_index,
+    extract_optional_string_column_by_name, optional_ustr_value,
 };
 
 impl ArrowSchemaProvider for BettingInstrument {
     fn get_schema(metadata: Option<HashMap<String, String>>) -> Schema {
         let fields = vec![
             Field::new("id", DataType::Utf8, false),
+            Field::new("raw_symbol", DataType::Utf8, false),
             Field::new("venue_name", DataType::Utf8, false),
             Field::new("currency", DataType::Utf8, false),
             Field::new("event_type_id", DataType::UInt64, false),
@@ -69,6 +71,19 @@ impl ArrowSchemaProvider for BettingInstrument {
             Field::new("selection_handicap", DataType::Float64, false),
             Field::new("price_precision", DataType::UInt8, false),
             Field::new("size_precision", DataType::UInt8, false),
+            Field::new("price_increment", DataType::Utf8, false),
+            Field::new("size_increment", DataType::Utf8, false),
+            Field::new("max_quantity", DataType::Utf8, true), // nullable
+            Field::new("min_quantity", DataType::Utf8, true), // nullable
+            Field::new("max_notional", DataType::Utf8, true), // nullable
+            Field::new("min_notional", DataType::Utf8, true), // nullable
+            Field::new("max_price", DataType::Utf8, true),    // nullable
+            Field::new("min_price", DataType::Utf8, true),    // nullable
+            Field::new("margin_init", DataType::Utf8, false),
+            Field::new("margin_maint", DataType::Utf8, false),
+            Field::new("maker_fee", DataType::Utf8, false),
+            Field::new("taker_fee", DataType::Utf8, false),
+            Field::new("tick_scheme", DataType::Utf8, true),
             Field::new("info", DataType::Binary, true), // nullable
             Field::new("ts_event", DataType::UInt64, false),
             Field::new("ts_init", DataType::UInt64, false),
@@ -91,6 +106,7 @@ impl EncodeToRecordBatch for BettingInstrument {
         data: &[Self],
     ) -> Result<RecordBatch, ArrowError> {
         let mut id_builder = StringBuilder::new();
+        let mut raw_symbol_builder = StringBuilder::new();
         let mut venue_name_builder = StringBuilder::new();
         let mut currency_builder = StringBuilder::new();
         let mut event_type_id_builder = UInt64Array::builder(data.len());
@@ -111,12 +127,26 @@ impl EncodeToRecordBatch for BettingInstrument {
         let mut selection_handicap_builder = Float64Array::builder(data.len());
         let mut price_precision_builder = UInt8Array::builder(data.len());
         let mut size_precision_builder = UInt8Array::builder(data.len());
+        let mut price_increment_builder = StringBuilder::new();
+        let mut size_increment_builder = StringBuilder::new();
+        let mut max_quantity_builder = StringBuilder::new();
+        let mut min_quantity_builder = StringBuilder::new();
+        let mut max_notional_builder = StringBuilder::new();
+        let mut min_notional_builder = StringBuilder::new();
+        let mut max_price_builder = StringBuilder::new();
+        let mut min_price_builder = StringBuilder::new();
+        let mut margin_init_builder = StringBuilder::new();
+        let mut margin_maint_builder = StringBuilder::new();
+        let mut maker_fee_builder = StringBuilder::new();
+        let mut taker_fee_builder = StringBuilder::new();
+        let mut tick_scheme_builder = StringBuilder::new();
         let mut info_builder = BinaryBuilder::new();
         let mut ts_event_builder = UInt64Array::builder(data.len());
         let mut ts_init_builder = UInt64Array::builder(data.len());
 
         for bi in data {
             id_builder.append_value(bi.id.to_string());
+            raw_symbol_builder.append_value(bi.raw_symbol);
             // Extract venue_name from instrument_id (format: "SYMBOL.VENUE")
             let venue_name = bi.id.venue.to_string();
             venue_name_builder.append_value(venue_name);
@@ -139,6 +169,55 @@ impl EncodeToRecordBatch for BettingInstrument {
             selection_handicap_builder.append_value(bi.selection_handicap);
             price_precision_builder.append_value(bi.price_precision);
             size_precision_builder.append_value(bi.size_precision);
+            price_increment_builder.append_value(bi.price_increment.to_string());
+            size_increment_builder.append_value(bi.size_increment.to_string());
+
+            if let Some(max_quantity) = bi.max_quantity {
+                max_quantity_builder.append_value(max_quantity.to_string());
+            } else {
+                max_quantity_builder.append_null();
+            }
+
+            if let Some(min_quantity) = bi.min_quantity {
+                min_quantity_builder.append_value(min_quantity.to_string());
+            } else {
+                min_quantity_builder.append_null();
+            }
+
+            if let Some(max_notional) = bi.max_notional {
+                max_notional_builder.append_value(max_notional.to_string());
+            } else {
+                max_notional_builder.append_null();
+            }
+
+            if let Some(min_notional) = bi.min_notional {
+                min_notional_builder.append_value(min_notional.to_string());
+            } else {
+                min_notional_builder.append_null();
+            }
+
+            if let Some(max_price) = bi.max_price {
+                max_price_builder.append_value(max_price.to_string());
+            } else {
+                max_price_builder.append_null();
+            }
+
+            if let Some(min_price) = bi.min_price {
+                min_price_builder.append_value(min_price.to_string());
+            } else {
+                min_price_builder.append_null();
+            }
+
+            margin_init_builder.append_value(bi.margin_init.to_string());
+            margin_maint_builder.append_value(bi.margin_maint.to_string());
+            maker_fee_builder.append_value(bi.maker_fee.to_string());
+            taker_fee_builder.append_value(bi.taker_fee.to_string());
+
+            if let Some(tick_scheme) = bi.tick_scheme {
+                tick_scheme_builder.append_value(tick_scheme);
+            } else {
+                tick_scheme_builder.append_null();
+            }
 
             // Encode info dict as JSON bytes (matching Python's msgspec.json.encode)
             if let Some(ref info) = bi.info {
@@ -167,6 +246,7 @@ impl EncodeToRecordBatch for BettingInstrument {
             Self::get_schema(Some(final_metadata)).into(),
             vec![
                 Arc::new(id_builder.finish()),
+                Arc::new(raw_symbol_builder.finish()),
                 Arc::new(venue_name_builder.finish()),
                 Arc::new(currency_builder.finish()),
                 Arc::new(event_type_id_builder.finish()),
@@ -187,6 +267,19 @@ impl EncodeToRecordBatch for BettingInstrument {
                 Arc::new(selection_handicap_builder.finish()),
                 Arc::new(price_precision_builder.finish()),
                 Arc::new(size_precision_builder.finish()),
+                Arc::new(price_increment_builder.finish()),
+                Arc::new(size_increment_builder.finish()),
+                Arc::new(max_quantity_builder.finish()),
+                Arc::new(min_quantity_builder.finish()),
+                Arc::new(max_notional_builder.finish()),
+                Arc::new(min_notional_builder.finish()),
+                Arc::new(max_price_builder.finish()),
+                Arc::new(min_price_builder.finish()),
+                Arc::new(margin_init_builder.finish()),
+                Arc::new(margin_maint_builder.finish()),
+                Arc::new(maker_fee_builder.finish()),
+                Arc::new(taker_fee_builder.finish()),
+                Arc::new(tick_scheme_builder.finish()),
                 Arc::new(info_builder.finish()),
                 Arc::new(ts_event_builder.finish()),
                 Arc::new(ts_init_builder.finish()),
@@ -223,52 +316,80 @@ pub fn decode_betting_instrument_batch(
     let num_rows = record_batch.num_rows();
 
     let id_values = extract_column::<StringArray>(cols, "id", 0, DataType::Utf8)?;
-    let _venue_name_values = extract_column::<StringArray>(cols, "venue_name", 1, DataType::Utf8)?; // Not used, extracted from id
-    let currency_values = extract_column::<StringArray>(cols, "currency", 2, DataType::Utf8)?;
+    let raw_symbol_values = extract_column::<StringArray>(cols, "raw_symbol", 1, DataType::Utf8)?;
+    let _venue_name_values = extract_column::<StringArray>(cols, "venue_name", 2, DataType::Utf8)?; // Not used, extracted from id
+    let currency_values = extract_column::<StringArray>(cols, "currency", 3, DataType::Utf8)?;
     let event_type_id_values =
-        extract_column::<UInt64Array>(cols, "event_type_id", 3, DataType::UInt64)?;
+        extract_column::<UInt64Array>(cols, "event_type_id", 4, DataType::UInt64)?;
     let event_type_name_values =
-        extract_column::<StringArray>(cols, "event_type_name", 4, DataType::Utf8)?;
+        extract_column::<StringArray>(cols, "event_type_name", 5, DataType::Utf8)?;
     let competition_id_values =
-        extract_column::<UInt64Array>(cols, "competition_id", 5, DataType::UInt64)?;
+        extract_column::<UInt64Array>(cols, "competition_id", 6, DataType::UInt64)?;
     let competition_name_values =
-        extract_column::<StringArray>(cols, "competition_name", 6, DataType::Utf8)?;
-    let event_id_values = extract_column::<UInt64Array>(cols, "event_id", 7, DataType::UInt64)?;
-    let event_name_values = extract_column::<StringArray>(cols, "event_name", 8, DataType::Utf8)?;
+        extract_column::<StringArray>(cols, "competition_name", 7, DataType::Utf8)?;
+    let event_id_values = extract_column::<UInt64Array>(cols, "event_id", 8, DataType::UInt64)?;
+    let event_name_values = extract_column::<StringArray>(cols, "event_name", 9, DataType::Utf8)?;
     let event_country_code_values =
-        extract_column::<StringArray>(cols, "event_country_code", 9, DataType::Utf8)?;
+        extract_column::<StringArray>(cols, "event_country_code", 10, DataType::Utf8)?;
     let event_open_date_values =
-        extract_column::<UInt64Array>(cols, "event_open_date", 10, DataType::UInt64)?;
+        extract_column::<UInt64Array>(cols, "event_open_date", 11, DataType::UInt64)?;
     let betting_type_values =
-        extract_column::<StringArray>(cols, "betting_type", 11, DataType::Utf8)?;
-    let market_id_values = extract_column::<StringArray>(cols, "market_id", 12, DataType::Utf8)?;
+        extract_column::<StringArray>(cols, "betting_type", 12, DataType::Utf8)?;
+    let market_id_values = extract_column::<StringArray>(cols, "market_id", 13, DataType::Utf8)?;
     let market_name_values =
-        extract_column::<StringArray>(cols, "market_name", 13, DataType::Utf8)?;
+        extract_column::<StringArray>(cols, "market_name", 14, DataType::Utf8)?;
     let market_type_values =
-        extract_column::<StringArray>(cols, "market_type", 14, DataType::Utf8)?;
+        extract_column::<StringArray>(cols, "market_type", 15, DataType::Utf8)?;
     let market_start_time_values =
-        extract_column::<UInt64Array>(cols, "market_start_time", 15, DataType::UInt64)?;
+        extract_column::<UInt64Array>(cols, "market_start_time", 16, DataType::UInt64)?;
     let selection_id_values =
-        extract_column::<UInt64Array>(cols, "selection_id", 16, DataType::UInt64)?;
+        extract_column::<UInt64Array>(cols, "selection_id", 17, DataType::UInt64)?;
     let selection_name_values =
-        extract_column::<StringArray>(cols, "selection_name", 17, DataType::Utf8)?;
+        extract_column::<StringArray>(cols, "selection_name", 18, DataType::Utf8)?;
     let selection_handicap_values =
-        extract_column::<Float64Array>(cols, "selection_handicap", 18, DataType::Float64)?;
+        extract_column::<Float64Array>(cols, "selection_handicap", 19, DataType::Float64)?;
     let price_precision_values =
-        extract_column::<UInt8Array>(cols, "price_precision", 19, DataType::UInt8)?;
+        extract_column::<UInt8Array>(cols, "price_precision", 20, DataType::UInt8)?;
     let size_precision_values =
-        extract_column::<UInt8Array>(cols, "size_precision", 20, DataType::UInt8)?;
-    let info_values = cols
-        .get(21)
-        .ok_or_else(|| EncodingError::MissingColumn("info", 21))?;
-    let ts_event_values = extract_column::<UInt64Array>(cols, "ts_event", 22, DataType::UInt64)?;
-    let ts_init_values = extract_column::<UInt64Array>(cols, "ts_init", 23, DataType::UInt64)?;
+        extract_column::<UInt8Array>(cols, "size_precision", 21, DataType::UInt8)?;
+    let price_increment_values =
+        extract_column::<StringArray>(cols, "price_increment", 22, DataType::Utf8)?;
+    let size_increment_values =
+        extract_column::<StringArray>(cols, "size_increment", 23, DataType::Utf8)?;
+    let max_quantity_values = extract_optional_string_column_by_name(record_batch, "max_quantity")?;
+    let min_quantity_values = extract_optional_string_column_by_name(record_batch, "min_quantity")?;
+    let max_notional_values = extract_optional_string_column_by_name(record_batch, "max_notional")?;
+    let min_notional_values = extract_optional_string_column_by_name(record_batch, "min_notional")?;
+    let max_price_values = extract_optional_string_column_by_name(record_batch, "max_price")?;
+    let min_price_values = extract_optional_string_column_by_name(record_batch, "min_price")?;
+    let margin_init_values =
+        extract_column::<StringArray>(cols, "margin_init", 30, DataType::Utf8)?;
+    let margin_maint_values =
+        extract_column::<StringArray>(cols, "margin_maint", 31, DataType::Utf8)?;
+    let maker_fee_values = extract_column::<StringArray>(cols, "maker_fee", 32, DataType::Utf8)?;
+    let taker_fee_values = extract_column::<StringArray>(cols, "taker_fee", 33, DataType::Utf8)?;
+    let tick_scheme_values = extract_optional_string_column_by_name(record_batch, "tick_scheme")?;
+    let info_values =
+        extract_column_by_name_or_index::<BinaryArray>(record_batch, "info", 35, DataType::Binary)?;
+    let ts_event_values = extract_column_by_name_or_index::<UInt64Array>(
+        record_batch,
+        "ts_event",
+        36,
+        DataType::UInt64,
+    )?;
+    let ts_init_values = extract_column_by_name_or_index::<UInt64Array>(
+        record_batch,
+        "ts_init",
+        37,
+        DataType::UInt64,
+    )?;
 
     let mut result = Vec::with_capacity(num_rows);
 
     for i in 0..num_rows {
         let id = InstrumentId::from_str(id_values.value(i))
             .map_err(|e| EncodingError::ParseError("id", format!("row {i}: {e}")))?;
+        let raw_symbol = Symbol::from(raw_symbol_values.value(i));
         let currency = super::decode_currency(
             currency_values.value(i),
             "currency",
@@ -294,6 +415,20 @@ pub fn decode_betting_instrument_batch(
         let price_prec = price_precision_values.value(i);
         let size_prec = size_precision_values.value(i);
 
+        let price_increment = Price::from_str(price_increment_values.value(i))
+            .map_err(|e| EncodingError::ParseError("price_increment", format!("row {i}: {e}")))?;
+        let size_increment = Quantity::from_str(size_increment_values.value(i))
+            .map_err(|e| EncodingError::ParseError("size_increment", format!("row {i}: {e}")))?;
+
+        let margin_init = Decimal::from_str(margin_init_values.value(i))
+            .map_err(|e| EncodingError::ParseError("margin_init", format!("row {i}: {e}")))?;
+        let margin_maint = Decimal::from_str(margin_maint_values.value(i))
+            .map_err(|e| EncodingError::ParseError("margin_maint", format!("row {i}: {e}")))?;
+        let maker_fee = Decimal::from_str(maker_fee_values.value(i))
+            .map_err(|e| EncodingError::ParseError("maker_fee", format!("row {i}: {e}")))?;
+        let taker_fee = Decimal::from_str(taker_fee_values.value(i))
+            .map_err(|e| EncodingError::ParseError("taker_fee", format!("row {i}: {e}")))?;
+
         // Decode info dict from JSON bytes (matching Python's msgspec.json.decode)
         let info = if info_values.is_null(i) {
             None
@@ -318,56 +453,177 @@ pub fn decode_betting_instrument_batch(
         let ts_event = nautilus_core::UnixNanos::from(ts_event_values.value(i));
         let ts_init = nautilus_core::UnixNanos::from(ts_init_values.value(i));
 
-        // Note: BettingInstrument requires price_increment and size_increment, but they're not in the Python schema
-        // We'll need to use defaults or extract from price_precision/size_precision
-        // For now, using minimal defaults based on precision
-        let price_increment = Price::new(0.01, price_prec);
-        let size_increment = Quantity::new(1.0, size_prec);
+        let tick_scheme = optional_ustr_value(tick_scheme_values, i);
 
-        // Extract raw_symbol from id's symbol component
-        let raw_symbol = id.symbol;
+        let max_notional = match max_notional_values {
+            Some(column) if !column.is_null(i) => {
+                Some(Money::from_str(column.value(i)).map_err(|e| {
+                    EncodingError::ParseError("max_notional", format!("row {i}: {e}"))
+                })?)
+            }
+            _ => None,
+        };
 
-        let betting_instrument = BettingInstrument::new(
-            id,
-            raw_symbol,
-            event_type_id,
-            event_type_name,
-            competition_id,
-            competition_name,
-            event_id,
-            event_name,
-            event_country_code,
-            event_open_date,
-            betting_type,
-            market_id,
-            market_name,
-            market_type,
-            market_start_time,
-            selection_id,
-            selection_name,
-            selection_handicap,
-            currency,
-            price_prec,
-            size_prec,
-            price_increment,
-            size_increment,
-            None, // max_quantity - not in Python schema
-            None, // min_quantity - not in Python schema
-            None, // max_notional - not in Python schema
-            None, // min_notional - not in Python schema
-            None, // max_price - not in Python schema
-            None, // min_price - not in Python schema
-            None, // margin_init - not in Python schema, will default to 1
-            None, // margin_maint - not in Python schema, will default to 1
-            None, // maker_fee - not in Python schema, will default to 0
-            None, // taker_fee - not in Python schema, will default to 0
-            info,
-            ts_event,
-            ts_init,
-        );
+        let min_notional = match min_notional_values {
+            Some(column) if !column.is_null(i) => {
+                Some(Money::from_str(column.value(i)).map_err(|e| {
+                    EncodingError::ParseError("min_notional", format!("row {i}: {e}"))
+                })?)
+            }
+            _ => None,
+        };
+
+        let betting_instrument = BettingInstrument::builder()
+            .instrument_id(id)
+            .raw_symbol(raw_symbol)
+            .event_type_id(event_type_id)
+            .event_type_name(event_type_name)
+            .competition_id(competition_id)
+            .competition_name(competition_name)
+            .event_id(event_id)
+            .event_name(event_name)
+            .event_country_code(event_country_code)
+            .event_open_date(event_open_date)
+            .betting_type(betting_type)
+            .market_id(market_id)
+            .market_name(market_name)
+            .market_type(market_type)
+            .market_start_time(market_start_time)
+            .selection_id(selection_id)
+            .selection_name(selection_name)
+            .selection_handicap(selection_handicap)
+            .currency(currency)
+            .price_precision(price_prec)
+            .size_precision(size_prec)
+            .price_increment(price_increment)
+            .size_increment(size_increment)
+            .maybe_max_quantity(super::optional_quantity_value(
+                max_quantity_values,
+                "max_quantity",
+                i,
+            )?)
+            .maybe_min_quantity(super::optional_quantity_value(
+                min_quantity_values,
+                "min_quantity",
+                i,
+            )?)
+            .maybe_max_notional(max_notional)
+            .maybe_min_notional(min_notional)
+            .maybe_max_price(super::optional_price_value(
+                max_price_values,
+                "max_price",
+                i,
+            )?)
+            .maybe_min_price(super::optional_price_value(
+                min_price_values,
+                "min_price",
+                i,
+            )?)
+            .margin_init(margin_init)
+            .margin_maint(margin_maint)
+            .maker_fee(maker_fee)
+            .taker_fee(taker_fee)
+            .maybe_tick_scheme(tick_scheme)
+            .maybe_info(info)
+            .ts_event(ts_event)
+            .ts_init(ts_init)
+            .build()
+            .map_err(|e| super::instrument_validation_error::<BettingInstrument>(i, e))?;
 
         result.push(betting_instrument);
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::Arc};
+
+    use arrow::{array::UInt8Array, record_batch::RecordBatch};
+    use nautilus_model::instruments::stubs::betting;
+    use rstest::rstest;
+
+    use super::*;
+    use crate::arrow::EncodeToRecordBatch;
+
+    const PRICE_PRECISION_COLUMN: usize = 20;
+    const SIZE_PRECISION_COLUMN: usize = 21;
+
+    fn betting_batch_with_precision(column_index: usize, precision: u8) -> RecordBatch {
+        betting_batch_with_precision_values(column_index, &[precision])
+    }
+
+    fn betting_batch_with_precision_values(column_index: usize, precisions: &[u8]) -> RecordBatch {
+        let instruments = vec![betting(); precisions.len()];
+        let batch = BettingInstrument::encode_batch(&HashMap::new(), &instruments).unwrap();
+        let mut columns = batch.columns().to_vec();
+        columns[column_index] = Arc::new(UInt8Array::from(precisions.to_vec()));
+
+        RecordBatch::try_new(batch.schema(), columns).unwrap()
+    }
+
+    #[rstest]
+    fn decode_betting_instrument_invalid_price_precision_returns_error() {
+        let batch = betting_batch_with_precision(PRICE_PRECISION_COLUMN, u8::MAX);
+        let error = decode_betting_instrument_batch(&HashMap::new(), &batch).unwrap_err();
+
+        match error {
+            EncodingError::ParseError(field, message) => {
+                assert_eq!(field, super::super::INSTRUMENT_VALIDATION_FIELD);
+                assert!(message.starts_with("row 0:"));
+                assert!(message.contains("price_increment"));
+                assert!(message.contains("precision"));
+            }
+            _ => panic!("Expected instrument parse error, was: {error}"),
+        }
+    }
+
+    #[rstest]
+    fn decode_betting_instrument_invalid_second_row_precision_reports_row_index() {
+        let batch = betting_batch_with_precision_values(PRICE_PRECISION_COLUMN, &[2, u8::MAX]);
+        let error = decode_betting_instrument_batch(&HashMap::new(), &batch).unwrap_err();
+
+        match error {
+            EncodingError::ParseError(field, message) => {
+                assert_eq!(field, super::super::INSTRUMENT_VALIDATION_FIELD);
+                assert!(message.starts_with("row 1:"));
+                assert!(message.contains("price_increment"));
+                assert!(message.contains("precision"));
+            }
+            _ => panic!("Expected instrument parse error, was: {error}"),
+        }
+    }
+
+    #[rstest]
+    fn decode_betting_instrument_invalid_size_precision_returns_error() {
+        let batch = betting_batch_with_precision(SIZE_PRECISION_COLUMN, u8::MAX);
+        let error = decode_betting_instrument_batch(&HashMap::new(), &batch).unwrap_err();
+
+        match error {
+            EncodingError::ParseError(field, message) => {
+                assert_eq!(field, super::super::INSTRUMENT_VALIDATION_FIELD);
+                assert!(message.starts_with("row 0:"));
+                assert!(message.contains("size_increment"));
+                assert!(message.contains("precision"));
+            }
+            _ => panic!("Expected instrument parse error, was: {error}"),
+        }
+    }
+
+    #[rstest]
+    fn decode_betting_instrument_invalid_default_price_increment_returns_error() {
+        let batch = betting_batch_with_precision(PRICE_PRECISION_COLUMN, 1);
+        let error = decode_betting_instrument_batch(&HashMap::new(), &batch).unwrap_err();
+
+        match error {
+            EncodingError::ParseError(field, message) => {
+                assert_eq!(field, super::super::INSTRUMENT_VALIDATION_FIELD);
+                assert!(message.starts_with("row 0:"));
+                assert!(message.contains("BettingInstrument"));
+                assert!(message.contains("price_increment"));
+            }
+            _ => panic!("Expected instrument parse error, was: {error}"),
+        }
+    }
 }

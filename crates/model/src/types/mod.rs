@@ -64,12 +64,12 @@ pub mod money;
 pub mod price;
 pub mod quantity;
 
-#[cfg(any(test, feature = "stubs"))]
+#[cfg(any(test, feature = "test-support"))]
 pub mod stubs;
 
 // Re-exports
 pub use balance::{AccountBalance, MarginBalance};
-pub use currency::Currency;
+pub use currency::{Currency, CurrencyLookupError};
 pub use money::{MONEY_MAX, MONEY_MIN, Money};
 pub use price::{
     ERROR_PRICE, PRICE_ERROR, PRICE_MAX, PRICE_MIN, PRICE_RAW_MAX, PRICE_RAW_MIN, PRICE_UNDEF,

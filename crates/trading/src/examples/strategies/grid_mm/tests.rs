@@ -42,13 +42,15 @@ fn create_strategy(
     max_position: Quantity,
     requote_threshold_bps: u32,
 ) -> GridMarketMaker {
-    let config =
-        GridMarketMakerConfig::new(InstrumentId::from("ETHUSDT-PERP.BINANCE"), max_position)
-            .with_trade_size(Quantity::from("0.100"))
-            .with_num_levels(num_levels)
-            .with_grid_step_bps(grid_step_bps)
-            .with_skew_factor(skew_factor)
-            .with_requote_threshold_bps(requote_threshold_bps);
+    let config = GridMarketMakerConfig::builder()
+        .instrument_id(InstrumentId::from("ETHUSDT-PERP.BINANCE"))
+        .max_position(max_position)
+        .trade_size(Quantity::from("0.100"))
+        .num_levels(num_levels)
+        .grid_step_bps(grid_step_bps)
+        .skew_factor(skew_factor)
+        .requote_threshold_bps(requote_threshold_bps)
+        .build();
 
     let mut strategy = GridMarketMaker::new(config);
     strategy.price_precision = Some(PRECISION);
@@ -70,6 +72,27 @@ fn quote(bid: &str, ask: &str) -> QuoteTick {
         UnixNanos::default(),
         UnixNanos::default(),
     )
+}
+
+#[rstest]
+fn test_config_defaults() {
+    let config = GridMarketMakerConfig::builder()
+        .instrument_id(InstrumentId::from("ETHUSDT-PERP.BINANCE"))
+        .max_position(Quantity::from("10.0"))
+        .build();
+
+    assert_eq!(
+        config.base.strategy_id,
+        Some(StrategyId::from("GRID_MM-001"))
+    );
+    assert_eq!(config.base.order_id_tag, Some("001".to_string()));
+    assert_eq!(config.trade_size, None);
+    assert_eq!(config.num_levels, 3);
+    assert_eq!(config.grid_step_bps, 10);
+    assert_eq!(config.skew_factor, 0.0);
+    assert_eq!(config.requote_threshold_bps, 5);
+    assert_eq!(config.expire_time_secs, None);
+    assert!(!config.on_cancel_resubmit);
 }
 
 #[rstest]
@@ -210,11 +233,11 @@ fn test_grid_orders_empty_when_fully_constrained() {
 
 #[rstest]
 fn test_grid_orders_errors_when_instrument_not_resolved() {
-    let config = GridMarketMakerConfig::new(
-        InstrumentId::from("ETHUSDT-PERP.BINANCE"),
-        Quantity::from("10.0"),
-    )
-    .with_trade_size(Quantity::from("0.100"));
+    let config = GridMarketMakerConfig::builder()
+        .instrument_id(InstrumentId::from("ETHUSDT-PERP.BINANCE"))
+        .max_position(Quantity::from("10.0"))
+        .trade_size(Quantity::from("0.100"))
+        .build();
     let strategy = GridMarketMaker::new(config);
 
     let err = strategy
@@ -230,11 +253,11 @@ fn test_grid_orders_errors_when_instrument_not_resolved() {
 
 #[rstest]
 fn test_on_quote_errors_when_price_precision_not_resolved() {
-    let config = GridMarketMakerConfig::new(
-        InstrumentId::from("ETHUSDT-PERP.BINANCE"),
-        Quantity::from("10.0"),
-    )
-    .with_trade_size(Quantity::from("0.100"));
+    let config = GridMarketMakerConfig::builder()
+        .instrument_id(InstrumentId::from("ETHUSDT-PERP.BINANCE"))
+        .max_position(Quantity::from("10.0"))
+        .trade_size(Quantity::from("0.100"))
+        .build();
     let mut strategy = GridMarketMaker::new(config);
 
     let err = strategy
@@ -255,12 +278,12 @@ fn order_canceled(client_order_id: &str) -> OrderCanceled {
 }
 
 fn create_cancel_resubmit_strategy() -> GridMarketMaker {
-    let config = GridMarketMakerConfig::new(
-        InstrumentId::from("ETHUSDT-PERP.BINANCE"),
-        Quantity::from("10.0"),
-    )
-    .with_trade_size(Quantity::from("0.100"))
-    .with_on_cancel_resubmit(true);
+    let config = GridMarketMakerConfig::builder()
+        .instrument_id(InstrumentId::from("ETHUSDT-PERP.BINANCE"))
+        .max_position(Quantity::from("10.0"))
+        .trade_size(Quantity::from("0.100"))
+        .on_cancel_resubmit(true)
+        .build();
 
     let mut strategy = GridMarketMaker::new(config);
     strategy.price_precision = Some(PRECISION);
@@ -276,7 +299,7 @@ fn test_on_order_canceled_self_cancel_preserves_last_quoted_mid() {
         .insert(ClientOrderId::from("O-001"));
 
     let event = order_canceled("O-001");
-    strategy.on_order_canceled(&event).unwrap();
+    strategy.on_order_canceled(&event);
 
     assert!(strategy.pending_self_cancels.is_empty());
     assert_eq!(strategy.last_quoted_mid, Some(mid("1000.00")));
@@ -289,7 +312,7 @@ fn test_on_order_canceled_protocol_cancel_resets_last_quoted_mid() {
     strategy.last_quoted_mid = Some(mid("1000.00"));
 
     let event = order_canceled("O-999");
-    strategy.on_order_canceled(&event).unwrap();
+    strategy.on_order_canceled(&event);
 
     assert_eq!(strategy.last_quoted_mid, None);
 }
@@ -304,12 +327,12 @@ fn test_on_order_canceled_self_cancel_then_protocol_cancel() {
 
     // Self-cancel consumed
     let self_event = order_canceled("O-001");
-    strategy.on_order_canceled(&self_event).unwrap();
+    strategy.on_order_canceled(&self_event);
     assert_eq!(strategy.last_quoted_mid, Some(mid("1000.00")));
 
     // Protocol cancel triggers reset
     let protocol_event = order_canceled("O-002");
-    strategy.on_order_canceled(&protocol_event).unwrap();
+    strategy.on_order_canceled(&protocol_event);
     assert_eq!(strategy.last_quoted_mid, None);
 }
 
@@ -325,7 +348,7 @@ fn test_on_order_canceled_filled_order_does_not_block_protocol_cancel() {
 
     // O-001 filled (no cancel event) → O-002 is a protocol cancel
     let event = order_canceled("O-002");
-    strategy.on_order_canceled(&event).unwrap();
+    strategy.on_order_canceled(&event);
 
     assert_eq!(strategy.last_quoted_mid, None);
 }
@@ -337,7 +360,7 @@ fn test_on_order_canceled_without_resubmit_does_nothing() {
     strategy.last_quoted_mid = Some(mid("1000.00"));
 
     let event = order_canceled("O-001");
-    strategy.on_order_canceled(&event).unwrap();
+    strategy.on_order_canceled(&event);
 
     assert_eq!(strategy.last_quoted_mid, Some(mid("1000.00")));
 }

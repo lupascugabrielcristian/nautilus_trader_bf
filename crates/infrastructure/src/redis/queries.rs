@@ -17,13 +17,13 @@ use std::{collections::HashMap, str::FromStr};
 
 use ahash::AHashMap;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 use futures::future::join_all;
+use jiff::Timestamp;
 use nautilus_common::{cache::database::CacheMap, enums::SerializationEncoding};
 use nautilus_model::{
     accounts::AccountAny,
     data::{CustomData, DataType, HasTsInit},
-    events::{AccountState, OrderEventAny, OrderFilled},
+    events::{AccountState, OrderEventAny, OrderFilled, PositionSnapshot},
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, PositionId},
     instruments::{InstrumentAny, SyntheticInstrument},
     orders::OrderAny,
@@ -46,6 +46,7 @@ const SYNTHETICS: &str = "synthetics";
 const ACCOUNTS: &str = "accounts";
 const ORDERS: &str = "orders";
 const POSITIONS: &str = "positions";
+const SNAPSHOTS: &str = "snapshots";
 const ACTORS: &str = "actors";
 const STRATEGIES: &str = "strategies";
 const CUSTOM: &str = "custom";
@@ -77,13 +78,25 @@ impl DatabaseQueries {
         encoding: SerializationEncoding,
         payload: &T,
     ) -> anyhow::Result<Vec<u8>> {
-        let mut value = serde_json::to_value(payload)?;
-        convert_timestamps(&mut value);
         match encoding {
-            SerializationEncoding::MsgPack => rmp_serde::to_vec(&value)
-                .map_err(|e| anyhow::anyhow!("Failed to serialize msgpack `payload`: {e}")),
-            SerializationEncoding::Json => serde_json::to_vec(&value)
-                .map_err(|e| anyhow::anyhow!("Failed to serialize json `payload`: {e}")),
+            SerializationEncoding::MsgPack => {
+                let mut value = serde_json::to_value(payload)?;
+                convert_timestamps(&mut value);
+                rmp_serde::to_vec(&value)
+                    .map_err(|e| anyhow::anyhow!("Failed to serialize msgpack `payload`: {e}"))
+            }
+            SerializationEncoding::Json => {
+                let mut value = serde_json::to_value(payload)?;
+                convert_timestamps(&mut value);
+                serde_json::to_vec(&value)
+                    .map_err(|e| anyhow::anyhow!("Failed to serialize json `payload`: {e}"))
+            }
+            SerializationEncoding::Sbe => {
+                anyhow::bail!("SBE encoding is not supported for Redis cache payloads")
+            }
+            SerializationEncoding::Capnp => {
+                anyhow::bail!("Cap'n Proto encoding is not supported for Redis cache payloads")
+            }
         }
     }
 
@@ -101,6 +114,12 @@ impl DatabaseQueries {
                 .map_err(|e| anyhow::anyhow!("Failed to deserialize msgpack `payload`: {e}"))?,
             SerializationEncoding::Json => serde_json::from_slice(payload)
                 .map_err(|e| anyhow::anyhow!("Failed to deserialize json `payload`: {e}"))?,
+            SerializationEncoding::Sbe => {
+                anyhow::bail!("SBE encoding is not supported for Redis cache payloads")
+            }
+            SerializationEncoding::Capnp => {
+                anyhow::bail!("Cap'n Proto encoding is not supported for Redis cache payloads")
+            }
         };
 
         convert_timestamp_strings(&mut value);
@@ -228,7 +247,7 @@ impl DatabaseQueries {
             GENERAL | CURRENCIES | INSTRUMENTS | SYNTHETICS | ACTORS | STRATEGIES => {
                 Self::read_string(&mut con, &full_key).await
             }
-            ACCOUNTS | ORDERS | POSITIONS => Self::read_list(&mut con, &full_key).await,
+            ACCOUNTS | ORDERS | POSITIONS | SNAPSHOTS => Self::read_list(&mut con, &full_key).await,
             _ => anyhow::bail!("Unsupported operation: `read` for collection '{collection}'"),
         }
     }
@@ -338,7 +357,8 @@ impl DatabaseQueries {
         encoding: SerializationEncoding,
     ) -> anyhow::Result<AHashMap<InstrumentId, InstrumentAny>> {
         let mut instruments = AHashMap::new();
-        let pattern = format!("{trader_key}{REDIS_DELIMITER}{INSTRUMENTS}*");
+        let prefix = format!("{trader_key}{REDIS_DELIMITER}{INSTRUMENTS}{REDIS_DELIMITER}");
+        let pattern = format!("{prefix}*");
         log::debug!("Loading {pattern}");
 
         let mut con = con.clone();
@@ -348,23 +368,12 @@ impl DatabaseQueries {
             .iter()
             .map(|key| {
                 let con = con.clone();
+                let prefix = &prefix;
                 async move {
-                    let instrument_id = key
-                        .as_str()
-                        .rsplit(':')
-                        .next()
-                        .ok_or_else(|| {
-                            log::error!("Invalid key format: {key}");
-                            "Invalid key format"
-                        })
-                        .and_then(|code| {
-                            InstrumentId::from_str(code).map_err(|e| {
-                                log::error!("Failed to convert to InstrumentId for {key}: {e}");
-                                "Invalid instrument ID"
-                            })
-                        });
+                    let instrument_id = parse_instrument_key(key, prefix);
 
                     let Ok(instrument_id) = instrument_id else {
+                        log::error!("Failed to parse InstrumentId from Redis key: {key}");
                         return None;
                     };
 
@@ -868,6 +877,18 @@ impl DatabaseQueries {
         position_id: &PositionId,
         encoding: SerializationEncoding,
     ) -> anyhow::Result<Option<Position>> {
+        let snapshot_key =
+            format!("{SNAPSHOTS}{REDIS_DELIMITER}{POSITIONS}{REDIS_DELIMITER}{position_id}");
+        let snapshots = Self::read(con, trader_key, &snapshot_key).await?;
+        for payload in snapshots.iter().rev() {
+            let snapshot: PositionSnapshot = Self::deserialize_payload(encoding, payload)?;
+            if let Some(replay_state) = snapshot.replay_state {
+                return serde_json::from_value(replay_state)
+                    .map(Some)
+                    .map_err(|e| anyhow::anyhow!("Failed to decode position replay state: {e}"));
+            }
+        }
+
         let key = format!("{POSITIONS}{REDIS_DELIMITER}{position_id}");
         let result = Self::read(con, trader_key, &key).await?;
         if result.is_empty() {
@@ -891,7 +912,7 @@ impl DatabaseQueries {
             return Ok(None);
         };
 
-        let mut position = Position::new(&instrument, *first_fill);
+        let mut position = Position::new(&instrument, first_fill.clone());
         for fill in remaining_fills {
             if position.trade_ids().contains(&fill.trade_id) {
                 anyhow::bail!(
@@ -957,6 +978,15 @@ impl DatabaseQueries {
     }
 }
 
+fn parse_instrument_key(key: &str, prefix: &str) -> anyhow::Result<InstrumentId> {
+    let value = key
+        .strip_prefix(prefix)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Invalid instrument key '{key}'"))?;
+    InstrumentId::from_str(value)
+        .map_err(|e| anyhow::anyhow!("Failed to parse instrument ID from key '{key}': {e}"))
+}
+
 fn is_timestamp_field(key: &str) -> bool {
     let expire_match = key == "expire_time_ns";
     let ts_match = key.starts_with("ts_");
@@ -971,8 +1001,9 @@ fn convert_timestamps(value: &mut Value) {
                     && let Value::Number(n) = v
                     && let Some(n) = n.as_u64()
                 {
-                    let dt = DateTime::<Utc>::from_timestamp_nanos(n.cast_signed());
-                    *v = Value::String(dt.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true));
+                    let dt = Timestamp::from_nanosecond(i128::from(n))
+                        .expect("UnixNanos is within Jiff's timestamp range");
+                    *v = Value::String(format!("{dt:.9}"));
                 }
                 convert_timestamps(v);
             }
@@ -992,15 +1023,10 @@ fn convert_timestamp_strings(value: &mut Value) {
             for (key, v) in map {
                 if is_timestamp_field(key)
                     && let Value::String(s) = v
-                    && let Ok(dt) = DateTime::parse_from_rfc3339(s)
+                    && let Ok(dt) = s.parse::<Timestamp>()
                 {
-                    *v = Value::Number(
-                        (dt.with_timezone(&Utc)
-                            .timestamp_nanos_opt()
-                            .expect("Invalid DateTime")
-                            .cast_unsigned())
-                        .into(),
-                    );
+                    let nanos = u64::try_from(dt.as_nanosecond()).expect("Invalid timestamp");
+                    *v = Value::Number(nanos.into());
                 }
                 convert_timestamp_strings(v);
             }
@@ -1011,5 +1037,113 @@ fn convert_timestamp_strings(value: &mut Value) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use nautilus_common::enums::SerializationEncoding;
+    use nautilus_core::UnixNanos;
+    use nautilus_model::{
+        enums::{AccountType, CurrencyType},
+        events::AccountState,
+        identifiers::{AccountId, InstrumentId},
+        types::{AccountBalance, Currency, Money},
+    };
+    use rstest::rstest;
+    use serde::Deserialize;
+
+    use super::{DatabaseQueries, parse_instrument_key};
+
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    struct TimestampPayload {
+        ts_event: UnixNanos,
+        ts_init: UnixNanos,
+    }
+
+    #[rstest]
+    #[case(SerializationEncoding::Json)]
+    #[case(SerializationEncoding::MsgPack)]
+    fn test_deserialize_chrono_timestamp_payload(#[case] encoding: SerializationEncoding) {
+        let json = include_bytes!("../../test_data/redis_cache_timestamp_chrono.json");
+        let payload = match encoding {
+            SerializationEncoding::Json => json.to_vec(),
+            SerializationEncoding::MsgPack => {
+                let value = serde_json::from_slice::<serde_json::Value>(json).unwrap();
+                rmp_serde::to_vec(&value).unwrap()
+            }
+            _ => unreachable!(),
+        };
+
+        let result =
+            DatabaseQueries::deserialize_payload::<TimestampPayload>(encoding, &payload).unwrap();
+
+        assert_eq!(
+            result,
+            TimestampPayload {
+                ts_event: UnixNanos::from(1_123_456_789),
+                ts_init: UnixNanos::from(2_987_654_321),
+            }
+        );
+    }
+
+    #[rstest]
+    #[case(SerializationEncoding::Json)]
+    #[case(SerializationEncoding::MsgPack)]
+    fn test_wallet_account_state_round_trips_unregistered_currency(
+        #[case] encoding: SerializationEncoding,
+    ) {
+        let currency = Currency::new(
+            "ENG729C",
+            6,
+            0,
+            "Cache round-trip token",
+            CurrencyType::Crypto,
+        );
+        let total = Money::from_mantissa_exponent(123_456_789, -6, currency);
+        let state = AccountState::new(
+            AccountId::new("WALLET-CACHE-001"),
+            AccountType::Wallet,
+            vec![AccountBalance::new(total, Money::zero(currency), total)],
+            vec![],
+            true,
+            nautilus_core::UUID4::new(),
+            UnixNanos::from(1),
+            UnixNanos::from(2),
+            None,
+        );
+        assert!(Currency::try_from_str("ENG729C").is_none());
+
+        let payload = DatabaseQueries::serialize_payload(encoding, &state).unwrap();
+        let restored: AccountState =
+            DatabaseQueries::deserialize_payload(encoding, &payload).unwrap();
+        let restored = restored.balances[0];
+
+        assert_eq!(restored.total.raw, total.raw);
+        assert_eq!(restored.locked.raw, 0);
+        assert_eq!(restored.free.raw, total.raw);
+        assert_eq!(restored.currency.code, currency.code);
+        assert_eq!(restored.currency.precision, currency.precision);
+        assert_eq!(restored.currency.iso4217, currency.iso4217);
+        assert_eq!(restored.currency.name, currency.name);
+        assert_eq!(restored.currency.currency_type, currency.currency_type);
+        assert!(Currency::try_from_str("ENG729C").is_none());
+    }
+
+    #[rstest]
+    #[case("0xC31E54c7a869B9FcBEcc14363CF510d1c41fa443.Arbitrum:UniswapV3")]
+    #[case(concat!(
+        "0xc9bc8043294146424a4e4607d8ad837d",
+        "6a659142822bbaaabc83bb57e7447461.Arbitrum:UniswapV4",
+    ))]
+    fn test_parse_instrument_key_preserves_colons_in_venue(#[case] value: &str) {
+        let prefix = "TRADER-001:instruments:";
+        let key = format!("{prefix}{value}");
+
+        let result = parse_instrument_key(&key, prefix).unwrap();
+
+        assert_eq!(result, InstrumentId::from_str(value).unwrap());
     }
 }

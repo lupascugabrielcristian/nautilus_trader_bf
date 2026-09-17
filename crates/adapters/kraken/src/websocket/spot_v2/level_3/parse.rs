@@ -19,7 +19,7 @@ use std::cmp::Ordering;
 
 use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use nautilus_core::nanos::UnixNanos;
 use nautilus_model::{
     data::{BookOrder, OrderBookDelta, OrderBookDeltas},
@@ -28,30 +28,29 @@ use nautilus_model::{
     instruments::{Instrument, any::InstrumentAny},
     types::{Price, Quantity},
 };
+use rust_decimal::Decimal;
 
 use super::{
     book_id::BookOrderIdHasher,
     messages::{KrakenL3EventType, KrakenL3OrderEvent, KrakenL3Snapshot, KrakenL3UpdateData},
 };
 
-fn datetime_to_nanos(value: DateTime<Utc>, field: &str) -> anyhow::Result<UnixNanos> {
-    let nanos = value
-        .timestamp_nanos_opt()
-        .with_context(|| format!("Failed to convert {field}='{value}' to nanoseconds"))?;
-    Ok(UnixNanos::from(u64::try_from(nanos).with_context(
-        || format!("Timestamp predates Unix epoch: {field}='{value}'"),
-    )?))
+fn datetime_to_nanos(value: Timestamp, field: &str) -> anyhow::Result<UnixNanos> {
+    Ok(UnixNanos::from(
+        u64::try_from(value.as_nanosecond())
+            .with_context(|| format!("Timestamp predates Unix epoch: {field}='{value}'"))?,
+    ))
 }
 
 /// Cached state for an open L3 order, used to detect price changes on modify events.
 #[derive(Debug, Clone)]
 pub(crate) struct CachedL3Order {
     /// Last known limit price.
-    pub price: f64,
+    pub price: Decimal,
     /// Original JSON decimal string for `price`, used verbatim in checksum computation.
     pub price_raw: String,
     /// Last known order quantity.
-    pub size: f64,
+    pub size: Decimal,
     /// Original JSON decimal string for `size`, used verbatim in checksum computation.
     pub size_raw: String,
     /// Order side.
@@ -100,14 +99,12 @@ pub(crate) fn parse_l3_snapshot(
     let last_idx = all_orders.len().saturating_sub(1);
 
     for (idx, (order, side)) in all_orders.into_iter().enumerate() {
-        let price =
-            Price::new_checked(order.limit_price.value, price_precision).with_context(|| {
-                format!("Failed to construct Price with precision {price_precision}")
-            })?;
-        let size =
-            Quantity::new_checked(order.order_qty.value, size_precision).with_context(|| {
-                format!("Failed to construct Quantity with precision {size_precision}")
-            })?;
+        let price = Price::from_decimal_dp(order.limit_price.value, price_precision).with_context(
+            || format!("Failed to construct Price with precision {price_precision}"),
+        )?;
+        let size = Quantity::from_decimal_dp(order.order_qty.value, size_precision).with_context(
+            || format!("Failed to construct Quantity with precision {size_precision}"),
+        )?;
 
         let order_id = hasher.hash(&order.order_id);
         let book_order = BookOrder::new(side, price, size, order_id);
@@ -189,11 +186,11 @@ pub(crate) fn parse_l3_update(
 
         match event.event {
             KrakenL3EventType::Add => {
-                let price = Price::new_checked(event.limit_price.value, price_precision)
+                let price = Price::from_decimal_dp(event.limit_price.value, price_precision)
                     .with_context(|| {
                         format!("Failed to construct Price with precision {price_precision}")
                     })?;
-                let size = Quantity::new_checked(event.order_qty.value, size_precision)
+                let size = Quantity::from_decimal_dp(event.order_qty.value, size_precision)
                     .with_context(|| {
                         format!("Failed to construct Quantity with precision {size_precision}")
                     })?;
@@ -227,13 +224,14 @@ pub(crate) fn parse_l3_update(
             }
             KrakenL3EventType::Modify => {
                 if let Some(cached) = open_orders.get_mut(&order_id) {
-                    let new_price = Price::new_checked(event.limit_price.value, price_precision)
-                        .with_context(|| {
-                            format!(
-                                "Failed to construct new Price with precision {price_precision}"
-                            )
-                        })?;
-                    let new_size = Quantity::new_checked(event.order_qty.value, size_precision)
+                    let new_price =
+                        Price::from_decimal_dp(event.limit_price.value, price_precision)
+                            .with_context(|| {
+                                format!(
+                                    "Failed to construct new Price with precision {price_precision}"
+                                )
+                            })?;
+                    let new_size = Quantity::from_decimal_dp(event.order_qty.value, size_precision)
                         .with_context(|| {
                             format!(
                                 "Failed to construct new Quantity with precision {size_precision}"
@@ -263,14 +261,14 @@ pub(crate) fn parse_l3_update(
 
                         deltas.push(delta);
                     } else {
-                        let cached_price = Price::new_checked(cached.price, price_precision)
+                        let cached_price = Price::from_decimal_dp(cached.price, price_precision)
                             .with_context(|| {
                                 format!(
                                     "Failed to construct cached Price with precision \
                                          {price_precision}"
                                 )
                             })?;
-                        let old_size = Quantity::new_checked(cached.size, size_precision)
+                        let old_size = Quantity::from_decimal_dp(cached.size, size_precision)
                             .with_context(|| {
                                 format!(
                                     "Failed to construct old Quantity with precision \
@@ -317,19 +315,19 @@ pub(crate) fn parse_l3_update(
                     }
                 } else {
                     log::warn!(
-                        "Unknown order_id on Modify event: {} — skipping",
+                        "Unknown order_id on Modify event: {} - skipping",
                         event.order_id
                     );
                 }
             }
             KrakenL3EventType::Delete => {
                 if let Some(cached) = open_orders.remove(&order_id) {
-                    let price =
-                        Price::new_checked(cached.price, price_precision).with_context(|| {
+                    let price = Price::from_decimal_dp(cached.price, price_precision)
+                        .with_context(|| {
                             format!("Failed to construct Price with precision {price_precision}")
                         })?;
-                    let size =
-                        Quantity::new_checked(cached.size, size_precision).with_context(|| {
+                    let size = Quantity::from_decimal_dp(cached.size, size_precision)
+                        .with_context(|| {
                             format!("Failed to construct Quantity with precision {size_precision}")
                         })?;
                     let book_order = BookOrder::new(cached.side, price, size, order_id);
@@ -347,7 +345,7 @@ pub(crate) fn parse_l3_update(
                     deltas.push(delta);
                 } else {
                     log::warn!(
-                        "Unknown order_id on Delete event: {} — ignoring",
+                        "Unknown order_id on Delete event: {} - ignoring",
                         event.order_id
                     );
                 }
@@ -396,18 +394,17 @@ fn append_depth_prune_deltas(
         return Ok(());
     }
 
-    let mut ask_levels: AHashSet<u64> = AHashSet::new();
-    let mut bid_levels: AHashSet<u64> = AHashSet::new();
+    let mut ask_levels: AHashSet<Decimal> = AHashSet::new();
+    let mut bid_levels: AHashSet<Decimal> = AHashSet::new();
 
     for order in open_orders.values() {
         match order.side {
             OrderSide::Sell => {
-                ask_levels.insert(order.price.to_bits());
+                ask_levels.insert(order.price);
             }
             OrderSide::Buy => {
-                bid_levels.insert(order.price.to_bits());
+                bid_levels.insert(order.price);
             }
-            OrderSide::NoOrderSide => {}
         }
     }
 
@@ -430,9 +427,8 @@ fn append_depth_prune_deltas(
     let mut pruned: Vec<(u64, CachedL3Order)> = open_orders
         .iter()
         .filter(|(_, order)| match order.side {
-            OrderSide::Sell => !ask_keep.contains(&order.price.to_bits()),
-            OrderSide::Buy => !bid_keep.contains(&order.price.to_bits()),
-            OrderSide::NoOrderSide => true,
+            OrderSide::Sell => !ask_keep.contains(&order.price),
+            OrderSide::Buy => !bid_keep.contains(&order.price),
         })
         .map(|(order_id, order)| (*order_id, order.clone()))
         .collect();
@@ -442,10 +438,10 @@ fn append_depth_prune_deltas(
     for (order_id, cached) in pruned {
         open_orders.remove(&order_id);
 
-        let price = Price::new_checked(cached.price, price_precision).with_context(|| {
+        let price = Price::from_decimal_dp(cached.price, price_precision).with_context(|| {
             format!("Failed to construct Price with precision {price_precision}")
         })?;
-        let size = Quantity::new_checked(cached.size, size_precision).with_context(|| {
+        let size = Quantity::from_decimal_dp(cached.size, size_precision).with_context(|| {
             format!("Failed to construct Quantity with precision {size_precision}")
         })?;
         let book_order = BookOrder::new(cached.side, price, size, order_id);
@@ -470,33 +466,20 @@ fn retained_price_levels(
     open_orders: &AHashMap<u64, CachedL3Order>,
     side: OrderSide,
     depth: u32,
-) -> AHashSet<u64> {
-    let mut levels: Vec<(f64, u64)> = open_orders
+) -> AHashSet<Decimal> {
+    let mut levels: Vec<Decimal> = open_orders
         .values()
         .filter(|order| order.side == side)
-        .map(|order| (order.price, order.price.to_bits()))
+        .map(|order| order.price)
         .collect();
 
     match side {
-        OrderSide::Sell => levels.sort_by(|a, b| {
-            a.0.partial_cmp(&b.0)
-                .unwrap_or(Ordering::Equal)
-                .then(a.1.cmp(&b.1))
-        }),
-        OrderSide::Buy => levels.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(Ordering::Equal)
-                .then(a.1.cmp(&b.1))
-        }),
-        OrderSide::NoOrderSide => {}
+        OrderSide::Sell => levels.sort(),
+        OrderSide::Buy => levels.sort_by(|a, b| b.cmp(a)),
     }
 
-    levels.dedup_by(|a, b| a.1 == b.1);
-    levels
-        .into_iter()
-        .take(depth as usize)
-        .map(|(_, price_bits)| price_bits)
-        .collect()
+    levels.dedup();
+    levels.into_iter().take(depth as usize).collect()
 }
 
 fn compare_l3_orders(a: &CachedL3Order, b: &CachedL3Order) -> Ordering {
@@ -506,9 +489,8 @@ fn compare_l3_orders(a: &CachedL3Order, b: &CachedL3Order) -> Ordering {
     }
 
     let price_order = match a.side {
-        OrderSide::Sell => a.price.partial_cmp(&b.price).unwrap_or(Ordering::Equal),
-        OrderSide::Buy => b.price.partial_cmp(&a.price).unwrap_or(Ordering::Equal),
-        OrderSide::NoOrderSide => Ordering::Equal,
+        OrderSide::Sell => a.price.cmp(&b.price),
+        OrderSide::Buy => b.price.cmp(&a.price),
     };
 
     price_order.then(a.seq.cmp(&b.seq))
@@ -518,7 +500,6 @@ fn side_rank(side: OrderSide) -> u8 {
     match side {
         OrderSide::Sell => 0,
         OrderSide::Buy => 1,
-        OrderSide::NoOrderSide => 2,
     }
 }
 
@@ -532,48 +513,45 @@ mod tests {
         types::{Currency, Price, Quantity},
     };
     use rstest::rstest;
+    use rust_decimal_macros::dec;
+    use serde_json::value::RawValue;
 
     use super::*;
 
+    #[derive(serde::Deserialize)]
+    struct RawDataMessage {
+        data: Vec<Box<RawValue>>,
+    }
+
     fn make_instrument() -> InstrumentAny {
-        InstrumentAny::CurrencyPair(CurrencyPair::new(
-            InstrumentId::from("BTC/USD.KRAKEN"),
-            Symbol::from("BTC/USD"),
-            Currency::BTC(),
-            Currency::USD(),
-            1,
-            8,
-            Price::from("0.1"),
-            Quantity::from("0.00000001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        ))
+        InstrumentAny::CurrencyPair(
+            CurrencyPair::builder()
+                .instrument_id(InstrumentId::from("BTC/USD.KRAKEN"))
+                .raw_symbol(Symbol::from("BTC/USD"))
+                .base_currency(Currency::BTC())
+                .quote_currency(Currency::USD())
+                .price_precision(1)
+                .size_precision(8)
+                .price_increment(Price::from("0.1"))
+                .size_increment(Quantity::from("0.00000001"))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
     }
 
     fn load_snapshot() -> KrakenL3Snapshot {
         let json = include_str!("../../../../test_data/ws_l3_snapshot.json");
-        let v: serde_json::Value = serde_json::from_str(json).unwrap();
-        serde_json::from_value(v["data"][0].clone()).unwrap()
+        let message: RawDataMessage = serde_json::from_str(json).unwrap();
+        serde_json::from_str(message.data[0].get()).unwrap()
     }
 
     fn load_update(filename: &str) -> KrakenL3UpdateData {
         let path = format!("{}/test_data/{filename}", env!("CARGO_MANIFEST_DIR"));
         let json = std::fs::read_to_string(&path).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        serde_json::from_value(v["data"][0].clone()).unwrap()
+        let message: RawDataMessage = serde_json::from_str(&json).unwrap();
+        serde_json::from_str(message.data[0].get()).unwrap()
     }
 
     fn populated_open_orders() -> AHashMap<u64, CachedL3Order> {
@@ -748,9 +726,7 @@ mod tests {
             .clone();
         assert_eq!(cached_raw, "42001.0");
 
-        // Deserialize the data payload directly so the wire-format raw decimal
-        // is preserved; routing through `serde_json::Value` would collapse
-        // `42001.00` back to `42001.0` and defeat the test.
+        // Deserialize the data payload directly so the wire-format decimal text is preserved
         let update_data_json = r#"{
             "symbol": "BTC/USD",
             "timestamp": "2024-01-15T12:00:02.000000Z",
@@ -768,10 +744,7 @@ mod tests {
         }"#;
         let update: KrakenL3UpdateData = serde_json::from_str(update_data_json).unwrap();
         assert_eq!(update.asks[0].limit_price.raw, "42001.00");
-        assert!(
-            (update.asks[0].limit_price.value - 42001.0).abs() < f64::EPSILON,
-            "numeric value should match cached price within f64 precision"
-        );
+        assert_eq!(update.asks[0].limit_price.value, dec!(42001));
 
         let (deltas, _ts_event) = parse_l3_update(
             &update,
@@ -857,7 +830,7 @@ mod tests {
             bids: vec![],
             asks: vec![],
             checksum: 0,
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
         };
 
         let (deltas, _ts_event) = parse_l3_update(

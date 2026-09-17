@@ -13,6 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use nautilus_core::python::to_pyvalue_err;
 use nautilus_model::{
     data::{Bar, QuoteTick, TradeTick},
     enums::PriceType,
@@ -24,8 +25,8 @@ use crate::{
     indicator::{Indicator, MovingAverage},
 };
 
-#[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
+#[pymethods]
 impl AdaptiveMovingAverage {
     /// An indicator which calculates an adaptive moving average (AMA) across a
     /// rolling window. Developed by Perry Kaufman, the AMA is a moving average
@@ -34,19 +35,19 @@ impl AdaptiveMovingAverage {
     /// low. The AMA will increase lag when the price swings increase.
     #[new]
     #[pyo3(signature = (period_efficiency_ratio, period_fast, period_slow, price_type=None))]
-    #[must_use]
     pub fn py_new(
         period_efficiency_ratio: usize,
         period_fast: usize,
         period_slow: usize,
         price_type: Option<PriceType>,
-    ) -> Self {
-        Self::new(
+    ) -> PyResult<Self> {
+        Self::new_checked(
             period_efficiency_ratio,
             period_fast,
             period_slow,
             price_type,
         )
+        .map_err(to_pyvalue_err)
     }
 
     fn __repr__(&self) -> String {
@@ -63,6 +64,54 @@ impl AdaptiveMovingAverage {
     #[pyo3(name = "name")]
     fn py_name(&self) -> String {
         self.name()
+    }
+
+    #[getter]
+    #[pyo3(name = "period_efficiency_ratio")]
+    const fn py_period_efficiency_ratio(&self) -> usize {
+        self.period_efficiency_ratio
+    }
+
+    #[getter]
+    #[pyo3(name = "period_fast")]
+    const fn py_period_fast(&self) -> usize {
+        self.period_fast
+    }
+
+    #[getter]
+    #[pyo3(name = "period_slow")]
+    const fn py_period_slow(&self) -> usize {
+        self.period_slow
+    }
+
+    #[getter]
+    #[pyo3(name = "alpha_fast")]
+    const fn py_alpha_fast(&self) -> f64 {
+        self.alpha_fast()
+    }
+
+    #[getter]
+    #[pyo3(name = "alpha_slow")]
+    const fn py_alpha_slow(&self) -> f64 {
+        self.alpha_slow()
+    }
+
+    #[getter]
+    #[pyo3(name = "alpha_diff")]
+    fn py_alpha_diff(&self) -> f64 {
+        self.alpha_diff()
+    }
+
+    #[getter]
+    #[pyo3(name = "price_type")]
+    const fn py_price_type(&self) -> PriceType {
+        self.price_type
+    }
+
+    #[getter]
+    #[pyo3(name = "value")]
+    const fn py_value(&self) -> f64 {
+        self.value
     }
 
     #[getter]
@@ -84,22 +133,22 @@ impl AdaptiveMovingAverage {
     }
 
     #[pyo3(name = "handle_quote_tick")]
-    fn py_handle_quote_tick(&mut self, quote: &QuoteTick) {
-        self.py_update_raw(quote.extract_price(self.price_type).into());
+    fn py_handle_quote_tick(&mut self, quote: &QuoteTick) -> PyResult<()> {
+        self.handle_quote(quote).map_err(to_pyvalue_err)
     }
 
     #[pyo3(name = "handle_trade_tick")]
     fn py_handle_trade_tick(&mut self, trade: &TradeTick) {
-        self.update_raw((&trade.price).into());
+        self.handle_trade(trade);
     }
 
     #[pyo3(name = "handle_bar")]
     fn py_handle_bar(&mut self, bar: &Bar) {
-        self.update_raw((&bar.close).into());
+        self.handle_bar(bar);
     }
 
     #[pyo3(name = "reset")]
-    const fn py_reset(&mut self) {
+    fn py_reset(&mut self) {
         self.reset();
     }
 

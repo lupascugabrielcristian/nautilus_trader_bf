@@ -26,12 +26,15 @@ defi = ["nautilus-common/defi", "nautilus-data/defi", "nautilus-model/defi"]
 extension-module = ["python", "pyo3/extension-module", "streaming"]
 live = ["nautilus-common/live"]
 python = [
+  "nautilus-common/python",
   "nautilus-core/python",
   "nautilus-persistence/python",
+  "nautilus-trading/python",
   "pyo3",
+  "pyo3-stub-gen",
   "streaming",
 ]
-streaming = ["nautilus-persistence"]
+streaming = ["dep:jiff", "nautilus-data/streaming", "nautilus-persistence"]
 tracing-bridge = ["nautilus-common/tracing-bridge"]
 
 [package.metadata.cargo-machete]
@@ -40,7 +43,8 @@ ignored = [
 ] # Optional dep activated only via the streaming feature
 
 [package.metadata.docs.rs]
-all-features = true
+# Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
+features = ["defi", "live", "streaming", "tracing-bridge"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -48,7 +52,7 @@ nautilus-common = { workspace = true }
 nautilus-core = { workspace = true }
 nautilus-data = { workspace = true }
 nautilus-execution = { workspace = true }
-nautilus-model = { workspace = true, features = ["stubs"] }
+nautilus-model = { workspace = true, features = ["test-support"] }
 nautilus-portfolio = { workspace = true }
 nautilus-risk = { workspace = true }
 nautilus-trading = { workspace = true }
@@ -58,17 +62,27 @@ nautilus-persistence = { workspace = true, optional = true }
 ahash = { workspace = true }
 anyhow = { workspace = true }
 bon = { workspace = true }
+futures = { workspace = true }
 indexmap = { workspace = true }
+jiff = { workspace = true, optional = true }
 log = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 sysinfo = { workspace = true }
 ustr = { workspace = true }
 
 pyo3 = { workspace = true, optional = true }
+pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
+nautilus-serialization = { workspace = true }
+nautilus-testkit = { workspace = true, default-features = false, features = [
+  "testers",
+] }
+
 async-trait = { workspace = true }
 bytes = { workspace = true }
+proptest = { workspace = true }
 rstest = { workspace = true }
-serde_json = { workspace = true }
+tempfile = { workspace = true }
 toml = { workspace = true }

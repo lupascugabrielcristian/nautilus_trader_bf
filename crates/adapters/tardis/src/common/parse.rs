@@ -118,7 +118,7 @@ where
 ///
 /// Tardis records do not always carry a venue-provided trade ID (some venues
 /// publish empty strings or omit the field entirely). This hash combines the
-/// symbol, timestamp, price, amount and side so replayed data yields the same
+/// symbol, timestamp, price, amount, and side so replayed data yields the same
 /// identifier across runs. FNV-1a is stable across architectures and crate
 /// versions; the 0x1f delimiter keeps variable-length fields from colliding.
 #[must_use]
@@ -197,6 +197,10 @@ pub fn normalize_symbol_str(
             append_suffix(symbol, "-PERP")
         }
 
+        TardisExchange::MexcFutures if instrument_type == &TardisInstrumentType::Perpetual => {
+            append_suffix(symbol, "-PERP")
+        }
+
         _ => symbol,
     }
 }
@@ -260,11 +264,11 @@ pub fn parse_price(value: f64, precision: u8) -> Price {
 
 /// Parses a Nautilus order side from the given Tardis string `value`.
 #[must_use]
-pub fn parse_order_side(value: &str) -> OrderSide {
+pub fn parse_order_side(value: &str) -> Option<OrderSide> {
     match value {
-        "bid" => OrderSide::Buy,
-        "ask" => OrderSide::Sell,
-        _ => OrderSide::NoOrderSide,
+        "bid" => Some(OrderSide::Buy),
+        "ask" => Some(OrderSide::Sell),
+        _ => None,
     }
 }
 
@@ -272,8 +276,8 @@ pub fn parse_order_side(value: &str) -> OrderSide {
 #[must_use]
 pub fn parse_aggressor_side(value: &str) -> AggressorSide {
     match value {
-        "buy" => AggressorSide::Buyer,
-        "sell" => AggressorSide::Seller,
+        "buy" => AggressorSide::Buy,
+        "sell" => AggressorSide::Sell,
         _ => AggressorSide::NoAggressor,
     }
 }
@@ -417,6 +421,7 @@ mod tests {
     #[case(TardisExchange::Bybit, "BTCUSDT", "BTCUSDT.BYBIT")]
     #[case(TardisExchange::OkexFutures, "BTC-USD-200313", "BTC-USD-200313.OKEX")]
     #[case(TardisExchange::HuobiDmLinearSwap, "FOO-BAR", "FOO-BAR.HUOBI")]
+    #[case(TardisExchange::Mexc, "BTCUSDT", "BTCUSDT.MEXC")]
     fn test_parse_instrument_id(
         #[case] exchange: TardisExchange,
         #[case] symbol: Ustr,
@@ -470,6 +475,13 @@ mod tests {
         None,
         "BTC-USD-PERP.DYDX"
     )]
+    #[case(
+        TardisExchange::MexcFutures,
+        "BTC_USDT",
+        TardisInstrumentType::Perpetual,
+        None,
+        "BTC_USDT-PERP.MEXC"
+    )]
     fn test_normalize_instrument_id(
         #[case] exchange: TardisExchange,
         #[case] symbol: Ustr,
@@ -519,18 +531,18 @@ mod tests {
     }
 
     #[rstest]
-    #[case("bid", OrderSide::Buy)]
-    #[case("ask", OrderSide::Sell)]
-    #[case("unknown", OrderSide::NoOrderSide)]
-    #[case("", OrderSide::NoOrderSide)]
-    #[case("random", OrderSide::NoOrderSide)]
-    fn test_parse_order_side(#[case] input: &str, #[case] expected: OrderSide) {
+    #[case("bid", Some(OrderSide::Buy))]
+    #[case("ask", Some(OrderSide::Sell))]
+    #[case("unknown", None)]
+    #[case("", None)]
+    #[case("random", None)]
+    fn test_parse_order_side(#[case] input: &str, #[case] expected: Option<OrderSide>) {
         assert_eq!(parse_order_side(input), expected);
     }
 
     #[rstest]
-    #[case("buy", AggressorSide::Buyer)]
-    #[case("sell", AggressorSide::Seller)]
+    #[case("buy", AggressorSide::Buy)]
+    #[case("sell", AggressorSide::Sell)]
     #[case("unknown", AggressorSide::NoAggressor)]
     #[case("", AggressorSide::NoAggressor)]
     #[case("random", AggressorSide::NoAggressor)]

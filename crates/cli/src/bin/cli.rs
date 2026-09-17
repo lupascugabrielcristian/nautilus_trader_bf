@@ -15,16 +15,29 @@
 
 #![warn(clippy::pedantic)]
 
-use clap::Parser;
+use std::process::ExitCode;
+
+use clap::FromArgMatches;
+use mimalloc::MiMalloc;
 use nautilus_cli::opt::NautilusCli;
-use nautilus_common::logging::ensure_logging_initialized;
+use nautilus_common::logging::{ensure_logging_initialized, headers::register_allocator_mimalloc};
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
+    register_allocator_mimalloc();
     dotenvy::dotenv().ok();
     ensure_logging_initialized();
 
-    if let Err(e) = Box::pin(nautilus_cli::run(NautilusCli::parse())).await {
+    let matches = nautilus_cli::cli_command().get_matches();
+    let cli = NautilusCli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+
+    if let Err(e) = Box::pin(nautilus_cli::run(cli)).await {
         log::error!("Error executing Nautilus CLI: {e}");
+        return ExitCode::FAILURE;
     }
+
+    ExitCode::SUCCESS
 }

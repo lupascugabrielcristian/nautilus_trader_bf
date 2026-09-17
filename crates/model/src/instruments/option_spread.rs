@@ -18,7 +18,7 @@ use std::hash::{Hash, Hasher};
 use nautilus_core::{
     Params, UnixNanos,
     correctness::{
-        CorrectnessResult, CorrectnessResultExt, FAILED, check_equal_u8, check_valid_string_ascii,
+        CorrectnessResult, check_equal_u8, check_valid_string_ascii,
         check_valid_string_ascii_optional,
     },
 };
@@ -26,7 +26,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
-use super::{Instrument, any::InstrumentAny};
+use super::{Instrument, any::InstrumentAny, tick_scheme::check_tick_scheme};
 use crate::{
     enums::{AssetClass, InstrumentClass, OptionKind},
     identifiers::{InstrumentId, Symbol},
@@ -43,7 +43,7 @@ use crate::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -96,6 +96,8 @@ pub struct OptionSpread {
     pub max_price: Option<Price>,
     /// The minimum allowable quoted price.
     pub min_price: Option<Price>,
+    /// The registered variable tick scheme name.
+    pub tick_scheme: Option<Ustr>,
     /// Additional instrument metadata as a JSON-serializable dictionary.
     pub info: Option<Params>,
     /// UNIX timestamp (nanoseconds) when the data event occurred.
@@ -104,18 +106,10 @@ pub struct OptionSpread {
     pub ts_init: UnixNanos,
 }
 
+#[bon::bon]
 impl OptionSpread {
-    /// Creates a new [`OptionSpread`] instance with correctness checking.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any input validation fails.
-    ///
-    /// # Notes
-    ///
-    /// PyO3 requires a `Result` type for proper error handling and stacktrace printing in Python.
     #[expect(clippy::too_many_arguments)]
-    pub fn new_checked(
+    fn new_checked(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
         asset_class: AssetClass,
@@ -137,6 +131,7 @@ impl OptionSpread {
         margin_maint: Option<Decimal>,
         maker_fee: Option<Decimal>,
         taker_fee: Option<Decimal>,
+        tick_scheme: Option<Ustr>,
         info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
@@ -150,6 +145,7 @@ impl OptionSpread {
             stringify!(price_increment.precision),
         )?;
         check_positive_price(price_increment, stringify!(price_increment))?;
+        check_tick_scheme(tick_scheme)?;
         check_positive_quantity(multiplier, stringify!(multiplier))?;
         check_positive_quantity(lot_size, stringify!(lot_size))?;
 
@@ -177,20 +173,23 @@ impl OptionSpread {
             min_quantity: Some(min_quantity.unwrap_or(1.into())),
             max_price,
             min_price,
+            tick_scheme,
             info,
             ts_event,
             ts_init,
         })
     }
 
-    /// Creates a new [`OptionSpread`] instance.
+    /// Returns a fluent builder for a [`OptionSpread`] instance.
     ///
-    /// # Panics
+    /// Required fields are enforced at compile time; optional fields can be omitted and use the
+    /// same defaults as checked construction. The same correctness checks run on `build`.
     ///
-    /// Panics if any input parameter is invalid (see `new_checked`).
-    #[expect(clippy::too_many_arguments)]
-    #[must_use]
-    pub fn new(
+    /// # Errors
+    ///
+    /// Returns an error if any input validation fails.
+    #[builder(start_fn = builder, finish_fn = build)]
+    pub fn build_checked(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
         asset_class: AssetClass,
@@ -212,10 +211,11 @@ impl OptionSpread {
         margin_maint: Option<Decimal>,
         maker_fee: Option<Decimal>,
         taker_fee: Option<Decimal>,
+        tick_scheme: Option<Ustr>,
         info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
-    ) -> Self {
+    ) -> CorrectnessResult<Self> {
         Self::new_checked(
             instrument_id,
             raw_symbol,
@@ -238,11 +238,11 @@ impl OptionSpread {
             margin_maint,
             maker_fee,
             taker_fee,
+            tick_scheme,
             info,
             ts_event,
             ts_init,
         )
-        .expect_display(FAILED)
     }
 }
 
@@ -261,6 +261,9 @@ impl Hash for OptionSpread {
 }
 
 impl Instrument for OptionSpread {
+    fn tick_scheme(&self) -> Option<Ustr> {
+        self.tick_scheme
+    }
     fn into_any(self) -> InstrumentAny {
         InstrumentAny::OptionSpread(self)
     }
@@ -404,6 +407,7 @@ impl Instrument for OptionSpread {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use rust_decimal_macros::dec;
     use ustr::Ustr;
 
     use crate::{
@@ -457,6 +461,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             0.into(),
             0.into(),
         );
@@ -468,5 +473,69 @@ mod tests {
         let json = serde_json::to_string(&option_spread).unwrap();
         let deserialized: OptionSpread = serde_json::from_str(&json).unwrap();
         assert_eq!(option_spread, deserialized);
+    }
+
+    #[rstest]
+    fn test_builder_matches_new_checked() {
+        let positional = OptionSpread::new_checked(
+            InstrumentId::from("UD:U$: GN 2534559.GLBX"),
+            Symbol::from("UD:U$: GN 2534559"),
+            AssetClass::FX,
+            Some(Ustr::from("XCME")),
+            Ustr::from("SR3"),
+            Ustr::from("GN"),
+            1.into(),
+            2.into(),
+            Currency::USD(),
+            2,
+            Price::from("0.01"),
+            Quantity::from(10),
+            Quantity::from(5),
+            Some(Quantity::from("100")),
+            Some(Quantity::from("1")),
+            Some(Price::from("999.0")),
+            Some(Price::from("1.0")),
+            Some(dec!(0.01)),
+            Some(dec!(0.02)),
+            Some(dec!(0.0002)),
+            Some(dec!(0.0004)),
+            None,
+            None,
+            3.into(),
+            4.into(),
+        )
+        .unwrap();
+
+        let built = OptionSpread::builder()
+            .instrument_id(InstrumentId::from("UD:U$: GN 2534559.GLBX"))
+            .raw_symbol(Symbol::from("UD:U$: GN 2534559"))
+            .asset_class(AssetClass::FX)
+            .exchange(Ustr::from("XCME"))
+            .underlying(Ustr::from("SR3"))
+            .strategy_type(Ustr::from("GN"))
+            .activation_ns(1.into())
+            .expiration_ns(2.into())
+            .currency(Currency::USD())
+            .price_precision(2)
+            .price_increment(Price::from("0.01"))
+            .multiplier(Quantity::from(10))
+            .lot_size(Quantity::from(5))
+            .max_quantity(Quantity::from("100"))
+            .min_quantity(Quantity::from("1"))
+            .max_price(Price::from("999.0"))
+            .min_price(Price::from("1.0"))
+            .margin_init(dec!(0.01))
+            .margin_maint(dec!(0.02))
+            .maker_fee(dec!(0.0002))
+            .taker_fee(dec!(0.0004))
+            .ts_event(3.into())
+            .ts_init(4.into())
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&positional).unwrap(),
+            serde_json::to_value(&built).unwrap(),
+        );
     }
 }

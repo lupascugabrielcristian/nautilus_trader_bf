@@ -15,7 +15,7 @@
 
 //! Factory functions for creating Databento clients and components.
 
-use std::{any::Any, cell::RefCell, fmt::Debug, path::PathBuf, rc::Rc};
+use std::{any::Any, cell::RefCell, path::PathBuf, rc::Rc};
 
 use nautilus_common::{
     cache::CacheView,
@@ -23,10 +23,7 @@ use nautilus_common::{
     clock::Clock,
     factories::{ClientConfig, DataClientFactory},
 };
-use nautilus_core::{
-    string::secret::REDACTED,
-    time::{AtomicTime, get_atomic_clock_realtime},
-};
+use nautilus_core::time::{AtomicTime, get_atomic_clock_realtime};
 use nautilus_model::identifiers::ClientId;
 
 use crate::{
@@ -35,72 +32,7 @@ use crate::{
     historical::DatabentoHistoricalClient,
 };
 
-/// Configuration for Databento data clients used with `LiveNode`.
-#[derive(Clone)]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.databento",
-        from_py_object
-    )
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.databento")
-)]
-pub struct DatabentoLiveClientConfig {
-    /// Databento API credential.
-    credential: Credential,
-    /// Path to publishers.json file.
-    pub publishers_filepath: PathBuf,
-    /// Whether to use exchange as venue for GLBX instruments.
-    pub use_exchange_as_venue: bool,
-    /// Whether to timestamp bars on close.
-    pub bars_timestamp_on_close: bool,
-}
-
-impl Debug for DatabentoLiveClientConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct(stringify!(DatabentoLiveClientConfig))
-            .field("credential", &REDACTED)
-            .field("publishers_filepath", &self.publishers_filepath)
-            .field("use_exchange_as_venue", &self.use_exchange_as_venue)
-            .field("bars_timestamp_on_close", &self.bars_timestamp_on_close)
-            .finish()
-    }
-}
-
-impl DatabentoLiveClientConfig {
-    /// Creates a new [`DatabentoLiveClientConfig`] instance.
-    #[must_use]
-    pub fn new(
-        api_key: impl Into<String>,
-        publishers_filepath: PathBuf,
-        use_exchange_as_venue: bool,
-        bars_timestamp_on_close: bool,
-    ) -> Self {
-        Self {
-            credential: Credential::new(api_key),
-            publishers_filepath,
-            use_exchange_as_venue,
-            bars_timestamp_on_close,
-        }
-    }
-
-    /// Returns the API key associated with this config.
-    #[must_use]
-    pub fn api_key(&self) -> &str {
-        self.credential.api_key()
-    }
-
-    /// Returns a masked version of the API key for logging purposes.
-    #[must_use]
-    pub fn api_key_masked(&self) -> String {
-        self.credential.api_key_masked()
-    }
-}
-
-impl ClientConfig for DatabentoLiveClientConfig {
+impl ClientConfig for DatabentoDataClientConfig {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -110,10 +42,7 @@ impl ClientConfig for DatabentoLiveClientConfig {
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.databento",
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.adapters.databento", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -181,22 +110,17 @@ impl DataClientFactory for DatabentoDataClientFactory {
     ) -> anyhow::Result<Box<dyn DataClient>> {
         let databento_config = config
             .as_any()
-            .downcast_ref::<DatabentoLiveClientConfig>()
+            .downcast_ref::<DatabentoDataClientConfig>()
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Invalid config type for DatabentoDataClientFactory. Expected DatabentoLiveClientConfig, was {config:?}"
+                    "Invalid config type for DatabentoDataClientFactory. Expected DatabentoDataClientConfig, was {config:?}"
                 )
-            })?;
+            })?
+            .clone();
 
         let client_id = ClientId::from(name);
-        let config = DatabentoDataClientConfig::new(
-            databento_config.api_key(),
-            databento_config.publishers_filepath.clone(),
-            databento_config.use_exchange_as_venue,
-            databento_config.bars_timestamp_on_close,
-        );
-
-        let client = DatabentoDataClient::new(client_id, config, get_atomic_clock_realtime())?;
+        let client =
+            DatabentoDataClient::new(client_id, databento_config, get_atomic_clock_realtime())?;
         Ok(Box::new(client))
     }
 
@@ -205,7 +129,7 @@ impl DataClientFactory for DatabentoDataClientFactory {
     }
 
     fn config_type(&self) -> &'static str {
-        "DatabentoLiveClientConfig"
+        "DatabentoDataClientConfig"
     }
 }
 

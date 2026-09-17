@@ -505,7 +505,7 @@ impl SubmitBroadcaster {
 
         *self.health_check_task.write().await = Some(task);
 
-        log::info!(
+        log::debug!(
             "SubmitBroadcaster started with {} clients",
             self.transports.len()
         );
@@ -525,7 +525,7 @@ impl SubmitBroadcaster {
             task.abort();
         }
 
-        log::info!("SubmitBroadcaster stopped");
+        log::debug!("SubmitBroadcaster stopped");
     }
 
     async fn run_health_checks(&self) {
@@ -950,7 +950,7 @@ mod tests {
             account_id: AccountId::from("BITMEX-001"),
             instrument_id: InstrumentId::from_str("XBTUSD.BITMEX").unwrap(),
             venue_order_id: VenueOrderId::from(venue_order_id),
-            order_side: OrderSide::Buy,
+            order_side: OrderSide::Buy.into(),
             order_type: OrderType::Limit,
             time_in_force: TimeInForce::Gtc,
             order_status: OrderStatus::Accepted,
@@ -963,9 +963,10 @@ mod tests {
             ts_init: 0.into(),
             client_order_id: None,
             avg_px: None,
+            activation_price: None,
             trigger_price: None,
             trigger_type: None,
-            contingency_type: ContingencyType::NoContingency,
+            contingency_type: None,
             expire_time: None,
             order_list_id: None,
             venue_position_id: None,
@@ -974,7 +975,7 @@ mod tests {
             display_qty: None,
             limit_offset: None,
             trailing_offset: None,
-            trailing_offset_type: TrailingOffsetType::NoTrailingOffset,
+            trailing_offset_type: None,
             post_only: false,
             reduce_only: false,
             cancel_reason: None,
@@ -1049,10 +1050,7 @@ mod tests {
     async fn test_broadcast_submit_duplicate_clordid_expected() {
         let transports = vec![
             create_stub_transport("client-0", || async { anyhow::bail!("Duplicate clOrdID") }),
-            create_stub_transport("client-1", || async {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                anyhow::bail!("Should be aborted")
-            }),
+            create_stub_transport("client-1", || async { anyhow::bail!("Connection timeout") }),
         ];
 
         let config = SubmitBroadcasterConfig::default();
@@ -1637,10 +1635,7 @@ mod tests {
             create_stub_transport("client-0", || async {
                 anyhow::bail!("Duplicate clOrdID: O-123 already exists")
             }),
-            create_stub_transport("client-1", || async {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                anyhow::bail!("Should be aborted")
-            }),
+            create_stub_transport("client-1", || async { anyhow::bail!("Connection timeout") }),
         ];
 
         let config = SubmitBroadcasterConfig::default();

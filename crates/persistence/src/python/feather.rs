@@ -23,10 +23,9 @@ use std::{
 
 use nautilus_common::{
     live::get_runtime,
-    msgbus::typed_handler::ShareableMessageHandler,
     python::{cache::PyCache, clock::PyClock},
 };
-use nautilus_core::UnixNanos;
+use nautilus_core::{UnixNanos, datetime::get_timezone};
 use nautilus_model::{
     data::{
         Bar, Data, FundingRateUpdate, IndexPriceUpdate, InstrumentStatus, MarkPriceUpdate,
@@ -35,10 +34,10 @@ use nautilus_model::{
     },
     events::{
         AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied,
-        OrderEmulated, OrderExpired, OrderFilled, OrderInitialized, OrderModifyRejected,
-        OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased, OrderSnapshot,
-        OrderSubmitted, OrderTriggered, OrderUpdated, PositionAdjusted, PositionChanged,
-        PositionClosed, PositionOpened, PositionSnapshot,
+        OrderEmulated, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
+        OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased,
+        OrderSnapshot, OrderSubmitted, OrderTriggered, OrderUpdated, PositionAdjusted,
+        PositionChanged, PositionClosed, PositionOpened, PositionSnapshot,
     },
     python::instruments::pyobject_to_instrument_any,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
@@ -47,7 +46,9 @@ use object_store::ObjectStoreExt;
 use pyo3::{exceptions::PyIOError, prelude::*};
 
 use crate::{
-    backend::feather::{FeatherWriter, RotationConfig},
+    backend::feather::{
+        FeatherWriter, FeatherWriterSubscriptions, RotationConfig, default_per_instrument_types,
+    },
     parquet::{ObjectStoreLocationKind, create_object_store_location_from_path},
 };
 
@@ -57,13 +58,13 @@ use crate::{
 /// capabilities, matching the interface of Python's `StreamingFeatherWriter`.
 #[pyclass(
     name = "StreamingFeatherWriter",
-    module = "nautilus_trader.core.nautilus_pyo3.persistence",
+    module = "nautilus_trader.persistence",
     unsendable
 )]
 #[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.persistence")]
 pub struct PyStreamingFeatherWriter {
     writer: Rc<RefCell<FeatherWriter>>,
-    handler: Option<ShareableMessageHandler>,
+    subscriptions: Option<FeatherWriterSubscriptions>,
 }
 
 #[pymethods]
@@ -94,7 +95,7 @@ impl PyStreamingFeatherWriter {
         fs_storage_options=None,
         include_types=None,
         rotation_mode=3,
-        max_file_size=1024*1024*1024,
+        max_file_size=1_073_741_824,
         rotation_interval_ns=None,
         rotation_time_ns=None,
         rotation_timezone="UTC",
@@ -102,7 +103,7 @@ impl PyStreamingFeatherWriter {
         replace=false
     ))]
     #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
-    pub fn new(
+    pub fn py_new(
         path: String,
         cache: PyCache,
         clock: PyClock,
@@ -184,7 +185,7 @@ impl PyStreamingFeatherWriter {
             }
             2 => {
                 let interval = rotation_interval_ns.unwrap_or(86_400_000_000_000); // Default 1 day
-                let tz = rotation_timezone.parse::<chrono_tz::Tz>().map_err(|e| {
+                let tz = get_timezone(rotation_timezone).map_err(|e| {
                     PyIOError::new_err(format!("Failed to parse rotation_timezone: {e}"))
                 })?;
                 let time_ns = rotation_time_ns.unwrap_or(0);
@@ -200,17 +201,6 @@ impl PyStreamingFeatherWriter {
         // Convert include_types to HashSet
         let type_filter = include_types.map(|types| types.into_iter().collect::<HashSet<String>>());
 
-        let mut per_instrument_types = HashSet::new();
-        per_instrument_types.insert("bars".to_string());
-        per_instrument_types.insert("funding_rate_update".to_string());
-        per_instrument_types.insert("index_prices".to_string());
-        per_instrument_types.insert("mark_prices".to_string());
-        per_instrument_types.insert("order_book_deltas".to_string());
-        per_instrument_types.insert("order_book_depths".to_string());
-        per_instrument_types.insert("option_greeks".to_string());
-        per_instrument_types.insert("quotes".to_string());
-        per_instrument_types.insert("trades".to_string());
-
         // Extract Clock from Python wrapper
         // PyClock wraps Rc<RefCell<dyn Clock>>, we get the inner Rc
         let clock_rc = clock.clock_rc();
@@ -225,13 +215,13 @@ impl PyStreamingFeatherWriter {
             clock_rc,
             rotation_config,
             type_filter,
-            Some(per_instrument_types),
+            Some(default_per_instrument_types()),
             flush_interval_ms, // Auto-flush interval in milliseconds
         );
 
         Ok(Self {
             writer: Rc::new(RefCell::new(writer)),
-            handler: None,
+            subscriptions: None,
         })
     }
 
@@ -240,7 +230,7 @@ impl PyStreamingFeatherWriter {
     /// This matches the behavior of Python's `StreamingFeatherWriter` when subscribed
     /// via `trader.subscribe("*", writer.write)`.
     pub fn subscribe(&mut self) -> PyResult<()> {
-        if self.handler.is_some() {
+        if self.subscriptions.is_some() {
             // Already subscribed
             return Ok(());
         }
@@ -248,13 +238,13 @@ impl PyStreamingFeatherWriter {
         let handler = FeatherWriter::subscribe_to_message_bus(self.writer.clone())
             .map_err(|e| PyIOError::new_err(format!("Failed to subscribe to message bus: {e}")))?;
 
-        self.handler = Some(handler);
+        self.subscriptions = Some(handler);
         Ok(())
     }
 
     /// Unsubscribes from the message bus.
     pub fn unsubscribe(&mut self) -> PyResult<()> {
-        if let Some(handler) = self.handler.take() {
+        if let Some(handler) = self.subscriptions.take() {
             FeatherWriter::unsubscribe_from_message_bus(&handler);
         }
         Ok(())
@@ -265,7 +255,6 @@ impl PyStreamingFeatherWriter {
     /// # Parameters
     ///
     /// - `data`: The data object to write (must be a Nautilus data type from pyo3).
-    ///
     #[expect(
         clippy::needless_pass_by_value,
         clippy::too_many_lines,
@@ -331,7 +320,7 @@ impl PyStreamingFeatherWriter {
             let mut writer = self.writer.borrow_mut();
             let runtime = get_runtime();
             return runtime
-                .block_on(async { writer.write_data(Data::IndexPriceUpdate(price)).await })
+                .block_on(async { writer.write_data(Data::IndexPrice(price)).await })
                 .map_err(|e| PyIOError::new_err(format!("Failed to write IndexPriceUpdate: {e}")));
         }
 
@@ -339,7 +328,7 @@ impl PyStreamingFeatherWriter {
             let mut writer = self.writer.borrow_mut();
             let runtime = get_runtime();
             return runtime
-                .block_on(async { writer.write_data(Data::MarkPriceUpdate(price)).await })
+                .block_on(async { writer.write_data(Data::MarkPrice(price)).await })
                 .map_err(|e| PyIOError::new_err(format!("Failed to write MarkPriceUpdate: {e}")));
         }
 
@@ -378,6 +367,7 @@ impl PyStreamingFeatherWriter {
         try_write!(OrderModifyRejected, "OrderModifyRejected");
         try_write!(OrderUpdated, "OrderUpdated");
         try_write!(OrderFilled, "OrderFilled");
+        try_write!(OrderFillVoided, "OrderFillVoided");
         try_write!(PositionOpened, "PositionOpened");
         try_write!(PositionChanged, "PositionChanged");
         try_write!(PositionClosed, "PositionClosed");

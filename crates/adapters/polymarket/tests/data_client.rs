@@ -15,11 +15,19 @@
 
 //! Integration tests for the Polymarket data client.
 //!
-//! Exercises the `DataClient` trait surface (`request_instrument`,
-//! `request_instruments`, `request_book_snapshot`, `request_trades`) against
-//! axum mocks for the Gamma, CLOB public, and Data API endpoints.
+//! Exercises selected `DataClient` subscription and request surfaces against axum mocks for the
+//! Gamma, CLOB public, and Data API endpoints.
 
-use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    num::NonZeroUsize,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use axum::{
     Router,
@@ -27,36 +35,50 @@ use axum::{
         State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    response::{Json, Response},
+    http::StatusCode,
+    response::{IntoResponse, Json, Response},
     routing::get,
 };
 use futures_util::StreamExt;
+use jiff::{SignedDuration, Timestamp, tz::Offset};
 use nautilus_common::{
     clients::DataClient,
-    live::runner::replace_data_event_sender,
+    live::runner::{replace_data_event_sender, replace_system_event_sender},
     messages::{
-        DataEvent, DataResponse,
+        DataEvent, DataResponse, SystemEvent,
         data::{
             RequestBookSnapshot, RequestInstrument, RequestInstruments, RequestTrades,
-            SubscribeQuotes,
+            SubscribeBookDepth10, SubscribeCustomData, SubscribeInstrument,
+            SubscribeInstrumentClose, SubscribeInstrumentStatus, SubscribeQuotes,
+            UnsubscribeInstrument,
         },
+        system::SocketState,
     },
     testing::wait_until_async,
 };
-use nautilus_core::{UUID4, UnixNanos};
-use nautilus_model::identifiers::InstrumentId;
+use nautilus_core::{Params, UUID4, UnixNanos};
+use nautilus_live::{SocketReconnectRegistry, SocketReconnectRequestOutcome};
+use nautilus_model::{
+    data::{Data as NautilusData, DataType},
+    enums::BookType,
+    identifiers::InstrumentId,
+    instruments::InstrumentAny,
+};
 use nautilus_network::{retry::RetryConfig, websocket::TransportBackend};
 use nautilus_polymarket::{
-    common::consts::{POLYMARKET_CLIENT_ID, POLYMARKET_VENUE},
+    common::consts::{POLYMARKET_CLIENT_ID, POLYMARKET_VENUE, WS_DEFAULT_SUBSCRIPTIONS},
     config::PolymarketDataClientConfig,
     data::PolymarketDataClient,
+    data_types::PolymarketRtdsCryptoTwap,
     http::{
         clob::PolymarketClobPublicClient, data_api::PolymarketDataApiHttpClient,
         gamma::PolymarketGammaHttpClient,
     },
-    websocket::client::PolymarketWebSocketClient,
+    websocket::pool::PolymarketMarketConnectionPool,
 };
+use nautilus_testkit::events::{collect_data_events_until_response, drain_data_events};
 use rstest::rstest;
+use rust_decimal_macros::dec;
 use serde_json::Value;
 
 const TEST_CONDITION_ID: &str =
@@ -74,15 +96,51 @@ fn load_json(filename: &str) -> Value {
     serde_json::from_str(&content).expect("invalid json")
 }
 
+fn future_end_date_string() -> String {
+    let future_date = Offset::UTC
+        .to_datetime(Timestamp::now() + SignedDuration::from_hours(24 * 365))
+        .date();
+    format!("{}T00:00:00Z", future_date.strftime("%Y-%m-%d"))
+}
+
+fn set_future_end_date(value: &mut Value) {
+    let end_date = future_end_date_string();
+    let end_date_iso = end_date[..10].to_string();
+
+    if let Some(root) = value.as_object_mut() {
+        root.insert("endDate".to_string(), Value::String(end_date.clone()));
+        root.insert("endDateIso".to_string(), Value::String(end_date_iso));
+
+        if let Some(events) = root.get_mut("events").and_then(Value::as_array_mut) {
+            for event in events {
+                if let Some(event_obj) = event.as_object_mut() {
+                    event_obj.insert("endDate".to_string(), Value::String(end_date.clone()));
+                }
+            }
+        }
+    }
+}
+
+fn gamma_market_request_fixture() -> Value {
+    let mut value = load_json("gamma_market.json");
+    set_future_end_date(&mut value);
+    value
+}
+
 #[derive(Clone, Default)]
 struct TestServerState {
     gamma_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+    gamma_request_count: Arc<AtomicUsize>,
     book_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     trades_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+    trades_request_count: Arc<AtomicUsize>,
+    trades_error: Arc<AtomicBool>,
     market_payloads: Arc<tokio::sync::Mutex<Vec<Value>>>,
+    rtds_payloads: Arc<tokio::sync::Mutex<Vec<Value>>>,
 }
 
 async fn handle_gamma_markets(State(state): State<TestServerState>) -> Json<Value> {
+    state.gamma_request_count.fetch_add(1, Ordering::Relaxed);
     let body = state
         .gamma_response
         .lock()
@@ -90,6 +148,11 @@ async fn handle_gamma_markets(State(state): State<TestServerState>) -> Json<Valu
         .clone()
         .unwrap_or_else(|| serde_json::json!([]));
     Json(body)
+}
+
+async fn handle_gamma_markets_keyset(State(state): State<TestServerState>) -> Json<Value> {
+    let Json(markets) = handle_gamma_markets(State(state)).await;
+    Json(serde_json::json!({"markets": markets}))
 }
 
 async fn handle_book(State(state): State<TestServerState>) -> Json<Value> {
@@ -102,14 +165,20 @@ async fn handle_book(State(state): State<TestServerState>) -> Json<Value> {
     Json(body)
 }
 
-async fn handle_trades(State(state): State<TestServerState>) -> Json<Value> {
+async fn handle_trades(State(state): State<TestServerState>) -> Response {
+    state.trades_request_count.fetch_add(1, Ordering::Relaxed);
+
+    if state.trades_error.load(Ordering::Relaxed) {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
     let body = state
         .trades_response
         .lock()
         .await
         .clone()
         .unwrap_or_else(|| load_json("data_api_trades_response.json"));
-    Json(body)
+    Json(body).into_response()
 }
 
 async fn handle_market_upgrade(
@@ -141,13 +210,72 @@ async fn handle_market_socket(mut socket: WebSocket, state: TestServerState) {
     }
 }
 
+async fn handle_rtds_socket(mut socket: WebSocket, state: TestServerState) {
+    while let Some(result) = socket.next().await {
+        let Ok(message) = result else { break };
+
+        match message {
+            Message::Text(text) => {
+                let Ok(payload) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                let is_twap_subscribe = payload.get("action").and_then(Value::as_str)
+                    == Some("subscribe")
+                    && payload
+                        .get("subscriptions")
+                        .and_then(Value::as_array)
+                        .is_some_and(|subscriptions| {
+                            subscriptions.iter().any(|subscription| {
+                                subscription.get("topic").and_then(Value::as_str)
+                                    == Some("crypto_prices_twap_sixty")
+                            })
+                        });
+                state.rtds_payloads.lock().await.push(payload);
+
+                if is_twap_subscribe {
+                    let update = load_json("rtds_crypto_twap_sixty_update.json").to_string();
+                    if socket.send(Message::Text(update.into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            Message::Ping(data) => {
+                if socket.send(Message::Pong(data)).await.is_err() {
+                    break;
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+}
+
+async fn handle_rtds_upgrade(
+    ws: WebSocketUpgrade,
+    State(state): State<TestServerState>,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_rtds_socket(socket, state))
+}
+
 fn create_router(state: TestServerState) -> Router {
     Router::new()
         .route("/markets", get(handle_gamma_markets))
+        .route("/markets/keyset", get(handle_gamma_markets_keyset))
         .route("/book", get(handle_book))
         .route("/trades", get(handle_trades))
         .route("/ws/market", get(handle_market_upgrade))
+        .route("/rtds", get(handle_rtds_upgrade))
         .with_state(state)
+}
+
+fn crypto_twap_data_type(symbol: &str, window_seconds: u64) -> DataType {
+    let mut metadata = Params::new();
+    metadata.insert("symbol".to_string(), Value::String(symbol.to_string()));
+    metadata.insert(
+        "window_seconds".to_string(),
+        Value::Number(window_seconds.into()),
+    );
+    DataType::new("PolymarketRtdsCryptoTwap", Some(metadata), None)
 }
 
 async fn start_mock_server(state: TestServerState) -> SocketAddr {
@@ -166,6 +294,117 @@ fn create_test_data_client(
     PolymarketDataClient,
     tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
 ) {
+    create_test_data_client_with_new_markets(addr, false)
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_connect_emits_market_socket_state_change() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state).await;
+    let (system_tx, mut system_rx) = tokio::sync::mpsc::unbounded_channel();
+    replace_system_event_sender(system_tx);
+    let registry = SocketReconnectRegistry::default();
+    let (mut client, _data_rx) = registry.scope(|| create_test_data_client(addr));
+
+    client.connect().await.expect("connect data client");
+
+    let event = tokio::time::timeout(Duration::from_secs(5), system_rx.recv())
+        .await
+        .expect("wait for socket state change")
+        .expect("system event channel closed");
+    let SystemEvent::SocketState(change) = event;
+    let endpoint = ustr::Ustr::from("polymarket-market-streams");
+    let handle = registry.handle(*POLYMARKET_CLIENT_ID, endpoint).unwrap();
+
+    assert_eq!(change.client_id, *POLYMARKET_CLIENT_ID);
+    assert_eq!(change.venue, Some(*POLYMARKET_VENUE));
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Connected);
+    assert_eq!(
+        handle.request_reconnect(),
+        SocketReconnectRequestOutcome::Accepted
+    );
+
+    let event = tokio::time::timeout(Duration::from_secs(5), system_rx.recv())
+        .await
+        .expect("wait for socket state change")
+        .expect("system event channel closed");
+    let SystemEvent::SocketState(change) = event;
+    assert_eq!(change.client_id, *POLYMARKET_CLIENT_ID);
+    assert_eq!(change.venue, Some(*POLYMARKET_VENUE));
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Disconnected);
+
+    client.disconnect().await.expect("disconnect data client");
+    assert!(registry.handle(*POLYMARKET_CLIENT_ID, endpoint).is_none());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_subscribe_crypto_twap_sends_exact_topic_and_emits_exact_update() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut data_rx) = create_test_data_client(addr);
+    let data_type = crypto_twap_data_type("BTC/USD", 60);
+
+    client
+        .subscribe(SubscribeCustomData::new(
+            Some(*POLYMARKET_CLIENT_ID),
+            None,
+            data_type.clone(),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .expect("subscribe 60-second TWAP");
+    client.connect().await.expect("connect data client");
+
+    let custom = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = data_rx.recv().await.expect("data event channel closed");
+            if let DataEvent::Data(NautilusData::Custom(custom)) = event {
+                break custom;
+            }
+        }
+    })
+    .await
+    .expect("wait for TWAP custom data");
+    let payload = custom
+        .data
+        .as_any()
+        .downcast_ref::<PolymarketRtdsCryptoTwap>()
+        .expect("PolymarketRtdsCryptoTwap");
+    let requests = state.rtds_payloads.lock().await.clone();
+
+    assert_eq!(custom.data_type, data_type);
+    assert_eq!(payload.symbol, "btc/usd");
+    assert_eq!(payload.window_seconds, 60);
+    assert_eq!(payload.value, dec!(65000.123456789012345678));
+    assert_eq!(payload.observation_timestamp_ms, 1772752581815);
+    assert_eq!(payload.message_timestamp_ms, 1772752582004);
+    assert_eq!(
+        requests,
+        vec![serde_json::json!({
+            "action": "subscribe",
+            "subscriptions": [{
+                "topic": "crypto_prices_twap_sixty",
+                "type": "update",
+            }],
+        })],
+    );
+
+    client.disconnect().await.expect("disconnect data client");
+}
+
+fn create_test_data_client_with_new_markets(
+    addr: SocketAddr,
+    subscribe_new_markets: bool,
+) -> (
+    PolymarketDataClient,
+    tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     // Use replace_ rather than set_ so this test can run on a thread that
     // already had a sender installed by another test in the same harness.
@@ -176,17 +415,20 @@ fn create_test_data_client(
         .expect("gamma client");
     let clob_public = PolymarketClobPublicClient::new(Some(base_url.clone()), 5).expect("clob");
     let data_api = PolymarketDataApiHttpClient::new(Some(base_url.clone()), 5).expect("data_api");
-    let ws = PolymarketWebSocketClient::new_market(
+    let ws = PolymarketMarketConnectionPool::new(
         Some(format!("ws://{addr}/ws/market")),
-        false,
+        subscribe_new_markets,
         TransportBackend::default(),
+        WS_DEFAULT_SUBSCRIPTIONS,
     );
 
     let config = PolymarketDataClientConfig {
         base_url_http: Some(base_url.clone()),
         base_url_ws: Some(format!("ws://{addr}/ws")),
+        base_url_rtds: Some(format!("ws://{addr}/rtds")),
         base_url_gamma: Some(base_url.clone()),
         base_url_data_api: Some(base_url),
+        subscribe_new_markets,
         ..PolymarketDataClientConfig::default()
     };
     let client = PolymarketDataClient::new(
@@ -201,59 +443,77 @@ fn create_test_data_client(
     (client, rx)
 }
 
-fn gamma_market_fixture() -> Value {
-    load_json("gamma_market.json")
-}
-
 fn yes_instrument_id() -> InstrumentId {
     InstrumentId::from(format!("{TEST_CONDITION_ID}-{TEST_TOKEN_ID_YES}.POLYMARKET").as_str())
 }
 
-async fn drain_data_events(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
-    timeout: Duration,
-) -> Vec<DataEvent> {
-    let mut events = Vec::new();
-    let deadline = tokio::time::Instant::now() + timeout;
-    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
-        events.push(event);
-    }
-    events
+#[derive(Clone, Copy)]
+enum UnsupportedGenericSubscription {
+    BookDepth10,
+    InstrumentStatus,
+    InstrumentClose,
 }
 
 async fn wait_for_market_payload_count(
     state: &TestServerState,
     expected: usize,
+    empty_assets: bool,
     timeout: Duration,
 ) {
     wait_until_async(
         || {
             let state = state.clone();
-            async move { state.market_payloads.lock().await.len() >= expected }
+            async move {
+                state
+                    .market_payloads
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|payload| {
+                        payload
+                            .get("assets_ids")
+                            .and_then(Value::as_array)
+                            .is_some_and(|ids| ids.is_empty() == empty_assets)
+                    })
+                    .count()
+                    >= expected
+            }
         },
         timeout,
     )
     .await;
 }
 
+async fn market_payload_count(state: &TestServerState, empty_assets: bool) -> usize {
+    state
+        .market_payloads
+        .lock()
+        .await
+        .iter()
+        .filter(|payload| {
+            payload
+                .get("assets_ids")
+                .and_then(Value::as_array)
+                .is_some_and(|ids| ids.is_empty() == empty_assets)
+        })
+        .count()
+}
+
 #[rstest]
 #[tokio::test]
-async fn test_request_instrument_publishes_event_and_response() {
-    // Regression test for the `DataEvent::Instrument` publish in
-    // `request_instrument` (data.rs:1183-1187). Without it the exec client
-    // does not pick up newly fetched instruments and the WS dispatcher
-    // logs `Unknown asset_id in order update`.
+async fn test_request_instrument_fetches_fresh_definition() {
     let state = TestServerState::default();
-    *state.gamma_response.lock().await = Some(serde_json::json!([gamma_market_fixture()]));
+    *state.gamma_response.lock().await = Some(serde_json::json!([gamma_market_request_fixture()]));
     let addr = start_mock_server(state.clone()).await;
     let (client, mut rx) = create_test_data_client(addr);
 
+    let request_id = UUID4::new();
     let request = RequestInstrument::new(
         yes_instrument_id(),
         None,
         None,
         Some(*POLYMARKET_CLIENT_ID),
-        UUID4::new(),
+        request_id,
         nautilus_core::UnixNanos::default(),
         None,
     );
@@ -261,7 +521,8 @@ async fn test_request_instrument_publishes_event_and_response() {
         .request_instrument(request)
         .expect("request_instrument");
 
-    let events = drain_data_events(&mut rx, Duration::from_secs(5)).await;
+    let events =
+        collect_data_events_until_response(&mut rx, request_id, Duration::from_secs(5)).await;
 
     let publish_count = events
         .iter()
@@ -280,16 +541,190 @@ async fn test_request_instrument_publishes_event_and_response() {
         response_count, 1,
         "request_instrument must also send a DataResponse::Instrument; events were: {events:?}"
     );
+
+    let expected_description = "Fresh Gamma instrument definition";
+    let mut updated_market = gamma_market_request_fixture();
+    updated_market["question"] = Value::String(expected_description.to_string());
+    *state.gamma_response.lock().await = Some(serde_json::json!([updated_market]));
+    let second_request_id = UUID4::new();
+    client
+        .request_instrument(RequestInstrument::new(
+            yes_instrument_id(),
+            None,
+            None,
+            Some(*POLYMARKET_CLIENT_ID),
+            second_request_id,
+            UnixNanos::default(),
+            None,
+        ))
+        .expect("second request_instrument");
+
+    let second_events = [
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("second instrument event timeout")
+            .expect("second instrument event"),
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("second instrument response timeout")
+            .expect("second instrument response"),
+    ];
+    assert_eq!(state.gamma_request_count.load(Ordering::Relaxed), 2);
+    let response = second_events
+        .iter()
+        .find_map(|event| match event {
+            DataEvent::Response(DataResponse::Instrument(response)) => Some(response),
+            _ => None,
+        })
+        .expect("second instrument response");
+    assert_eq!(response.correlation_id, second_request_id);
+    assert_eq!(response.client_id, *POLYMARKET_CLIENT_ID);
+    assert_eq!(response.instrument_id, yes_instrument_id());
+    match &response.data {
+        InstrumentAny::BinaryOption(instrument) => {
+            assert_eq!(instrument.description, Some(expected_description.into()));
+        }
+        other => panic!("expected BinaryOption response, received {other:?}"),
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_subscribe_instrument_does_not_replay_cached_definition() {
+    let state = TestServerState::default();
+    *state.gamma_response.lock().await = Some(serde_json::json!([gamma_market_request_fixture()]));
+    let addr = start_mock_server(state).await;
+    let (mut client, mut rx) = create_test_data_client(addr);
+    let instrument_id = yes_instrument_id();
+
+    let request_id = UUID4::new();
+    client
+        .request_instrument(RequestInstrument::new(
+            instrument_id,
+            None,
+            None,
+            Some(*POLYMARKET_CLIENT_ID),
+            request_id,
+            UnixNanos::default(),
+            None,
+        ))
+        .expect("prime cache");
+    let prime_events =
+        collect_data_events_until_response(&mut rx, request_id, Duration::from_secs(5)).await;
+    assert_eq!(
+        prime_events
+            .iter()
+            .filter(|event| matches!(event, DataEvent::Instrument(_)))
+            .count(),
+        1,
+    );
+
+    client
+        .subscribe_instrument(SubscribeInstrument::new(
+            instrument_id,
+            Some(*POLYMARKET_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .expect("subscribe instrument");
+
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    client
+        .unsubscribe_instrument(&UnsubscribeInstrument::new(
+            instrument_id,
+            Some(*POLYMARKET_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .expect("unsubscribe instrument");
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[rstest]
+#[case::book_depth10(
+    UnsupportedGenericSubscription::BookDepth10,
+    "Polymarket does not support OrderBookDepth10 subscriptions; use managed L2_MBP order book deltas"
+)]
+#[case::instrument_status(
+    UnsupportedGenericSubscription::InstrumentStatus,
+    "Polymarket does not support generic instrument status subscriptions; resolution status is owned by position tracking"
+)]
+#[case::instrument_close(
+    UnsupportedGenericSubscription::InstrumentClose,
+    "Polymarket does not support generic instrument close subscriptions; resolution close is owned by position tracking"
+)]
+#[tokio::test]
+async fn test_unsupported_generic_subscription_returns_exact_reason(
+    #[case] subscription: UnsupportedGenericSubscription,
+    #[case] expected: &str,
+) {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx) = create_test_data_client(addr);
+    let instrument_id = yes_instrument_id();
+
+    let result = match subscription {
+        UnsupportedGenericSubscription::BookDepth10 => {
+            client.subscribe_book_depth10(SubscribeBookDepth10::new(
+                instrument_id,
+                BookType::L2_MBP,
+                Some(*POLYMARKET_CLIENT_ID),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                NonZeroUsize::new(10),
+                true,
+                None,
+                None,
+            ))
+        }
+        UnsupportedGenericSubscription::InstrumentStatus => {
+            client.subscribe_instrument_status(SubscribeInstrumentStatus::new(
+                instrument_id,
+                Some(*POLYMARKET_CLIENT_ID),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ))
+        }
+        UnsupportedGenericSubscription::InstrumentClose => {
+            client.subscribe_instrument_close(SubscribeInstrumentClose::new(
+                instrument_id,
+                Some(*POLYMARKET_CLIENT_ID),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ))
+        }
+    };
+
+    let error = result.expect_err("subscription should be unsupported");
+    assert_eq!(error.to_string(), expected);
 }
 
 #[rstest]
 #[tokio::test]
 async fn test_request_instrument_not_found_emits_no_publish() {
-    // Gamma returns an empty array. The instrument lookup misses, the
-    // method logs an error, and no events are emitted.
     let state = TestServerState::default();
     *state.gamma_response.lock().await = Some(serde_json::json!([]));
-    let addr = start_mock_server(state.clone()).await;
+    let addr = start_mock_server(state).await;
     let (client, mut rx) = create_test_data_client(addr);
 
     let request = RequestInstrument::new(
@@ -305,6 +740,8 @@ async fn test_request_instrument_not_found_emits_no_publish() {
         .request_instrument(request)
         .expect("request_instrument");
 
+    // A missing instrument produces no terminal response, so this is the one deliberate bounded
+    // absence window in these tests.
     let events = drain_data_events(&mut rx, Duration::from_millis(500)).await;
     assert!(
         events.is_empty(),
@@ -316,23 +753,26 @@ async fn test_request_instrument_not_found_emits_no_publish() {
 #[tokio::test]
 async fn test_request_instruments_emits_response() {
     let state = TestServerState::default();
-    *state.gamma_response.lock().await = Some(serde_json::json!([gamma_market_fixture()]));
+    *state.gamma_response.lock().await = Some(serde_json::json!([gamma_market_request_fixture()]));
     let addr = start_mock_server(state.clone()).await;
     let (client, mut rx) = create_test_data_client(addr);
 
+    let instrument_request_id = UUID4::new();
     let instrument_request = RequestInstrument::new(
         yes_instrument_id(),
         None,
         None,
         Some(*POLYMARKET_CLIENT_ID),
-        UUID4::new(),
+        instrument_request_id,
         nautilus_core::UnixNanos::default(),
         None,
     );
     client
         .request_instrument(instrument_request)
         .expect("request_instrument");
-    let _ = drain_data_events(&mut rx, Duration::from_secs(5)).await;
+    let _ =
+        collect_data_events_until_response(&mut rx, instrument_request_id, Duration::from_secs(5))
+            .await;
 
     *state.gamma_response.lock().await = Some(serde_json::json!([]));
 
@@ -350,7 +790,8 @@ async fn test_request_instruments_emits_response() {
         .request_instruments(request)
         .expect("request_instruments");
 
-    let events = drain_data_events(&mut rx, Duration::from_secs(5)).await;
+    let events =
+        collect_data_events_until_response(&mut rx, request_id, Duration::from_secs(5)).await;
 
     let response_count = events
         .iter()
@@ -394,32 +835,33 @@ async fn test_request_instruments_emits_response() {
 #[rstest]
 #[tokio::test]
 async fn test_request_book_snapshot_returns_book_response() {
-    // request_book_snapshot needs the instrument cached; we prime the
-    // cache by issuing a request_instrument first, then the book snapshot.
     let state = TestServerState::default();
-    *state.gamma_response.lock().await = Some(serde_json::json!([gamma_market_fixture()]));
+    *state.gamma_response.lock().await = Some(serde_json::json!([gamma_market_request_fixture()]));
     let addr = start_mock_server(state).await;
     let (client, mut rx) = create_test_data_client(addr);
 
     let instrument_id = yes_instrument_id();
 
+    let request_id = UUID4::new();
     let request = RequestInstrument::new(
         instrument_id,
         None,
         None,
         None,
-        UUID4::new(),
+        request_id,
         nautilus_core::UnixNanos::default(),
         None,
     );
     client.request_instrument(request).expect("prime cache");
-    let _prime_events = drain_data_events(&mut rx, Duration::from_secs(5)).await;
+    let _prime_events =
+        collect_data_events_until_response(&mut rx, request_id, Duration::from_secs(5)).await;
 
+    let snapshot_request_id = UUID4::new();
     let snapshot_request = RequestBookSnapshot::new(
         instrument_id,
         Some(NonZeroUsize::new(10).unwrap()),
         Some(*POLYMARKET_CLIENT_ID),
-        UUID4::new(),
+        snapshot_request_id,
         nautilus_core::UnixNanos::default(),
         None,
     );
@@ -427,7 +869,9 @@ async fn test_request_book_snapshot_returns_book_response() {
         .request_book_snapshot(snapshot_request)
         .expect("request_book_snapshot");
 
-    let events = drain_data_events(&mut rx, Duration::from_secs(5)).await;
+    let events =
+        collect_data_events_until_response(&mut rx, snapshot_request_id, Duration::from_secs(5))
+            .await;
     let book_response_count = events
         .iter()
         .filter(|e| matches!(e, DataEvent::Response(DataResponse::Book(_))))
@@ -441,11 +885,6 @@ async fn test_request_book_snapshot_returns_book_response() {
 #[rstest]
 #[tokio::test]
 async fn test_request_trades_returns_trades_response() {
-    // The data API returns trades for all outcomes of a condition; the
-    // adapter filters by token_id. Build an inline fixture where two
-    // trades match TEST_TOKEN_ID_YES and one belongs to a sibling token,
-    // so we exercise the filter and assert exact counts/fields rather
-    // than a bare "response was emitted" check.
     let other_token = "0".repeat(76);
     let trades_fixture = serde_json::json!([
         {
@@ -487,33 +926,35 @@ async fn test_request_trades_returns_trades_response() {
     ]);
 
     let state = TestServerState::default();
-    *state.gamma_response.lock().await = Some(serde_json::json!([gamma_market_fixture()]));
+    *state.gamma_response.lock().await = Some(serde_json::json!([gamma_market_request_fixture()]));
     *state.trades_response.lock().await = Some(trades_fixture);
     let addr = start_mock_server(state).await;
     let (client, mut rx) = create_test_data_client(addr);
 
     let instrument_id = yes_instrument_id();
 
-    // Prime cache so request_trades can resolve the instrument.
+    let request_id = UUID4::new();
     let request = RequestInstrument::new(
         instrument_id,
         None,
         None,
         None,
-        UUID4::new(),
+        request_id,
         nautilus_core::UnixNanos::default(),
         None,
     );
     client.request_instrument(request).expect("prime cache");
-    let _prime_events = drain_data_events(&mut rx, Duration::from_secs(5)).await;
+    let _prime_events =
+        collect_data_events_until_response(&mut rx, request_id, Duration::from_secs(5)).await;
 
+    let trades_request_id = UUID4::new();
     let trades_request = RequestTrades::new(
         instrument_id,
         None,
         None,
         Some(NonZeroUsize::new(50).unwrap()),
         Some(*POLYMARKET_CLIENT_ID),
-        UUID4::new(),
+        trades_request_id,
         nautilus_core::UnixNanos::default(),
         None,
     );
@@ -521,7 +962,9 @@ async fn test_request_trades_returns_trades_response() {
         .request_trades(trades_request)
         .expect("request_trades");
 
-    let events = drain_data_events(&mut rx, Duration::from_secs(5)).await;
+    let events =
+        collect_data_events_until_response(&mut rx, trades_request_id, Duration::from_secs(5))
+            .await;
     let trades_response = events
         .iter()
         .find_map(|e| match e {
@@ -534,7 +977,6 @@ async fn test_request_trades_returns_trades_response() {
         trades_response.instrument_id, instrument_id,
         "response must carry the requested instrument_id",
     );
-    // Two of three trades match TEST_TOKEN_ID_YES; the sibling token is filtered out.
     assert_eq!(
         trades_response.data.len(),
         2,
@@ -561,28 +1003,165 @@ async fn test_request_trades_returns_trades_response() {
 
 #[rstest]
 #[tokio::test]
-async fn test_reset_reconnect_does_not_replay_stale_market_subscriptions() {
-    // Rotation safety regression:
-    // after reset(), reconnect must not replay stale market subscriptions from
-    // a previous generation. A new subscribe should be required for the next
-    // active instrument cycle.
+async fn test_request_trades_emits_no_response_on_data_api_error() {
     let state = TestServerState::default();
-    *state.gamma_response.lock().await = Some(serde_json::json!([gamma_market_fixture()]));
+    *state.gamma_response.lock().await = Some(serde_json::json!([gamma_market_request_fixture()]));
+    state.trades_error.store(true, Ordering::Relaxed);
     let addr = start_mock_server(state.clone()).await;
-    let (mut client, mut rx) = create_test_data_client(addr);
+    let (client, mut rx) = create_test_data_client(addr);
     let instrument_id = yes_instrument_id();
 
+    let request_id = UUID4::new();
+    client
+        .request_instrument(RequestInstrument::new(
+            instrument_id,
+            None,
+            None,
+            None,
+            request_id,
+            UnixNanos::default(),
+            None,
+        ))
+        .expect("prime cache");
+    let _prime_events =
+        collect_data_events_until_response(&mut rx, request_id, Duration::from_secs(5)).await;
+
+    let trades_request_id = UUID4::new();
+    client
+        .request_trades(RequestTrades::new(
+            instrument_id,
+            None,
+            None,
+            None,
+            Some(*POLYMARKET_CLIENT_ID),
+            trades_request_id,
+            UnixNanos::default(),
+            None,
+        ))
+        .expect("request_trades");
+
+    wait_until_async(
+        || async { state.trades_request_count.load(Ordering::Relaxed) == 1 },
+        Duration::from_secs(5),
+    )
+    .await;
+    let events = drain_data_events(&mut rx, Duration::from_secs(1)).await;
+    let response_count = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                DataEvent::Response(response) if response.correlation_id() == &trades_request_id
+            )
+        })
+        .count();
+
+    assert_eq!(state.trades_request_count.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        response_count, 0,
+        "Data API errors must not emit a correlated success; events were: {events:?}",
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_trades_emits_one_empty_response_for_empty_result() {
+    let state = TestServerState::default();
+    *state.gamma_response.lock().await = Some(serde_json::json!([gamma_market_request_fixture()]));
+    *state.trades_response.lock().await = Some(serde_json::json!([]));
+    let addr = start_mock_server(state).await;
+    let (client, mut rx) = create_test_data_client(addr);
+    let instrument_id = yes_instrument_id();
+
+    let request_id = UUID4::new();
+    client
+        .request_instrument(RequestInstrument::new(
+            instrument_id,
+            None,
+            None,
+            None,
+            request_id,
+            UnixNanos::default(),
+            None,
+        ))
+        .expect("prime cache");
+    let _prime_events =
+        collect_data_events_until_response(&mut rx, request_id, Duration::from_secs(5)).await;
+
+    let trades_request_id = UUID4::new();
+    client
+        .request_trades(RequestTrades::new(
+            instrument_id,
+            None,
+            None,
+            None,
+            Some(*POLYMARKET_CLIENT_ID),
+            trades_request_id,
+            UnixNanos::default(),
+            None,
+        ))
+        .expect("request_trades");
+
+    let events =
+        collect_data_events_until_response(&mut rx, trades_request_id, Duration::from_secs(5))
+            .await;
+    let trades_responses = events
+        .iter()
+        .filter_map(|event| match event {
+            DataEvent::Response(DataResponse::Trades(response))
+                if response.correlation_id == trades_request_id =>
+            {
+                Some(response)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        trades_responses.len(),
+        1,
+        "an empty Data API result must emit exactly one correlated trades response; events were: {events:?}",
+    );
+    assert_eq!(trades_responses[0].instrument_id, instrument_id);
+    assert!(trades_responses[0].data.is_empty());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_stop_reconnect_recreates_market_message_receiver() {
+    let state = TestServerState::default();
+    *state.gamma_response.lock().await = Some(serde_json::json!([gamma_market_request_fixture()]));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx) = create_test_data_client(addr);
+
+    client.connect().await.expect("connect #1");
+    client.stop().expect("stop");
+    client.connect().await.expect("connect #2");
+    client.disconnect().await.expect("disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_reset_reconnect_does_not_replay_stale_market_subscriptions() {
+    let state = TestServerState::default();
+    *state.gamma_response.lock().await = Some(serde_json::json!([gamma_market_request_fixture()]));
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx) = create_test_data_client_with_new_markets(addr, true);
+    let instrument_id = yes_instrument_id();
+
+    let prime_1_request_id = UUID4::new();
     let prime_1 = RequestInstrument::new(
         instrument_id,
         None,
         None,
         Some(*POLYMARKET_CLIENT_ID),
-        UUID4::new(),
+        prime_1_request_id,
         UnixNanos::default(),
         None,
     );
     client.request_instrument(prime_1).expect("prime cache #1");
-    let _ = drain_data_events(&mut rx, Duration::from_secs(5)).await;
+    let _ = collect_data_events_until_response(&mut rx, prime_1_request_id, Duration::from_secs(5))
+        .await;
 
     client.connect().await.expect("connect #1");
 
@@ -597,31 +1176,31 @@ async fn test_reset_reconnect_does_not_replay_stale_market_subscriptions() {
     );
     client.subscribe_quotes(sub_1).expect("subscribe quotes #1");
 
-    wait_for_market_payload_count(&state, 1, Duration::from_secs(5)).await;
+    wait_for_market_payload_count(&state, 1, false, Duration::from_secs(5)).await;
 
     client.reset().expect("reset");
     client.connect().await.expect("connect #2");
 
-    // Give reconnect path time to replay (if stale state leaked).
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let replay_count = state.market_payloads.lock().await.len();
+    wait_for_market_payload_count(&state, 2, true, Duration::from_secs(5)).await;
+    let replay_count = market_payload_count(&state, false).await;
     assert_eq!(
         replay_count, 1,
         "reset + reconnect must not replay stale market subscriptions, saw {replay_count} payload(s)",
     );
 
-    // Reset clears instrument cache; prime current active instrument again.
+    let prime_2_request_id = UUID4::new();
     let prime_2 = RequestInstrument::new(
         instrument_id,
         None,
         None,
         Some(*POLYMARKET_CLIENT_ID),
-        UUID4::new(),
+        prime_2_request_id,
         UnixNanos::default(),
         None,
     );
     client.request_instrument(prime_2).expect("prime cache #2");
-    let _ = drain_data_events(&mut rx, Duration::from_secs(5)).await;
+    let _ = collect_data_events_until_response(&mut rx, prime_2_request_id, Duration::from_secs(5))
+        .await;
 
     let sub_2 = SubscribeQuotes::new(
         instrument_id,
@@ -634,7 +1213,7 @@ async fn test_reset_reconnect_does_not_replay_stale_market_subscriptions() {
     );
     client.subscribe_quotes(sub_2).expect("subscribe quotes #2");
 
-    wait_for_market_payload_count(&state, 2, Duration::from_secs(5)).await;
+    wait_for_market_payload_count(&state, 2, false, Duration::from_secs(5)).await;
 
     client.disconnect().await.expect("disconnect");
 }

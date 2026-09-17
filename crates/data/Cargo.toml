@@ -23,14 +23,10 @@ crate-type = ["rlib"]
 [features]
 default = []
 streaming = ["nautilus-persistence"]
-ffi = [
-  "nautilus-common/ffi",
-  "nautilus-core/ffi",
-  "nautilus-model/ffi",
-  "nautilus-persistence/ffi",
-  "streaming",
+high-precision = [
+  "nautilus-model/high-precision",
+  "nautilus-serialization/high-precision",
 ]
-high-precision = ["nautilus-model/high-precision"]
 extension-module = [
   "nautilus-core/extension-module",
   "nautilus-model/extension-module",
@@ -51,22 +47,23 @@ defi = [
 ]
 
 [package.metadata.docs.rs]
-all-features = true
+# Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
+features = ["defi", "high-precision", "streaming"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 nautilus-common = { workspace = true }
 nautilus-core = { workspace = true }
-nautilus-model = { workspace = true, features = ["stubs"] }
+nautilus-model = { workspace = true, features = ["test-support"] }
 nautilus-persistence = { workspace = true, optional = true }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
-chrono = { workspace = true }
 futures = { workspace = true }
 indexmap = { workspace = true }
+jiff = { workspace = true }
 log = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
@@ -88,4 +85,9 @@ tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
 # Run with `cargo bench -p nautilus-data --bench engine`
 [[bench]]
 name = "engine"
+harness = false
+
+# Run with `cargo bench -p nautilus-data --bench aggregation`
+[[bench]]
+name = "aggregation"
 harness = false

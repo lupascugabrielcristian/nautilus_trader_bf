@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.binance",
+        module = "nautilus_trader.adapters.binance",
         eq,
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE"
@@ -120,7 +120,7 @@ impl Display for BinanceProductType {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.binance",
+        module = "nautilus_trader.adapters.binance",
         eq,
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE"
@@ -171,7 +171,6 @@ impl TryFrom<OrderSide> for BinanceSide {
         match value {
             OrderSide::Buy => Ok(Self::Buy),
             OrderSide::Sell => Ok(Self::Sell),
-            _ => anyhow::bail!("Unsupported `OrderSide` for Binance: {value:?}"),
         }
     }
 }
@@ -190,11 +189,7 @@ impl From<BinanceSide> for OrderSide {
 #[serde(rename_all = "UPPERCASE")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.binance",
-        eq,
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.adapters.binance", eq, from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -221,7 +216,7 @@ pub enum BinancePositionSide {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.binance",
+        module = "nautilus_trader.adapters.binance",
         eq,
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE"
@@ -557,6 +552,22 @@ pub enum BinanceTradingStatus {
     AuctionMatch,
     /// Break period.
     Break,
+    /// Pre-delivering.
+    PreDelivering,
+    /// Delivering.
+    Delivering,
+    /// Delivered.
+    Delivered,
+    /// Pre-settlement.
+    PreSettle,
+    /// Settling.
+    Settling,
+    /// Closed.
+    Close,
+    /// Trading is halted for an otherwise active contract.
+    TradingHalt,
+    /// New orders are blocked while cancellation remains available.
+    TradingCancelOnly,
     /// Unknown or undocumented value.
     #[serde(other)]
     Unknown,
@@ -574,6 +585,14 @@ impl From<BinanceTradingStatus> for MarketStatusAction {
             BinanceTradingStatus::Halt => Self::Halt,
             BinanceTradingStatus::AuctionMatch => Self::Cross,
             BinanceTradingStatus::Break => Self::Pause,
+            BinanceTradingStatus::PreDelivering | BinanceTradingStatus::PreSettle => Self::PreClose,
+            BinanceTradingStatus::Delivering
+            | BinanceTradingStatus::Delivered
+            | BinanceTradingStatus::Settling
+            | BinanceTradingStatus::Close => Self::Close,
+            BinanceTradingStatus::TradingHalt | BinanceTradingStatus::TradingCancelOnly => {
+                Self::Halt
+            }
             BinanceTradingStatus::Unknown => Self::NotAvailableForTrading,
         }
     }
@@ -585,6 +604,8 @@ impl From<BinanceTradingStatus> for MarketStatusAction {
 pub enum BinanceContractStatus {
     /// Trading is active.
     Trading,
+    /// Trading is halted for an otherwise active contract.
+    TradingHalt,
     /// Pending trading.
     PendingTrading,
     /// Pre-delivering.
@@ -605,6 +626,8 @@ pub enum BinanceContractStatus {
     Delisting,
     /// Contract down.
     Down,
+    /// New orders are blocked while cancellation remains available.
+    TradingCancelOnly,
     /// Unknown or undocumented value.
     #[serde(other)]
     Unknown,
@@ -614,6 +637,9 @@ impl From<BinanceContractStatus> for MarketStatusAction {
     fn from(status: BinanceContractStatus) -> Self {
         match status {
             BinanceContractStatus::Trading => Self::Trading,
+            BinanceContractStatus::TradingHalt | BinanceContractStatus::TradingCancelOnly => {
+                Self::Halt
+            }
             BinanceContractStatus::PendingTrading => Self::PreOpen,
             BinanceContractStatus::PreDelivering
             | BinanceContractStatus::PreDelisting
@@ -994,6 +1020,16 @@ mod tests {
     fn test_margin_type_unknown_fallback() {
         let value: BinanceMarginType = serde_json::from_str("\"SOMETHING_NEW\"").unwrap();
         assert_eq!(value, BinanceMarginType::Unknown);
+    }
+
+    #[rstest]
+    fn test_contract_status_trading_halt_deserializes_and_maps() {
+        // Binance reports `TRADING_HALT` for a temporarily halted active contract.
+        // It must deserialize to the explicit variant (not the `Unknown` fallback)
+        // and map deliberately to `Halt`.
+        let status: BinanceContractStatus = serde_json::from_str("\"TRADING_HALT\"").unwrap();
+        assert_eq!(status, BinanceContractStatus::TradingHalt);
+        assert_eq!(MarketStatusAction::from(status), MarketStatusAction::Halt);
     }
 
     #[rstest]

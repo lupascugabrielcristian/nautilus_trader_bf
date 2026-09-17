@@ -31,7 +31,7 @@ const MAX_PERIOD: usize = 8_192;
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.indicators")
+    pyo3::pyclass(module = "nautilus_trader.indicators")
 )]
 #[cfg_attr(
     feature = "python",
@@ -138,8 +138,9 @@ impl Indicator for WeightedMovingAverage {
         self.initialized
     }
 
-    fn handle_quote(&mut self, quote: &QuoteTick) {
-        self.update_raw(quote.extract_price(self.price_type).into());
+    fn handle_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
+        self.update_raw(quote.extract_price(self.price_type)?.into());
+        Ok(())
     }
 
     fn handle_trade(&mut self, trade: &TradeTick) {
@@ -187,6 +188,7 @@ mod tests {
         average::wma::WeightedMovingAverage,
         indicator::{Indicator, MovingAverage},
         stubs::*,
+        testing::assert_approx_equal,
     };
 
     #[rstest]
@@ -261,7 +263,7 @@ mod tests {
         for i in 1..=11 {
             indicator_wma_10.update_raw(f64::from(i));
         }
-        assert_eq!(indicator_wma_10.value(), 8.000_000_000_000_002);
+        assert_approx_equal(indicator_wma_10.value(), 8.0);
     }
 
     #[rstest]

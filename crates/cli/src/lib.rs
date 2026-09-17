@@ -48,6 +48,10 @@
 #![deny(clippy::missing_errors_doc)]
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
+#![allow(
+    clippy::assert_is_empty,
+    reason = "`assert!(x.is_empty())` is clearer than comparing against an empty value"
+)]
 
 #[cfg(feature = "defi")]
 mod blockchain;
@@ -60,6 +64,18 @@ use crate::{
     database::postgres::run_database_command,
     opt::{Commands, NautilusCli},
 };
+
+/// Builds the top-level CLI command, augmented with capability-aware blockchain help.
+///
+/// The blockchain subcommands gain `after_long_help` sections derived from the adapter's DEX
+/// registration maps when the `defi` feature is enabled.
+#[must_use]
+pub fn cli_command() -> clap::Command {
+    let command = <NautilusCli as clap::CommandFactory>::command();
+    #[cfg(feature = "defi")]
+    let command = crate::blockchain::augment_blockchain_help(command);
+    command
+}
 
 /// Runs the Nautilus CLI based on the provided options.
 ///

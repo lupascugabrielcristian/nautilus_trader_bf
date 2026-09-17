@@ -24,9 +24,12 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 
-use crate::spot::sbe::stream::{
-    BestBidAskStreamEvent, DepthDiffStreamEvent, DepthSnapshotStreamEvent, MessageHeader,
-    StreamDecodeError, TradesStreamEvent, template_id,
+use crate::{
+    common::parse::parse_micros_or_init,
+    spot::sbe::stream::{
+        BestBidAskStreamEvent, DepthDiffStreamEvent, DepthSnapshotStreamEvent, MessageHeader,
+        StreamDecodeError, TradesStreamEvent, template_id,
+    },
 };
 
 /// Decoded market data message.
@@ -72,8 +75,13 @@ pub fn decode_market_data(buf: &[u8]) -> Result<MarketDataMessage, StreamDecodeE
     }
 }
 
-/// Parses a trades stream event into a vector of `TradeTick`.
-pub fn parse_trades_event(event: &TradesStreamEvent, instrument: &InstrumentAny) -> Vec<Data> {
+/// Parses a trades stream event into a vector of `TradeTick` using the supplied
+/// adapter initialization timestamp.
+pub fn parse_trades_event(
+    event: &TradesStreamEvent,
+    instrument: &InstrumentAny,
+    ts_init: UnixNanos,
+) -> Vec<Data> {
     let instrument_id = instrument.id();
     let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
@@ -92,28 +100,37 @@ pub fn parse_trades_event(event: &TradesStreamEvent, instrument: &InstrumentAny)
                 event.qty_exponent,
                 size_precision,
             );
-            let ts_event = UnixNanos::from_micros(event.transact_time_us as u64);
+            let ts_event = parse_micros_or_init(
+                event.transact_time_us,
+                "Spot SBE stream transaction time",
+                ts_init,
+            );
 
             let trade = TradeTick::new(
                 instrument_id,
                 price,
                 size,
                 if t.is_buyer_maker {
-                    AggressorSide::Seller
+                    AggressorSide::Sell
                 } else {
-                    AggressorSide::Buyer
+                    AggressorSide::Buy
                 },
                 TradeId::new(t.id.to_string()),
                 ts_event,
-                ts_event,
+                ts_init,
             );
             Data::from(trade)
         })
         .collect()
 }
 
-/// Parses a best bid/ask event into a `QuoteTick`.
-pub fn parse_bbo_event(event: &BestBidAskStreamEvent, instrument: &InstrumentAny) -> QuoteTick {
+/// Parses a best bid/ask event into a `QuoteTick` using the supplied adapter
+/// initialization timestamp.
+pub fn parse_bbo_event(
+    event: &BestBidAskStreamEvent,
+    instrument: &InstrumentAny,
+    ts_init: UnixNanos,
+) -> QuoteTick {
     let instrument_id = instrument.id();
     let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
@@ -138,7 +155,7 @@ pub fn parse_bbo_event(event: &BestBidAskStreamEvent, instrument: &InstrumentAny
         event.qty_exponent,
         size_precision,
     );
-    let ts_event = UnixNanos::from_micros(event.event_time_us as u64);
+    let ts_event = parse_micros_or_init(event.event_time_us, "Spot SBE BBO event time", ts_init);
 
     QuoteTick::new(
         instrument_id,
@@ -147,21 +164,27 @@ pub fn parse_bbo_event(event: &BestBidAskStreamEvent, instrument: &InstrumentAny
         bid_size,
         ask_size,
         ts_event,
-        ts_event,
+        ts_init,
     )
 }
 
-/// Parses a depth snapshot event into `OrderBookDeltas`.
+/// Parses a depth snapshot event into `OrderBookDeltas` using the supplied
+/// adapter initialization timestamp for the aggregate and every inner delta.
 ///
 /// Returns `None` if the snapshot contains no levels.
 pub fn parse_depth_snapshot(
     event: &DepthSnapshotStreamEvent,
     instrument: &InstrumentAny,
+    ts_init: UnixNanos,
 ) -> Option<OrderBookDeltas> {
     let instrument_id = instrument.id();
     let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
-    let ts_event = UnixNanos::from_micros(event.event_time_us as u64);
+    let ts_event = parse_micros_or_init(
+        event.event_time_us,
+        "Spot SBE depth snapshot event time",
+        ts_init,
+    );
     let sequence = event.book_update_id as u64;
 
     let mut deltas = Vec::with_capacity(event.bids.len() + event.asks.len() + 1);
@@ -171,7 +194,7 @@ pub fn parse_depth_snapshot(
         instrument_id,
         sequence,
         ts_event,
-        ts_event,
+        ts_init,
     ));
 
     // Add bid levels
@@ -201,7 +224,7 @@ pub fn parse_depth_snapshot(
             flags,
             sequence,
             ts_event,
-            ts_event,
+            ts_init,
         ));
     }
 
@@ -232,7 +255,7 @@ pub fn parse_depth_snapshot(
             flags,
             sequence,
             ts_event,
-            ts_event,
+            ts_init,
         ));
     }
 
@@ -245,17 +268,23 @@ pub fn parse_depth_snapshot(
     Some(OrderBookDeltas::new(instrument_id, deltas))
 }
 
-/// Parses a depth diff event into `OrderBookDeltas`.
+/// Parses a depth diff event into `OrderBookDeltas` using the supplied adapter
+/// initialization timestamp for the aggregate and every inner delta.
 ///
 /// Returns `None` if the diff contains no updates.
 pub fn parse_depth_diff(
     event: &DepthDiffStreamEvent,
     instrument: &InstrumentAny,
+    ts_init: UnixNanos,
 ) -> Option<OrderBookDeltas> {
     let instrument_id = instrument.id();
     let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
-    let ts_event = UnixNanos::from_micros(event.event_time_us as u64);
+    let ts_event = parse_micros_or_init(
+        event.event_time_us,
+        "Spot SBE depth diff event time",
+        ts_init,
+    );
     let sequence = event.last_book_update_id as u64;
 
     let mut deltas = Vec::with_capacity(event.bids.len() + event.asks.len());
@@ -295,7 +324,7 @@ pub fn parse_depth_diff(
             flags,
             sequence,
             ts_event,
-            ts_event,
+            ts_init,
         ));
     }
 
@@ -333,7 +362,7 @@ pub fn parse_depth_diff(
             flags,
             sequence,
             ts_event,
-            ts_event,
+            ts_init,
         ));
     }
 
@@ -481,6 +510,7 @@ mod tests {
     #[rstest]
     fn test_parse_trades_event() {
         let instrument = sample_instrument();
+        let ts_init = UnixNanos::from(1_800_000_000_000_000_000u64);
         let event = TradesStreamEvent {
             event_time_us: 1_700_000_000_000_000,
             transact_time_us: 1_700_000_000_100_000,
@@ -503,7 +533,7 @@ mod tests {
             symbol: Ustr::from("ETHUSDT"),
         };
 
-        let data = parse_trades_event(&event, &instrument);
+        let data = parse_trades_event(&event, &instrument, ts_init);
 
         assert_eq!(data.len(), 2);
         match &data[0] {
@@ -511,19 +541,22 @@ mod tests {
                 assert_eq!(trade.instrument_id, instrument.id());
                 assert_eq!(trade.price, Price::new(123.45, 2));
                 assert_eq!(trade.size, Quantity::new(2.5, 4));
-                assert_eq!(trade.aggressor_side, AggressorSide::Buyer);
+                assert_eq!(trade.aggressor_side, AggressorSide::Buy);
                 assert_eq!(trade.trade_id, TradeId::new("1"));
                 assert_eq!(
                     trade.ts_event,
                     UnixNanos::from(1_700_000_000_100_000_000u64)
                 );
-                assert_eq!(trade.ts_init, UnixNanos::from(1_700_000_000_100_000_000u64));
+                assert_eq!(trade.ts_init, ts_init);
             }
             other => panic!("Expected trade data, was {other:?}"),
         }
 
         match &data[1] {
-            Data::Trade(trade) => assert_eq!(trade.aggressor_side, AggressorSide::Seller),
+            Data::Trade(trade) => {
+                assert_eq!(trade.aggressor_side, AggressorSide::Sell);
+                assert_eq!(trade.ts_init, ts_init);
+            }
             other => panic!("Expected trade data, was {other:?}"),
         }
     }
@@ -531,6 +564,7 @@ mod tests {
     #[rstest]
     fn test_parse_bbo_event() {
         let instrument = sample_instrument();
+        let ts_init = UnixNanos::from(1_800_000_000_000_000_000u64);
         let event = BestBidAskStreamEvent {
             event_time_us: 1_700_000_000_000_000,
             book_update_id: 123,
@@ -543,7 +577,7 @@ mod tests {
             symbol: Ustr::from("ETHUSDT"),
         };
 
-        let quote = parse_bbo_event(&event, &instrument);
+        let quote = parse_bbo_event(&event, &instrument, ts_init);
 
         assert_eq!(quote.instrument_id, instrument.id());
         assert_eq!(quote.bid_price, Price::new(123.45, 2));
@@ -554,12 +588,37 @@ mod tests {
             quote.ts_event,
             UnixNanos::from(1_700_000_000_000_000_000u64)
         );
-        assert_eq!(quote.ts_init, UnixNanos::from(1_700_000_000_000_000_000u64));
+        assert_eq!(quote.ts_init, ts_init);
+    }
+
+    #[rstest]
+    #[case::negative(-1)]
+    #[case::overflow(i64::MAX)]
+    fn test_parse_bbo_event_falls_back_for_invalid_timestamp(#[case] event_time_us: i64) {
+        let instrument = sample_instrument();
+        let event = BestBidAskStreamEvent {
+            event_time_us,
+            book_update_id: 123,
+            price_exponent: -2,
+            qty_exponent: -4,
+            bid_price_mantissa: 12_345,
+            bid_qty_mantissa: 25_000,
+            ask_price_mantissa: 12_350,
+            ask_qty_mantissa: 30_000,
+            symbol: Ustr::from("ETHUSDT"),
+        };
+
+        let ts_init = UnixNanos::from(1);
+        let quote = parse_bbo_event(&event, &instrument, ts_init);
+
+        assert_eq!(quote.ts_event, ts_init);
+        assert_eq!(quote.ts_init, ts_init);
     }
 
     #[rstest]
     fn test_parse_depth_snapshot() {
         let instrument = sample_instrument();
+        let ts_init = UnixNanos::from(1_800_000_000_000_000_000u64);
         let event = DepthSnapshotStreamEvent {
             event_time_us: 1_700_000_000_000_000,
             book_update_id: 123,
@@ -576,17 +635,17 @@ mod tests {
             symbol: Ustr::from("ETHUSDT"),
         };
 
-        let deltas = parse_depth_snapshot(&event, &instrument).unwrap();
+        let deltas = parse_depth_snapshot(&event, &instrument, ts_init).unwrap();
 
         assert_eq!(deltas.instrument_id, instrument.id());
         assert_eq!(deltas.deltas.len(), 3);
         assert_eq!(deltas.deltas[0].action, BookAction::Clear);
         assert_eq!(deltas.deltas[1].action, BookAction::Add);
-        assert_eq!(deltas.deltas[1].order.side, OrderSide::Buy);
+        assert_eq!(deltas.deltas[1].order.side, OrderSide::Buy.into());
         assert_eq!(deltas.deltas[1].order.price, Price::new(123.45, 2));
         assert_eq!(deltas.deltas[1].order.size, Quantity::new(2.5, 4));
         assert_eq!(deltas.deltas[2].action, BookAction::Add);
-        assert_eq!(deltas.deltas[2].order.side, OrderSide::Sell);
+        assert_eq!(deltas.deltas[2].order.side, OrderSide::Sell.into());
         assert_eq!(deltas.deltas[2].order.price, Price::new(123.50, 2));
         assert_eq!(deltas.deltas[2].order.size, Quantity::new(3.0, 4));
         assert_eq!(deltas.deltas[2].flags, RecordFlag::F_LAST as u8);
@@ -596,6 +655,8 @@ mod tests {
             deltas.ts_event,
             UnixNanos::from(1_700_000_000_000_000_000u64)
         );
+        assert_eq!(deltas.ts_init, ts_init);
+        assert!(deltas.deltas.iter().all(|delta| delta.ts_init == ts_init));
     }
 
     #[rstest]
@@ -611,7 +672,7 @@ mod tests {
             symbol: Ustr::from("ETHUSDT"),
         };
 
-        let deltas = parse_depth_snapshot(&event, &instrument);
+        let deltas = parse_depth_snapshot(&event, &instrument, UnixNanos::from(2));
 
         assert!(deltas.is_none());
     }
@@ -619,6 +680,7 @@ mod tests {
     #[rstest]
     fn test_parse_depth_diff() {
         let instrument = sample_instrument();
+        let ts_init = UnixNanos::from(1_800_000_000_000_000_000u64);
         let event = DepthDiffStreamEvent {
             event_time_us: 1_700_000_000_000_000,
             first_book_update_id: 100,
@@ -642,16 +704,16 @@ mod tests {
             symbol: Ustr::from("ETHUSDT"),
         };
 
-        let deltas = parse_depth_diff(&event, &instrument).unwrap();
+        let deltas = parse_depth_diff(&event, &instrument, ts_init).unwrap();
 
         assert_eq!(deltas.instrument_id, instrument.id());
         assert_eq!(deltas.deltas.len(), 3);
         assert_eq!(deltas.deltas[0].action, BookAction::Update);
-        assert_eq!(deltas.deltas[0].order.side, OrderSide::Buy);
+        assert_eq!(deltas.deltas[0].order.side, OrderSide::Buy.into());
         assert_eq!(deltas.deltas[1].action, BookAction::Delete);
-        assert_eq!(deltas.deltas[1].order.side, OrderSide::Buy);
+        assert_eq!(deltas.deltas[1].order.side, OrderSide::Buy.into());
         assert_eq!(deltas.deltas[2].action, BookAction::Update);
-        assert_eq!(deltas.deltas[2].order.side, OrderSide::Sell);
+        assert_eq!(deltas.deltas[2].order.side, OrderSide::Sell.into());
         assert_eq!(deltas.deltas[2].flags, RecordFlag::F_LAST as u8);
         assert_eq!(deltas.deltas[0].sequence, 101);
         assert_eq!(deltas.deltas[2].sequence, 101);
@@ -659,6 +721,8 @@ mod tests {
             deltas.ts_event,
             UnixNanos::from(1_700_000_000_000_000_000u64)
         );
+        assert_eq!(deltas.ts_init, ts_init);
+        assert!(deltas.deltas.iter().all(|delta| delta.ts_init == ts_init));
     }
 
     #[rstest]
@@ -675,7 +739,7 @@ mod tests {
             symbol: Ustr::from("ETHUSDT"),
         };
 
-        let deltas = parse_depth_diff(&event, &instrument);
+        let deltas = parse_depth_diff(&event, &instrument, UnixNanos::from(2));
 
         assert!(deltas.is_none());
     }

@@ -13,16 +13,14 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use nautilus_common::config::{ConfigError, ConfigErrorCollector, ConfigResult};
 use nautilus_core::serialization::default_true;
 use serde::{Deserialize, Serialize};
 
 /// Configuration for `Portfolio` instances.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.portfolio",
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.portfolio", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -40,14 +38,15 @@ use serde::{Deserialize, Serialize};
     reason = "config fields mirror the existing Python and serialization surface"
 )]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, bon::Builder)]
+#[builder(finish_fn(name = build_inner, vis = ""))]
 #[serde(deny_unknown_fields)]
 pub struct PortfolioConfig {
     /// The type of prices used for portfolio calculations, such as unrealized PnLs.
-    /// If false (default), uses quote prices if available; otherwise, last trade prices
-    /// (or falls back to bar prices if `bar_updates` is true).
-    /// If true, uses mark prices.
-    #[serde(default)]
-    #[builder(default)]
+    /// If true (default), prefers mark prices when available, then falls back to quote,
+    /// last trade, or bar prices when `bar_updates` is true. If false, skips mark prices
+    /// and uses the fallback chain.
+    #[serde(default = "default_true")]
+    #[builder(default = true)]
     pub use_mark_prices: bool,
     /// The type of exchange rates used for portfolio calculations.
     /// If false (default), uses quote prices.
@@ -64,6 +63,15 @@ pub struct PortfolioConfig {
     #[serde(default = "default_true")]
     #[builder(default = true)]
     pub convert_to_account_base_currency: bool,
+    /// If mark-to-market equity snapshots should be recorded and published for every account.
+    ///
+    /// Enabled by default. Records at account registration, every UTC midnight including
+    /// while flat, and shutdown. Disable for workloads such as optimizer runs that do not
+    /// consume an equity curve. This does not affect on-demand equity calculations or the
+    /// opt-in fine-grained `snapshot_interval_ms` stream.
+    #[serde(default = "default_true")]
+    #[builder(default = true)]
+    pub equity_curve: bool,
     /// The minimum interval (milliseconds) between logging account state events for the same account.
     /// When set, account state updates will only be logged if this much time has passed since the last log.
     /// Useful for HFT deployments to prevent excessive logging when account states change rapidly.
@@ -72,8 +80,8 @@ pub struct PortfolioConfig {
     /// The interval (milliseconds) between portfolio snapshot emissions per account.
     /// When set, a [`PortfolioSnapshot`] is emitted at this cadence while the
     /// account holds at least one open position, carrying continuous
-    /// mark-to-market equity. When `None` (the default), no periodic snapshots
-    /// are emitted.
+    /// mark-to-market equity. When `None` (the default), no fine-grained snapshots
+    /// are emitted; the `equity_curve` setting still controls daily snapshots.
     ///
     /// [`PortfolioSnapshot`]: nautilus_model::events::PortfolioSnapshot
     #[serde(default)]
@@ -84,8 +92,115 @@ pub struct PortfolioConfig {
     pub debug: bool,
 }
 
+impl<S: portfolio_config_builder::IsComplete> PortfolioConfigBuilder<S> {
+    /// Validates and builds the [`PortfolioConfig`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConfigError`] if any field fails validation
+    /// (see [`PortfolioConfig::validate`]).
+    pub fn build(self) -> ConfigResult<PortfolioConfig> {
+        let config = self.build_inner();
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+impl PortfolioConfig {
+    /// Validates the portfolio configuration, collecting every field violation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConfigError`] (a [`ConfigError::Multiple`] when more than one field is
+    /// invalid) if any field fails validation.
+    pub fn validate(&self) -> ConfigResult<()> {
+        let mut errors = ConfigErrorCollector::new();
+
+        for (field, value) in [
+            (
+                "min_account_state_logging_interval_ms",
+                self.min_account_state_logging_interval_ms,
+            ),
+            ("snapshot_interval_ms", self.snapshot_interval_ms),
+        ] {
+            if let Some(ms) = value {
+                errors.check(
+                    ms > 0,
+                    ConfigError::range(
+                        field,
+                        format!("must be a positive number of milliseconds, was {ms}"),
+                    ),
+                );
+            }
+        }
+
+        errors.into_result()
+    }
+}
+
 impl Default for PortfolioConfig {
     fn default() -> Self {
-        Self::builder().build()
+        Self::builder()
+            .build()
+            .expect("default `PortfolioConfig` should be valid")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_default_config_is_valid() {
+        assert!(PortfolioConfig::builder().build().is_ok());
+    }
+
+    #[rstest]
+    fn test_default_config_enables_daily_equity_curve_only() {
+        let config = PortfolioConfig::default();
+
+        assert!(config.equity_curve);
+        assert_eq!(config.snapshot_interval_ms, None);
+    }
+
+    #[rstest]
+    fn test_zero_min_account_state_logging_interval_rejected() {
+        let result = PortfolioConfig::builder()
+            .min_account_state_logging_interval_ms(0)
+            .build();
+        assert!(
+            matches!(result, Err(ConfigError::Range { field, .. }) if field == "min_account_state_logging_interval_ms")
+        );
+    }
+
+    #[rstest]
+    fn test_zero_snapshot_interval_rejected() {
+        let result = PortfolioConfig::builder().snapshot_interval_ms(0).build();
+        assert!(
+            matches!(result, Err(ConfigError::Range { field, .. }) if field == "snapshot_interval_ms")
+        );
+    }
+
+    #[rstest]
+    fn test_positive_intervals_accepted() {
+        let result = PortfolioConfig::builder()
+            .min_account_state_logging_interval_ms(1_000)
+            .snapshot_interval_ms(5_000)
+            .build();
+        assert!(result.is_ok());
+    }
+
+    #[rstest]
+    fn test_multiple_violations_collected() {
+        let result = PortfolioConfig::builder()
+            .min_account_state_logging_interval_ms(0)
+            .snapshot_interval_ms(0)
+            .build();
+        let ConfigError::Multiple { errors } = result.unwrap_err() else {
+            panic!("expected ConfigError::Multiple");
+        };
+        assert_eq!(errors.len(), 2);
     }
 }

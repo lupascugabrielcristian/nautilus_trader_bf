@@ -24,7 +24,7 @@ use std::{
 use ahash::AHashMap;
 use derive_builder::Builder;
 use futures_util::future::BoxFuture;
-use nautilus_common::live::get_runtime;
+use nautilus_live::task::TaskGroup;
 use tokio::{
     sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     time,
@@ -171,34 +171,48 @@ pub struct ScheduledPost {
 pub struct PostBatcher {
     tx_alo: mpsc::Sender<ScheduledPost>,
     tx_normal: mpsc::Sender<ScheduledPost>,
+    _tasks: TaskGroup,
 }
 
 impl PostBatcher {
     /// Spawns two lane tasks that batch-send scheduled posts via `send_fn`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the new task group rejects either initial lane task.
     pub fn new<F>(send_fn: F) -> Self
     where
         F: Send + 'static + Clone + FnMut(HyperliquidWsRequest) -> BoxFuture<'static, Result<()>>,
     {
         let (tx_alo, rx_alo) = mpsc::channel::<ScheduledPost>(1024);
         let (tx_normal, rx_normal) = mpsc::channel::<ScheduledPost>(4096);
+        let tasks = TaskGroup::new();
 
         // ALO lane: batchy tick, low jitter
-        get_runtime().spawn(Self::run_lane(
-            "ALO",
-            rx_alo,
-            Duration::from_millis(100),
-            send_fn.clone(),
-        ));
+        tasks
+            .spawn(Self::run_lane(
+                "ALO",
+                rx_alo,
+                Duration::from_millis(100),
+                send_fn.clone(),
+            ))
+            .expect("new post batcher accepts ALO lane task");
 
         // NORMAL lane: faster tick; adjust as needed
-        get_runtime().spawn(Self::run_lane(
-            "NORMAL",
-            rx_normal,
-            Duration::from_millis(50),
-            send_fn,
-        ));
+        tasks
+            .spawn(Self::run_lane(
+                "NORMAL",
+                rx_normal,
+                Duration::from_millis(50),
+                send_fn,
+            ))
+            .expect("new post batcher accepts normal lane task");
 
-        Self { tx_alo, tx_normal }
+        Self {
+            tx_alo,
+            tx_normal,
+            _tasks: tasks,
+        }
     }
 
     async fn run_lane<F>(
@@ -233,7 +247,7 @@ impl PostBatcher {
                 }
             }
         }
-        log::info!("Post lane terminated: lane={lane_name}");
+        log::debug!("Post lane terminated: lane={lane_name}");
     }
 
     pub async fn enqueue(&self, item: ScheduledPost) -> Result<()> {
@@ -482,6 +496,7 @@ pub fn cancel_many(cancels: Vec<(u32, u64)>) -> ActionRequest {
             .into_iter()
             .map(|(a, o)| CancelRequest { a, o })
             .collect(),
+        fast: None,
     }
 }
 pub fn cancel_by_cloid(asset: u32, cloid: impl Into<String>) -> ActionRequest {
@@ -490,6 +505,7 @@ pub fn cancel_by_cloid(asset: u32, cloid: impl Into<String>) -> ActionRequest {
             asset,
             cloid: cloid.into(),
         }],
+        fast: None,
     }
 }
 pub fn modify(oid: u64, new_order: OrderRequest) -> ActionRequest {
@@ -615,19 +631,16 @@ pub fn classify_action_payload(payload: &serde_json::Value) -> ActionOutcome<'_>
 
 #[derive(Clone, Debug)]
 pub struct WsSender {
-    inner: Arc<tokio::sync::Mutex<mpsc::Sender<HyperliquidWsRequest>>>,
+    inner: mpsc::Sender<HyperliquidWsRequest>,
 }
 
 impl WsSender {
     pub fn new(tx: mpsc::Sender<HyperliquidWsRequest>) -> Self {
-        Self {
-            inner: Arc::new(tokio::sync::Mutex::new(tx)),
-        }
+        Self { inner: tx }
     }
 
     pub async fn send(&self, req: HyperliquidWsRequest) -> Result<()> {
-        let sender = self.inner.lock().await;
-        sender
+        self.inner
             .send(req)
             .await
             .map_err(|_| Error::transport("WebSocket sender closed"))
@@ -636,7 +649,9 @@ impl WsSender {
 
 #[cfg(test)]
 mod tests {
-    use nautilus_common::testing::wait_until_async;
+    use std::sync::atomic::AtomicUsize;
+
+    use nautilus_common::{live::get_runtime, testing::wait_until_async};
     use rstest::rstest;
     use tokio::{
         sync::oneshot,
@@ -651,6 +666,14 @@ mod tests {
             OrderRequestBuilder, OrderTypeRequest, TimeInForceRequest,
         },
     };
+
+    struct DropCounter(Arc<AtomicUsize>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     fn mk_limit_alo(asset: u32) -> OrderRequest {
         OrderRequest {
@@ -679,6 +702,23 @@ mod tests {
             },
             c: None,
         }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_ws_sender_forwards_and_reports_closed_channel() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let sender = WsSender::new(tx);
+
+        sender.send(HyperliquidWsRequest::Ping).await.unwrap();
+        assert!(matches!(rx.recv().await, Some(HyperliquidWsRequest::Ping)));
+
+        drop(rx);
+        let error = sender.send(HyperliquidWsRequest::Ping).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "transport error: WebSocket sender closed"
+        );
     }
 
     #[rstest]
@@ -1019,5 +1059,57 @@ mod tests {
 
         let actual = sent.lock().await.clone();
         assert_eq!(actual, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_batcher_drop_aborts_lane_tasks() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let started_send = Arc::clone(&started);
+        let dropped_send = Arc::clone(&dropped);
+        let send_fn = move |_req: HyperliquidWsRequest| -> BoxFuture<'static, Result<()>> {
+            let started = Arc::clone(&started_send);
+            let dropped = Arc::clone(&dropped_send);
+            Box::pin(async move {
+                let _drop_counter = DropCounter(dropped);
+                started.fetch_add(1, Ordering::Relaxed);
+                std::future::pending::<Result<()>>().await
+            })
+        };
+        let batcher = PostBatcher::new(send_fn);
+
+        for (id, lane) in [(1, PostLane::Alo), (2, PostLane::Normal)] {
+            batcher
+                .enqueue(ScheduledPost {
+                    id,
+                    request: info_all_mids(),
+                    lane,
+                })
+                .await
+                .unwrap();
+        }
+        let started_check = Arc::clone(&started);
+        wait_until_async(
+            || {
+                let started = Arc::clone(&started_check);
+                async move { started.load(Ordering::Relaxed) == 2 }
+            },
+            Duration::from_secs(1),
+        )
+        .await;
+
+        drop(batcher);
+
+        let dropped_check = Arc::clone(&dropped);
+        wait_until_async(
+            || {
+                let dropped = Arc::clone(&dropped_check);
+                async move { dropped.load(Ordering::Relaxed) == 2 }
+            },
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(dropped.load(Ordering::Relaxed), 2);
     }
 }

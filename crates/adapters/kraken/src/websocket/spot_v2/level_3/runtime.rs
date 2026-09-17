@@ -15,10 +15,9 @@
 
 //! Shared protocol state machine for the Kraken Spot `level3` channel.
 //!
-//! The Rust `KrakenSpotDataClient` and the pyo3 `KrakenSpotWebSocketClient`
-//! stream loop drive their per-symbol state through [`process_l3_message`],
-//! keeping the snapshot parsing, incremental update parsing, checksum
-//! validation, and resync logic in a single implementation. Each caller
+//! The Rust `KrakenSpotDataClient` stream loop drives per-symbol state through
+//! [`process_l3_message`], keeping snapshot parsing, incremental update parsing,
+//! checksum validation, and resync logic in a single implementation. The caller
 //! supplies an [`L3Sink`] that decides how to deliver the produced
 //! `OrderBookDeltas` to its downstream consumer.
 
@@ -27,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use ahash::AHashMap;
 use nautilus_core::{AtomicMap, UnixNanos};
 use nautilus_model::{
-    data::{OrderBookDelta, OrderBookDeltas, OrderBookDeltas_API},
+    data::{OrderBookDelta, OrderBookDeltas},
     enums::RecordFlag,
     identifiers::InstrumentId,
     instruments::{Instrument, InstrumentAny},
@@ -70,7 +69,7 @@ pub(crate) struct L3ResyncRequest {
 /// Output sink for `OrderBookDeltas` produced by the L3 state machine.
 pub(crate) trait L3Sink {
     /// Forwards a batch of L3 deltas to the consumer.
-    fn emit_deltas(&mut self, deltas: OrderBookDeltas_API);
+    fn emit_deltas(&mut self, deltas: OrderBookDeltas);
 }
 
 /// Returns the depth registered for `symbol`, defaulting to `1000`.
@@ -94,7 +93,7 @@ pub(crate) fn emit_l3_clear<S: L3Sink>(
     clear.flags |= RecordFlag::F_LAST as u8;
 
     match OrderBookDeltas::new_checked(instrument_id, vec![clear]) {
-        Ok(clear_deltas) => sink.emit_deltas(OrderBookDeltas_API::new(clear_deltas)),
+        Ok(clear_deltas) => sink.emit_deltas(clear_deltas),
         Err(e) => log::error!("Failed to construct L3 clear after {reason}: {e}"),
     }
 }
@@ -179,7 +178,7 @@ pub(crate) fn process_l3_message<S: L3Sink>(
                         }
                     }
                     state.awaiting_snapshot = false;
-                    sink.emit_deltas(OrderBookDeltas_API::new(deltas));
+                    sink.emit_deltas(deltas);
                 }
                 Err(e) => {
                     log::error!(
@@ -272,7 +271,7 @@ pub(crate) fn process_l3_message<S: L3Sink>(
                     }
 
                     if let Some(deltas) = maybe_deltas {
-                        sink.emit_deltas(OrderBookDeltas_API::new(deltas));
+                        sink.emit_deltas(deltas);
                     }
                 }
                 Err(e) => {
@@ -318,39 +317,29 @@ mod tests {
     use crate::websocket::spot_v2::level_3::messages::{KrakenL3Snapshot, KrakenL3UpdateData};
 
     fn make_instrument() -> InstrumentAny {
-        InstrumentAny::CurrencyPair(CurrencyPair::new(
-            InstrumentId::from("BTC/USD.KRAKEN"),
-            Symbol::from("BTC/USD"),
-            Currency::BTC(),
-            Currency::USD(),
-            1,
-            8,
-            Price::from("0.1"),
-            Quantity::from("0.00000001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        ))
+        InstrumentAny::CurrencyPair(
+            CurrencyPair::builder()
+                .instrument_id(InstrumentId::from("BTC/USD.KRAKEN"))
+                .raw_symbol(Symbol::from("BTC/USD"))
+                .base_currency(Currency::BTC())
+                .quote_currency(Currency::USD())
+                .price_precision(1)
+                .size_precision(8)
+                .price_increment(Price::from("0.1"))
+                .size_increment(Quantity::from("0.00000001"))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
     }
 
     struct CollectingSink {
-        emitted: Vec<OrderBookDeltas_API>,
+        emitted: Vec<OrderBookDeltas>,
     }
 
     impl L3Sink for CollectingSink {
-        fn emit_deltas(&mut self, deltas: OrderBookDeltas_API) {
+        fn emit_deltas(&mut self, deltas: OrderBookDeltas) {
             self.emitted.push(deltas);
         }
     }

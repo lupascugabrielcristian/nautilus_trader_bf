@@ -33,14 +33,23 @@ use axum::{
     response::Response,
     routing::get,
 };
-use nautilus_common::testing::wait_until_async;
+use jiff::Timestamp;
+use nautilus_common::{
+    live::runner::replace_system_event_sender,
+    messages::{SystemEvent, system::SocketState},
+    testing::wait_until_async,
+};
 use nautilus_core::UnixNanos;
 use nautilus_dydx::{
     common::enums::DydxMarketStatus,
     http::{models::PerpetualMarket, parse::parse_instrument_any},
     websocket::{DydxWsOutputMessage, client::DydxWebSocketClient},
 };
-use nautilus_model::{identifiers::InstrumentId, instruments::InstrumentAny};
+use nautilus_live::{SocketControlFactory, SocketReconnectRegistry, SocketReconnectRequestOutcome};
+use nautilus_model::{
+    identifiers::{ClientId, InstrumentId, Venue},
+    instruments::InstrumentAny,
+};
 use rstest::rstest;
 use rust_decimal_macros::dec;
 use serde_json::json;
@@ -219,12 +228,17 @@ async fn handle_subscribe(
             }
             drop(subs);
 
+            let response_id = if channel_str == "v4_block_height" {
+                json!(channel_str)
+            } else {
+                value.get("id").cloned().unwrap_or(serde_json::Value::Null)
+            };
             let subscribed_response = json!({
                 "type": "subscribed",
                 "connection_id": "test-conn-123",
                 "message_id": 1,
                 "channel": channel_str,
-                "id": value.get("id")
+                "id": response_id
             });
             let _ = socket
                 .send(Message::Text(subscribed_response.to_string().into()))
@@ -557,8 +571,18 @@ async fn start_test_server()
 async fn test_websocket_connection() {
     let (addr, state) = start_test_server().await.unwrap();
     let ws_url = format!("ws://{addr}/v4/ws");
+    let (system_tx, mut system_rx) = tokio::sync::mpsc::unbounded_channel();
+    replace_system_event_sender(system_tx);
+    let registry = SocketReconnectRegistry::default();
+    let endpoint = Ustr::from("dydx-data-streams");
 
-    let mut client = DydxWebSocketClient::new_public(ws_url, Some(30), None);
+    let mut client = DydxWebSocketClient::new_public(ws_url, Some(30), None).with_socket_factory(
+        SocketControlFactory::with_registry(
+            ClientId::from("DYDX"),
+            Some(Venue::from("DYDX")),
+            &registry,
+        ),
+    );
     client.connect().await.unwrap();
 
     wait_until_async(
@@ -567,10 +591,41 @@ async fn test_websocket_connection() {
     )
     .await;
 
+    let event = tokio::time::timeout(Duration::from_secs(2), system_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let SystemEvent::SocketState(change) = event;
+    let handle = registry.handle(ClientId::from("DYDX"), endpoint).unwrap();
+
     let count = state.connection_count.lock().await;
     assert_eq!(*count, 1);
+    assert_eq!(change.client_id, ClientId::from("DYDX"));
+    assert_eq!(change.venue, Some(Venue::from("DYDX")));
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Connected);
+    assert_eq!(
+        handle.request_reconnect(),
+        SocketReconnectRequestOutcome::Accepted
+    );
+    let event = tokio::time::timeout(Duration::from_secs(2), system_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let SystemEvent::SocketState(change) = event;
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Disconnected);
+    drop(count);
+    let event = tokio::time::timeout(Duration::from_secs(5), system_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let SystemEvent::SocketState(change) = event;
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Connected);
 
     client.disconnect().await.unwrap();
+    assert!(registry.handle(ClientId::from("DYDX"), endpoint).is_none());
 }
 
 #[rstest]
@@ -2351,6 +2406,99 @@ async fn test_subscribe_block_height() {
 
 #[rstest]
 #[tokio::test]
+async fn test_block_height_reconnect_preserves_canonical_topic() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let ws_url = format!("ws://{addr}/v4/ws");
+    let (system_tx, mut system_rx) = tokio::sync::mpsc::unbounded_channel();
+    replace_system_event_sender(system_tx);
+    let registry = SocketReconnectRegistry::default();
+    let endpoint = Ustr::from("dydx-data-streams");
+
+    let mut client = DydxWebSocketClient::new_public(ws_url, Some(30), None).with_socket_factory(
+        SocketControlFactory::with_registry(
+            ClientId::from("DYDX"),
+            Some(Venue::from("DYDX")),
+            &registry,
+        ),
+    );
+    client.connect().await.unwrap();
+    let mut receiver = client.take_receiver().unwrap();
+
+    let connected = tokio::time::timeout(Duration::from_secs(2), system_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        connected,
+        SystemEvent::SocketState(ref change) if change.state == SocketState::Connected
+    ));
+
+    client.subscribe_block_height().await.unwrap();
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move {
+                state
+                    .subscriptions
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|topic| topic == "v4_block_height")
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let handle = registry.handle(ClientId::from("DYDX"), endpoint).unwrap();
+    assert_eq!(
+        handle.request_reconnect(),
+        SocketReconnectRequestOutcome::Accepted
+    );
+
+    let reconnected_topics = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(DydxWsOutputMessage::Reconnected { topics }) = receiver.recv().await {
+                break topics;
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move {
+                state
+                    .subscription_events()
+                    .await
+                    .iter()
+                    .filter(|(channel, success)| channel == "v4_block_height" && *success)
+                    .count()
+                    >= 2
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let replay_count = state
+        .subscription_events()
+        .await
+        .iter()
+        .filter(|(channel, success)| channel == "v4_block_height" && *success)
+        .count();
+
+    assert_eq!(reconnected_topics, vec!["v4_block_height"]);
+    assert_eq!(replay_count, 2);
+
+    client.disconnect().await.unwrap();
+    assert!(registry.handle(ClientId::from("DYDX"), endpoint).is_none());
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_unsubscribe_markets() {
     let (addr, state) = start_test_server().await.unwrap();
     let ws_url = format!("ws://{addr}/v4/ws");
@@ -2782,16 +2930,55 @@ async fn test_subscribe_subaccount_with_private_client() {
 
     let (addr, state) = start_test_server().await.unwrap();
     let ws_url = format!("ws://{addr}/v4/ws");
+    let (system_tx, mut system_rx) = tokio::sync::mpsc::unbounded_channel();
+    replace_system_event_sender(system_tx);
+    let registry = SocketReconnectRegistry::default();
+    let endpoint = Ustr::from("dydx-user-streams");
 
     // Create a credential from test private key
     let credential = DydxCredential::from_private_key(TEST_PRIVATE_KEY, vec![]).unwrap();
     let account_id = AccountId::new("DYDX-001");
 
     let mut client =
-        DydxWebSocketClient::new_private(ws_url, credential, account_id, Some(30), None);
+        DydxWebSocketClient::new_private(ws_url, credential, account_id, Some(30), None)
+            .with_socket_factory(SocketControlFactory::with_registry(
+                ClientId::from("DYDX"),
+                Some(Venue::from("DYDX")),
+                &registry,
+            ));
     client.connect().await.unwrap();
 
     wait_until_async(|| async { client.is_connected() }, Duration::from_secs(5)).await;
+
+    let event = tokio::time::timeout(Duration::from_secs(2), system_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let SystemEvent::SocketState(change) = event;
+    let handle = registry.handle(ClientId::from("DYDX"), endpoint).unwrap();
+
+    assert_eq!(change.client_id, ClientId::from("DYDX"));
+    assert_eq!(change.venue, Some(Venue::from("DYDX")));
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Connected);
+    assert_eq!(
+        handle.request_reconnect(),
+        SocketReconnectRequestOutcome::Accepted
+    );
+    let event = tokio::time::timeout(Duration::from_secs(2), system_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let SystemEvent::SocketState(change) = event;
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Disconnected);
+    let event = tokio::time::timeout(Duration::from_secs(5), system_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let SystemEvent::SocketState(change) = event;
+    assert_eq!(change.endpoint, endpoint);
+    assert_eq!(change.state, SocketState::Connected);
 
     let result = client.subscribe_subaccount("dydx1test", 0).await;
     assert!(
@@ -2819,6 +3006,7 @@ async fn test_subscribe_subaccount_with_private_client() {
     );
 
     client.disconnect().await.unwrap();
+    assert!(registry.handle(ClientId::from("DYDX"), endpoint).is_none());
 }
 
 #[rstest]
@@ -2933,7 +3121,6 @@ async fn test_subaccount_subscription_failure() {
 #[rstest]
 #[tokio::test]
 async fn test_block_height_parsing() {
-    use chrono::Utc;
     use nautilus_dydx::websocket::messages::{
         DydxBlockHeightChannelContents, DydxWsBlockHeightChannelData,
     };
@@ -2946,7 +3133,7 @@ async fn test_block_height_parsing() {
         version: "4.0.0".to_string(),
         contents: DydxBlockHeightChannelContents {
             block_height: test_block_height.to_string(),
-            time: Utc::now(),
+            time: Timestamp::now(),
         },
     };
 
@@ -2960,7 +3147,6 @@ async fn test_block_height_parsing() {
 #[rstest]
 #[tokio::test]
 async fn test_block_height_invalid_format() {
-    use chrono::Utc;
     use nautilus_dydx::websocket::messages::{
         DydxBlockHeightChannelContents, DydxWsBlockHeightChannelData,
     };
@@ -2973,7 +3159,7 @@ async fn test_block_height_invalid_format() {
         version: "4.0.0".to_string(),
         contents: DydxBlockHeightChannelContents {
             block_height: invalid_block_height.to_string(),
-            time: Utc::now(),
+            time: Timestamp::now(),
         },
     };
 
@@ -2987,7 +3173,6 @@ async fn test_block_height_invalid_format() {
 #[rstest]
 #[tokio::test]
 async fn test_block_height_subscribed_parsing() {
-    use chrono::Utc;
     use nautilus_dydx::websocket::messages::{
         DydxBlockHeightSubscribedContents, DydxWsBlockHeightSubscribedData,
     };
@@ -2999,7 +3184,7 @@ async fn test_block_height_subscribed_parsing() {
         id: "v4_block_height".to_string(),
         contents: DydxBlockHeightSubscribedContents {
             height: test_height.to_string(),
-            time: Utc::now(),
+            time: Timestamp::now(),
         },
     };
 
@@ -3255,6 +3440,183 @@ async fn test_orderbook_produces_update() {
     let has_bids = contents.bids.as_ref().is_some_and(|b| !b.is_empty());
     let has_asks = contents.asks.as_ref().is_some_and(|a| !a.is_empty());
     assert!(has_bids || has_asks, "Should contain orderbook levels");
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_pool_shards_trades_across_connections_when_channel_full() {
+    use std::sync::Arc;
+
+    use nautilus_dydx::common::instrument_cache::InstrumentCache;
+    use nautilus_network::websocket::TransportBackend;
+
+    let (addr, state) = start_test_server().await.unwrap();
+    let ws_url = format!("ws://{addr}/v4/ws");
+
+    let mut client = DydxWebSocketClient::new_public_with_cache_and_pool(
+        ws_url,
+        Arc::new(InstrumentCache::new()),
+        Some(30),
+        TransportBackend::default(),
+        None,
+        4,
+        3,
+    );
+    client.connect().await.unwrap();
+    wait_until_async(|| async { client.is_connected() }, Duration::from_secs(5)).await;
+    assert_eq!(client.pool_size(), 1);
+
+    let tickers = ["BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD"];
+    for t in tickers {
+        client
+            .subscribe_trades(InstrumentId::from(format!("{t}.DYDX").as_str()))
+            .await
+            .unwrap();
+    }
+
+    wait_until_async(
+        || async { *state.connection_count.lock().await >= 2 },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(*state.connection_count.lock().await, 2);
+    assert_eq!(client.pool_size(), 2);
+
+    wait_until_async(
+        || async {
+            state
+                .subscriptions
+                .lock()
+                .await
+                .iter()
+                .filter(|s| s.contains("v4_trades"))
+                .count()
+                == tickers.len()
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let trade_sub_count = state
+        .subscriptions
+        .lock()
+        .await
+        .iter()
+        .filter(|s| s.contains("v4_trades"))
+        .count();
+    assert_eq!(trade_sub_count, tickers.len());
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_pool_returns_error_when_cap_reached() {
+    use std::sync::Arc;
+
+    use nautilus_dydx::common::instrument_cache::InstrumentCache;
+    use nautilus_network::websocket::TransportBackend;
+
+    let (addr, _state) = start_test_server().await.unwrap();
+    let ws_url = format!("ws://{addr}/v4/ws");
+
+    let mut client = DydxWebSocketClient::new_public_with_cache_and_pool(
+        ws_url,
+        Arc::new(InstrumentCache::new()),
+        Some(30),
+        TransportBackend::default(),
+        None,
+        1,
+        2,
+    );
+    client.connect().await.unwrap();
+    wait_until_async(|| async { client.is_connected() }, Duration::from_secs(5)).await;
+
+    client
+        .subscribe_trades(InstrumentId::from("BTC-USD.DYDX"))
+        .await
+        .unwrap();
+    client
+        .subscribe_trades(InstrumentId::from("ETH-USD.DYDX"))
+        .await
+        .unwrap();
+
+    let err = client
+        .subscribe_trades(InstrumentId::from("SOL-USD.DYDX"))
+        .await
+        .expect_err("pool should be exhausted");
+    let msg = err.to_string();
+    assert!(
+        msg.to_lowercase().contains("exhaust") || msg.to_lowercase().contains("subscription"),
+        "expected exhaustion error, was: {msg}"
+    );
+
+    assert_eq!(client.pool_size(), 1);
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_pool_unsubscribe_does_not_shrink_pool() {
+    use std::sync::Arc;
+
+    use nautilus_dydx::common::instrument_cache::InstrumentCache;
+    use nautilus_network::websocket::TransportBackend;
+
+    let (addr, state) = start_test_server().await.unwrap();
+    let ws_url = format!("ws://{addr}/v4/ws");
+
+    let mut client = DydxWebSocketClient::new_public_with_cache_and_pool(
+        ws_url,
+        Arc::new(InstrumentCache::new()),
+        Some(30),
+        TransportBackend::default(),
+        None,
+        4,
+        2,
+    );
+    client.connect().await.unwrap();
+    wait_until_async(|| async { client.is_connected() }, Duration::from_secs(5)).await;
+
+    for t in ["BTC-USD", "ETH-USD", "SOL-USD"] {
+        client
+            .subscribe_trades(InstrumentId::from(format!("{t}.DYDX").as_str()))
+            .await
+            .unwrap();
+    }
+
+    wait_until_async(
+        || async { *state.connection_count.lock().await >= 2 },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(client.pool_size(), 2);
+
+    client
+        .unsubscribe_trades(InstrumentId::from("SOL-USD.DYDX"))
+        .await
+        .unwrap();
+
+    wait_until_async(
+        || async {
+            state
+                .subscriptions
+                .lock()
+                .await
+                .iter()
+                .filter(|s| s.contains("v4_trades"))
+                .count()
+                == 2
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(client.pool_size(), 2, "empty slots should not be reaped");
 
     client.disconnect().await.unwrap();
 }

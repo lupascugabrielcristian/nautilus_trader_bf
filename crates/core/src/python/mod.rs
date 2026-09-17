@@ -31,6 +31,27 @@
 //! consumed from the `nautilus_trader` Python package without sacrificing type-safety or
 //! performance.
 
+/// Implements read-only Python getters for cloneable configuration fields.
+#[macro_export]
+macro_rules! impl_pyo3_config_getters {
+    ($config:ty { $($field:ident: $field_type:ty),+ $(,)? }) => {
+        #[pyo3_stub_gen::derive::gen_stub_pymethods]
+        #[pyo3::pymethods]
+        #[allow(
+            clippy::clone_on_copy,
+            reason = "one macro handles Copy and owned configuration fields"
+        )]
+        impl $config {
+            $(
+                #[getter]
+                fn $field(&self) -> $field_type {
+                    self.$field.clone()
+                }
+            )+
+        }
+    };
+}
+
 pub mod casing;
 pub mod datetime;
 pub mod enums;
@@ -42,46 +63,69 @@ pub mod string;
 pub mod uuid;
 pub mod version;
 
-use std::fmt::Display;
+use std::{convert::Infallible, fmt::Display};
 
 use pyo3::{
-    Py,
+    BoundObject, Py,
     conversion::IntoPyObjectExt,
     exceptions::{
         PyException, PyKeyError, PyNotImplementedError, PyRuntimeError, PyTypeError, PyValueError,
     },
     prelude::*,
-    types::PyString,
+    types::{PyString, PyWeakrefMethods, PyWeakrefReference},
     wrap_pyfunction,
 };
-use pyo3_stub_gen::derive::gen_stub_pyfunction;
 
 use crate::{
     UUID4,
     consts::{NAUTILUS_USER_AGENT, NAUTILUS_VERSION},
+    correctness::CorrectnessError,
     datetime::{
         MILLISECONDS_IN_SECOND, NANOSECONDS_IN_MICROSECOND, NANOSECONDS_IN_MILLISECOND,
         NANOSECONDS_IN_SECOND,
     },
 };
 
-/// Safely clones a Python object by acquiring the GIL and properly managing reference counts.
+/// Clones a Python object reference by attaching to the interpreter.
 ///
-/// This function exists to break reference cycles between Rust and Python that can occur
-/// when using `Arc<Py<PyAny>>` in callback-holding structs. The original design wrapped
-/// Python callbacks in `Arc` for thread-safe sharing, but this created circular references:
+/// The result is a second strong reference to the same object, so this does not break a reference
+/// cycle. When a Rust object holds a `Py<T>` whose Python object reaches back into Rust, cloning
+/// adds another strong edge to that cycle rather than removing one.
 ///
-/// 1. Rust `Arc` holds Python objects → increases Python reference count.
-/// 2. Python objects might reference Rust objects → creates cycles.
-/// 3. Neither side can be garbage collected → memory leak.
-///
-/// By using plain `Py<PyAny>` with GIL-based cloning instead of `Arc<Py<PyAny>>`, we:
-/// - Avoid circular references between Rust and Python memory management.
-/// - Ensure proper Python reference counting under the GIL.
-/// - Allow both Rust and Python garbage collectors to work correctly.
+/// Break such a back-reference with a Python weak reference (see [`upgrade_py_weakref`]) or an
+/// explicit terminal release point that drops the strong reference during disposal.
 #[must_use]
 pub fn clone_py_object(obj: &Py<PyAny>) -> Py<PyAny> {
     Python::attach(|py| obj.clone_ref(py))
+}
+
+/// Upgrades the weak reference a Rust object keeps to its Python wrapper.
+///
+/// Returns `Ok(None)` when no wrapper was ever attached, which is the case for a purely Rust
+/// construction. `owner` names the Rust object in the error message.
+///
+/// # Errors
+///
+/// Returns an error if a wrapper was attached but has since been collected. Callers propagate
+/// this rather than skipping a required callback, because a live wrapper is an ownership
+/// invariant of the caller rather than an optional extra.
+pub fn upgrade_py_weakref(
+    py_self: Option<&Py<PyWeakrefReference>>,
+    owner: &dyn Display,
+) -> PyResult<Option<Py<PyAny>>> {
+    let Some(py_self) = py_self else {
+        return Ok(None);
+    };
+
+    Python::attach(|py| {
+        py_self
+            .bind(py)
+            .upgrade()
+            .map(|wrapper| Some(wrapper.unbind()))
+            .ok_or_else(|| {
+                to_pyruntime_err(format!("Python wrapper for {owner} has been collected"))
+            })
+    })
 }
 
 /// Calls a Python callback with a single argument, logging any errors.
@@ -107,18 +151,18 @@ pub fn call_python_threadsafe(
     }
 }
 
-/// Extend `IntoPyObjectExt` helper trait to unwrap `Py<PyAny>` after conversion.
+/// Extends `IntoPyObjectExt` with an infallible conversion to `Py<PyAny>`.
 pub trait IntoPyObjectNautilusExt<'py>: IntoPyObjectExt<'py> {
-    /// Convert `self` into a [`Py<PyAny>`] while *panicking* if the conversion fails.
-    ///
-    /// This is a convenience wrapper around [`IntoPyObjectExt::into_py_any`] that avoids the
-    /// cumbersome `Result` handling when we are certain that the conversion cannot fail (for
-    /// instance when we are converting primitives or other types that already implement the
-    /// necessary PyO3 traits).
+    /// Converts `self` into a [`Py<PyAny>`] when the underlying conversion is infallible.
     #[inline]
-    fn into_py_any_unwrap(self, py: Python<'py>) -> Py<PyAny> {
-        self.into_py_any(py)
-            .expect("Failed to convert type to Py<PyAny>")
+    fn into_py_any_unwrap(self, py: Python<'py>) -> Py<PyAny>
+    where
+        Self: IntoPyObject<'py, Error = Infallible>,
+    {
+        match self.into_pyobject(py) {
+            Ok(obj) => obj.into_any().unbind(),
+            Err(never) => match never {},
+        }
     }
 }
 
@@ -135,6 +179,16 @@ pub fn get_pytype_name<'py>(obj: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PySt
 
 /// Converts any type that implements `Display` to a Python `ValueError`.
 pub fn to_pyvalue_err(e: impl Display) -> PyErr {
+    PyValueError::new_err(e.to_string())
+}
+
+/// Converts a correctness check failure to a Python `ValueError`.
+#[must_use]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Result::map_err passes owned errors to conversion functions"
+)]
+pub fn correctness_error_to_pyvalue_err(e: CorrectnessError) -> PyErr {
     PyValueError::new_err(e.to_string())
 }
 
@@ -163,32 +217,7 @@ pub fn to_pynotimplemented_err(e: impl Display) -> PyErr {
     PyNotImplementedError::new_err(e.to_string())
 }
 
-/// Return a value indicating whether the `obj` is a `PyCapsule`.
-///
-/// Parameters
-/// ----------
-/// obj : Any
-///     The object to check.
-///
-/// # Returns
-///
-/// bool
-#[pyfunction(name = "is_pycapsule")]
-#[gen_stub_pyfunction(module = "nautilus_trader.core")]
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "Python FFI requires owned types"
-)]
-#[allow(unsafe_code)]
-fn py_is_pycapsule(obj: Py<PyAny>) -> bool {
-    // SAFETY: obj.as_ptr() returns a valid Python object pointer
-    unsafe {
-        // PyCapsule_CheckExact checks if the object is exactly a PyCapsule
-        pyo3::ffi::PyCapsule_CheckExact(obj.as_ptr()) != 0
-    }
-}
-
-/// Loaded as `nautilus_pyo3.core`.
+/// Exposed through `nautilus_trader.core`.
 ///
 /// # Errors
 ///
@@ -203,7 +232,6 @@ pub fn core(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(stringify!(NANOSECONDS_IN_MILLISECOND), NANOSECONDS_IN_MILLISECOND)?;
     m.add(stringify!(NANOSECONDS_IN_MICROSECOND), NANOSECONDS_IN_MICROSECOND)?;
     m.add_class::<UUID4>()?;
-    m.add_function(wrap_pyfunction!(py_is_pycapsule, m)?)?;
     m.add_function(wrap_pyfunction!(casing::py_convert_to_snake_case, m)?)?;
     m.add_function(wrap_pyfunction!(string::py_mask_api_key, m)?)?;
     m.add_function(wrap_pyfunction!(datetime::py_secs_to_nanos, m)?)?;
@@ -217,4 +245,40 @@ pub fn core(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(datetime::py_last_weekday_nanos, m)?)?;
     m.add_function(wrap_pyfunction!(datetime::py_is_within_last_24_hours, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Once;
+
+    use pyo3::{Python, exceptions::PyValueError};
+    use rstest::rstest;
+
+    use super::*;
+
+    fn ensure_python_initialized() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            Python::initialize();
+        });
+    }
+
+    #[rstest]
+    fn test_correctness_error_to_pyvalue_err_preserves_display_text() {
+        ensure_python_initialized();
+
+        let error = CorrectnessError::EmptyString {
+            param: "value".to_string(),
+        };
+
+        Python::attach(|py| {
+            let py_err = correctness_error_to_pyvalue_err(error);
+
+            assert!(py_err.is_instance_of::<PyValueError>(py));
+            assert_eq!(
+                py_err.value(py).to_string(),
+                "invalid string for 'value', was empty"
+            );
+        });
+    }
 }

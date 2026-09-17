@@ -18,14 +18,15 @@ workspace = true
 
 [lib]
 name = "nautilus_backtest"
-crate-type = ["rlib", "staticlib"]
+crate-type = ["rlib"]
 
 [features]
 default = []
 examples = ["nautilus-trading/examples"]
 high-precision = ["nautilus-model/high-precision"]
+mimalloc = ["dep:mimalloc"]
 defi = ["nautilus-common/defi", "nautilus-data/defi", "nautilus-model/defi"]
-plugin = ["dep:nautilus-plugin"]
+plugin = []
 streaming = ["nautilus-persistence", "nautilus-system/streaming"]
 extension-module = [
   "nautilus-common/extension-module",
@@ -37,13 +38,6 @@ extension-module = [
   "pyo3/extension-module",
   "streaming",
 ]
-ffi = [
-  "cbindgen",
-  "nautilus-core/ffi",
-  "nautilus-common/ffi",
-  "nautilus-execution/ffi",
-  "nautilus-model/ffi",
-]
 python = [
   "nautilus-common/python",
   "nautilus-core/python",
@@ -53,20 +47,16 @@ python = [
   "nautilus-persistence?/python",
   "nautilus-portfolio/python",
   "nautilus-risk/python",
+  "nautilus-system/python",
   "nautilus-trading/python",
   "pyo3",
   "pyo3-stub-gen",
   "streaming",
 ]
 
-[package.metadata.cargo-machete]
-ignored = [
-  "cbindgen", # Used by build.rs when the `ffi` feature is enabled
-  "nautilus-plugin", # Optional dep behind the `plugin` feature; enables backtest engines to load plug-in cdylibs via `nautilus_plugin::bridge` once backtest-side callers land
-]
-
 [package.metadata.docs.rs]
-all-features = true
+# Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
+features = ["defi", "examples", "high-precision", "plugin", "streaming"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -75,9 +65,8 @@ nautilus-common = { workspace = true }
 nautilus-core = { workspace = true }
 nautilus-data = { workspace = true }
 nautilus-execution = { workspace = true }
-nautilus-model = { workspace = true, features = ["stubs"] }
+nautilus-model = { workspace = true, features = ["test-support"] }
 nautilus-persistence = { workspace = true, optional = true }
-nautilus-plugin = { workspace = true, features = ["host"], optional = true }
 nautilus-portfolio = { workspace = true }
 nautilus-risk = { workspace = true }
 nautilus-system = { workspace = true }
@@ -86,15 +75,16 @@ nautilus-trading = { workspace = true }
 ahash = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+blake3 = { workspace = true }
 bon = { workspace = true }
-chrono = { workspace = true }
-chrono-tz = { workspace = true }
 indexmap = { workspace = true }
+jiff = { workspace = true }
 log = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
 ustr = { workspace = true }
 
+mimalloc = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 serde_json = { workspace = true }
@@ -102,14 +92,21 @@ serde_json = { workspace = true }
 [dev-dependencies]
 nautilus-indicators = { workspace = true }
 nautilus-persistence = { workspace = true }
-nautilus-testkit = { workspace = true }
+nautilus-testkit = { workspace = true, default-features = false, features = [
+  "datasets",
+  "testers",
+] }
 nautilus-trading = { workspace = true, features = ["examples"] }
 
+criterion = { workspace = true }
 rstest = { workspace = true }
 tempfile = { workspace = true }
 
-[build-dependencies]
-cbindgen = { workspace = true, optional = true }
+# Run with `cargo bench -p nautilus-backtest --bench engine`
+[[bench]]
+name = "engine"
+path = "benches/engine.rs"
+harness = false
 
 # Run with `cargo run -p nautilus-backtest --features examples --example engine-ema-cross`
 [[example]]
@@ -131,3 +128,9 @@ name = "tardis-option-chain"
 path = "examples/tardis_option_chain.rs"
 required-features = ["examples", "streaming"]
 doc = false
+
+# Run in the normal `--tests` lane; the dev-dependency enables `nautilus-trading/examples`
+[[test]]
+name = "backtest-node-workload"
+path = "tests/backtest_node_workload.rs"
+required-features = ["streaming"]

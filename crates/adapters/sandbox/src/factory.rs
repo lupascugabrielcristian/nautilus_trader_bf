@@ -25,7 +25,7 @@ use nautilus_common::{
     live::clock::LiveClock,
 };
 use nautilus_execution::client::core::ExecutionClientCore;
-use nautilus_model::identifiers::ClientId;
+use nautilus_model::identifiers::{ClientId, TraderId};
 
 use crate::{config::SandboxExecutionClientConfig, execution::SandboxExecutionClient};
 
@@ -40,7 +40,7 @@ impl ClientConfig for SandboxExecutionClientConfig {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.sandbox",
+        module = "nautilus_trader.adapters.sandbox",
         unsendable,
         from_py_object
     )
@@ -62,6 +62,7 @@ impl SandboxExecutionClientFactory {
 impl SimulatedExecutionClientFactory for SandboxExecutionClientFactory {
     fn create(
         &self,
+        trader_id: TraderId,
         name: &str,
         config: &dyn ClientConfig,
         cache: Rc<RefCell<Cache>>,
@@ -80,7 +81,7 @@ impl SimulatedExecutionClientFactory for SandboxExecutionClientFactory {
         let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(LiveClock::default()));
 
         let core = ExecutionClientCore::new(
-            sandbox_config.trader_id,
+            trader_id,
             client_id,
             sandbox_config.venue,
             sandbox_config.oms_type,

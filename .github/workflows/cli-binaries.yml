@@ -22,7 +22,8 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
+      # https://github.com/step-security/harden-runner
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
         with:
           egress-policy: ${{ vars.STEP_SECURITY_EGRESS_POLICY || 'block' }}
           allowed-endpoints: >-
@@ -30,7 +31,8 @@ jobs:
             ${{ vars.CI_ALLOWED_ENDPOINTS }}
 
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        # https://github.com/actions/checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -49,22 +51,14 @@ jobs:
           strip target/release/nautilus || true
 
       - name: Package artifact
-        run: |
-          set -euo pipefail
-          TARGET_TRIPLE="x86_64-unknown-linux-gnu"
-          STAGE_DIR="stage-cli"
-          mkdir -p "$STAGE_DIR" dist
-          cp target/release/nautilus "$STAGE_DIR/nautilus"
-          cp -L crates/cli/LICENSE "$STAGE_DIR/LICENSE" || cp -L LICENSE "$STAGE_DIR/LICENSE"
-          cp crates/cli/README.md "$STAGE_DIR/README.md"
-          tar -C "$STAGE_DIR" -czf "dist/nautilus-${TARGET_TRIPLE}.tar.gz" .
-          rm -rf "$STAGE_DIR"
+        run: bash scripts/ci/package-cli-artifact.bash x86_64-unknown-linux-gnu
 
       - name: Smoke test --version
         run: |
           target/release/nautilus --version || (echo "Smoke test failed" && exit 1)
 
       - name: Upload artifact
+        # https://github.com/actions/upload-artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nautilus-x86_64-unknown-linux-gnu.tar.gz
@@ -77,7 +71,8 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
+      # https://github.com/step-security/harden-runner
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
         with:
           egress-policy: ${{ vars.STEP_SECURITY_EGRESS_POLICY || 'block' }}
           allowed-endpoints: >-
@@ -85,7 +80,8 @@ jobs:
             ${{ vars.CI_ALLOWED_ENDPOINTS }}
 
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        # https://github.com/actions/checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -104,22 +100,14 @@ jobs:
           strip target/release/nautilus || true
 
       - name: Package artifact
-        run: |
-          set -euo pipefail
-          TARGET_TRIPLE="aarch64-unknown-linux-gnu"
-          STAGE_DIR="stage-cli"
-          mkdir -p "$STAGE_DIR" dist
-          cp target/release/nautilus "$STAGE_DIR/nautilus"
-          cp -L crates/cli/LICENSE "$STAGE_DIR/LICENSE" || cp -L LICENSE "$STAGE_DIR/LICENSE"
-          cp crates/cli/README.md "$STAGE_DIR/README.md"
-          tar -C "$STAGE_DIR" -czf "dist/nautilus-${TARGET_TRIPLE}.tar.gz" .
-          rm -rf "$STAGE_DIR"
+        run: bash scripts/ci/package-cli-artifact.bash aarch64-unknown-linux-gnu
 
       - name: Smoke test --version
         run: |
           target/release/nautilus --version || (echo "Smoke test failed" && exit 1)
 
       - name: Upload artifact
+        # https://github.com/actions/upload-artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nautilus-aarch64-unknown-linux-gnu.tar.gz
@@ -132,7 +120,8 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
+      # https://github.com/step-security/harden-runner
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
         with:
           egress-policy: ${{ vars.STEP_SECURITY_EGRESS_POLICY || 'block' }}
           allowed-endpoints: >-
@@ -140,7 +129,8 @@ jobs:
             ${{ vars.CI_ALLOWED_ENDPOINTS }}
 
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        # https://github.com/actions/checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -158,22 +148,14 @@ jobs:
           strip target/release/nautilus || true
 
       - name: Package artifact
-        run: |
-          set -euo pipefail
-          TARGET_TRIPLE="aarch64-apple-darwin"
-          STAGE_DIR="stage-cli"
-          mkdir -p "$STAGE_DIR" dist
-          cp target/release/nautilus "$STAGE_DIR/nautilus"
-          cp -L crates/cli/LICENSE "$STAGE_DIR/LICENSE" || cp -L LICENSE "$STAGE_DIR/LICENSE"
-          cp crates/cli/README.md "$STAGE_DIR/README.md"
-          tar -C "$STAGE_DIR" -czf "dist/nautilus-${TARGET_TRIPLE}.tar.gz" .
-          rm -rf "$STAGE_DIR"
+        run: bash scripts/ci/package-cli-artifact.bash aarch64-apple-darwin
 
       - name: Smoke test --version
         run: |
           target/release/nautilus --version || (echo "Smoke test failed" && exit 1)
 
       - name: Upload artifact
+        # https://github.com/actions/upload-artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nautilus-aarch64-apple-darwin.tar.gz
@@ -186,15 +168,22 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
+      # https://github.com/step-security/harden-runner
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
         with:
           egress-policy: ${{ vars.STEP_SECURITY_EGRESS_POLICY || 'block' }}
           allowed-endpoints: >-
             ${{ vars.COMMON_ALLOWED_ENDPOINTS }}
             ${{ vars.CI_ALLOWED_ENDPOINTS }}
+            crl.globalsign.com:80
+            ocsp.globalsign.com:80
+            ocsp2.globalsign.com:80
+            crl.sectigo.com:80
+            ocsp.sectigo.com:80
 
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        # https://github.com/actions/checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -226,6 +215,7 @@ jobs:
           Remove-Item -Recurse -Force stage-cli
 
       - name: Upload artifact
+        # https://github.com/actions/upload-artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nautilus-x86_64-pc-windows-msvc.zip
@@ -242,17 +232,19 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/nightly'
     environment: r2-nightly
     permissions:
-      actions: write
+      actions: read # Required for downloading build artifacts
       contents: read
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_EC2_METADATA_DISABLED: "true"
       CLOUDFLARE_R2_URL: ${{ secrets.CLOUDFLARE_R2_URL }}
       CLOUDFLARE_R2_REGION: "auto"
       CLOUDFLARE_R2_BUCKET_NAME: "packages"
       CLOUDFLARE_R2_PREFIX: "cli/nautilus-cli"
     steps:
-      - uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
+      # https://github.com/step-security/harden-runner
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
         with:
           egress-policy: ${{ vars.STEP_SECURITY_EGRESS_POLICY || 'block' }}
           allowed-endpoints: >-
@@ -261,84 +253,33 @@ jobs:
             ${{ secrets.CLOUDFLARE_R2_ALLOWED_HOST }}:443
 
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        # https://github.com/actions/checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Download built CLI artifacts
+        # https://github.com/actions/download-artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist/cli
 
       - name: Configure AWS CLI for Cloudflare R2
         shell: bash
-        run: |
-          set -euo pipefail
-          echo "Configuring AWS CLI for Cloudflare R2..."
-
-          # AWS CLI v2 is pre-installed on GitHub runners
-          aws --version
-
-          # Configure credentials for Cloudflare R2
-          mkdir -p ~/.aws
-          {
-            echo "[default]"
-            echo "aws_access_key_id=${AWS_ACCESS_KEY_ID}"
-            echo "aws_secret_access_key=${AWS_SECRET_ACCESS_KEY}"
-          } > ~/.aws/credentials
-          {
-            echo "[default]"
-            echo "region=${CLOUDFLARE_R2_REGION:-auto}"
-            echo "output=json"
-            echo "s3 ="
-            echo "    signature_version = s3v4"
-            echo "    addressing_style = path"
-            echo "    payload_signing_enabled = false"
-            echo "    use_accelerate_endpoint = false"
-            echo "    use_dualstack_endpoint = false"
-            echo "    use_fips_endpoint = false"
-          } > ~/.aws/config
-          export AWS_EC2_METADATA_DISABLED=true
+        run: bash scripts/ci/configure-r2-aws.bash
 
       - name: Upload install.sh to R2 (stable + latest)
         shell: bash
-        run: |
-          CACHE_CONTROL="no-cache, max-age=60, must-revalidate"
-          for i in {1..5}; do
-            if aws s3 cp scripts/cli/install.sh "s3://${CLOUDFLARE_R2_BUCKET_NAME}/${CLOUDFLARE_R2_PREFIX}/install.sh" \
-              --endpoint-url="${CLOUDFLARE_R2_URL}" \
-              --content-type "text/x-shellscript" \
-              --cache-control "$CACHE_CONTROL"; then
-              break
-            else
-              echo "Retry ($i/5)"
-              sleep $((2**i))
-            fi
-          done
-          for i in {1..5}; do
-            if aws s3 cp scripts/cli/install.sh \
-              "s3://${CLOUDFLARE_R2_BUCKET_NAME}/${CLOUDFLARE_R2_PREFIX}/latest/install.sh" \
-              --endpoint-url="${CLOUDFLARE_R2_URL}" \
-              --content-type "text/x-shellscript" \
-              --cache-control "$CACHE_CONTROL"; then
-              break
-            else
-              echo "Retry ($i/5)"
-              sleep $((2**i))
-            fi
-          done
+        run: bash ./scripts/ci/publish-cli-r2-upload-installer.sh
 
       - name: Publish CLI binaries to R2 (versioned + latest) and generate manifest
         shell: bash
-        run: |
-          bash ./scripts/ci/publish-cli-r2-upload.sh
+        run: bash ./scripts/ci/publish-cli-r2-upload.sh
 
       - name: Prune old CLI versions
         shell: bash
-        run: |
-          bash ./scripts/ci/publish-cli-r2-prune.sh
+        run: bash ./scripts/ci/publish-cli-r2-prune.sh
 
       - name: Verify uploaded files in R2
         shell: bash
-        run: |-
-          bash ./scripts/ci/publish-cli-r2-verify.sh
+        run: bash ./scripts/ci/publish-cli-r2-verify.sh

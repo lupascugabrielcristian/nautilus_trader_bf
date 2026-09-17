@@ -241,7 +241,7 @@ mod tests {
             ),
         ];
         catalog
-            .write_to_parquet(quotes.clone(), None, None, None)
+            .write_to_parquet(&quotes, None, None, None)
             .expect("write quotes");
 
         let query = CatalogSliceQuery {
@@ -275,7 +275,7 @@ mod tests {
                 instrument_id,
                 Price::from("1.0001"),
                 Quantity::from("100"),
-                AggressorSide::Buyer,
+                AggressorSide::Buy,
                 TradeId::from("T-1"),
                 UnixNanos::from(1_000),
                 UnixNanos::from(1_000),
@@ -284,7 +284,7 @@ mod tests {
                 instrument_id,
                 Price::from("1.0002"),
                 Quantity::from("200"),
-                AggressorSide::Seller,
+                AggressorSide::Sell,
                 TradeId::from("T-2"),
                 UnixNanos::from(2_000),
                 UnixNanos::from(2_000),
@@ -293,14 +293,14 @@ mod tests {
                 instrument_id,
                 Price::from("1.0003"),
                 Quantity::from("300"),
-                AggressorSide::Buyer,
+                AggressorSide::Buy,
                 TradeId::from("T-3"),
                 UnixNanos::from(3_000),
                 UnixNanos::from(3_000),
             ),
         ];
         catalog
-            .write_to_parquet(trades.clone(), None, None, None)
+            .write_to_parquet(&trades, None, None, None)
             .expect("write trades");
 
         let query = CatalogSliceQuery {
@@ -367,7 +367,7 @@ mod tests {
             ),
         ];
         catalog
-            .write_to_parquet(bars.clone(), None, None, None)
+            .write_to_parquet(&bars, None, None, None)
             .expect("write bars");
 
         let query = CatalogSliceQuery {

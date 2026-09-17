@@ -32,7 +32,7 @@ use crate::{
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.indicators")
+    pyo3::pyclass(module = "nautilus_trader.indicators")
 )]
 #[cfg_attr(
     feature = "python",
@@ -69,8 +69,9 @@ impl Indicator for HullMovingAverage {
         self.initialized
     }
 
-    fn handle_quote(&mut self, quote: &QuoteTick) {
-        self.update_raw(quote.extract_price(self.price_type).into());
+    fn handle_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
+        self.update_raw(quote.extract_price(self.price_type)?.into());
+        Ok(())
     }
 
     fn handle_trade(&mut self, trade: &TradeTick) {
@@ -178,6 +179,7 @@ mod tests {
         average::hma::HullMovingAverage,
         indicator::{Indicator, MovingAverage},
         stubs::*,
+        testing::assert_approx_equal,
     };
 
     #[rstest]
@@ -210,7 +212,7 @@ mod tests {
         indicator_hma_10.update_raw(1.0);
         indicator_hma_10.update_raw(2.0);
         indicator_hma_10.update_raw(3.0);
-        assert_eq!(indicator_hma_10.value, 1.824_561_403_508_772);
+        assert_approx_equal(indicator_hma_10.value, 1.82456140351);
     }
 
     #[rstest]
@@ -226,12 +228,12 @@ mod tests {
         indicator_hma_10.update_raw(1.00020);
         indicator_hma_10.update_raw(1.00010);
         indicator_hma_10.update_raw(1.00000);
-        assert_eq!(indicator_hma_10.value, 1.000_140_392_817_059_8);
+        assert_approx_equal(indicator_hma_10.value, 1.00014039282);
     }
 
     #[rstest]
     fn test_handle_quote_tick(mut indicator_hma_10: HullMovingAverage, stub_quote: QuoteTick) {
-        indicator_hma_10.handle_quote(&stub_quote);
+        indicator_hma_10.handle_quote(&stub_quote).unwrap();
         assert_eq!(indicator_hma_10.value, 1501.0);
     }
 

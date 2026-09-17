@@ -21,12 +21,13 @@ mod serial_tests {
 
     use bytes::Bytes;
     use nautilus_common::{
-        cache::CacheConfig, enums::SerializationEncoding, msgbus::database::DatabaseConfig,
-        testing::wait_until_async,
+        cache::CacheConfig, enums::SerializationEncoding, testing::wait_until_async,
     };
     use nautilus_core::{Params, UUID4};
     use nautilus_infrastructure::redis::{
-        cache::RedisCacheDatabase, create_redis_connection, queries::DatabaseQueries,
+        cache::{RedisCacheConfig, RedisCacheDatabase},
+        create_redis_connection,
+        queries::DatabaseQueries,
     };
     use nautilus_model::{
         data::{
@@ -45,52 +46,34 @@ mod serial_tests {
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
-    async fn get_redis_connection() -> redis::aio::ConnectionManager {
-        let config = DatabaseConfig {
-            database_type: "redis".to_string(),
+    fn redis_cache_config() -> RedisCacheConfig {
+        RedisCacheConfig {
             host: Some("localhost".to_string()),
             port: Some(6379),
-            username: None,
-            password: None,
-            ssl: false,
-            connection_timeout: 20,
-            response_timeout: 20,
-            number_of_retries: 100,
-            exponent_base: 2,
-            max_delay: 1000,
-            factor: 2,
-        };
+            connection_timeout: 1,
+            number_of_retries: 0,
+            ..Default::default()
+        }
+    }
 
-        create_redis_connection("test", config)
+    async fn get_redis_connection() -> redis::aio::ConnectionManager {
+        let config = redis_cache_config();
+
+        create_redis_connection("test", &config)
             .await
-            .expect("Failed to create Redis connection")
+            .expect("A running Redis service is required for this test")
     }
 
     async fn setup_test_database() -> (RedisCacheDatabase, String) {
         let trader_id = TraderId::from("test-trader");
         let instance_id = UUID4::new();
 
-        let config = CacheConfig {
-            database: Some(DatabaseConfig {
-                database_type: "redis".to_string(),
-                host: Some("localhost".to_string()),
-                port: Some(6379),
-                username: None,
-                password: None,
-                ssl: false,
-                connection_timeout: 20,
-                response_timeout: 20,
-                number_of_retries: 100,
-                exponent_base: 2,
-                max_delay: 1000,
-                factor: 2,
-            }),
-            ..Default::default()
-        };
+        let config = CacheConfig::default();
 
-        let mut database = RedisCacheDatabase::new(trader_id, instance_id, config)
-            .await
-            .expect("Failed to create database");
+        let mut database =
+            RedisCacheDatabase::new(trader_id, instance_id, config, redis_cache_config())
+                .await
+                .expect("A running Redis service is required for this test");
 
         // Clean the database at the start
         database.flushdb().await;

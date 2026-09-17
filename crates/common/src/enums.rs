@@ -46,7 +46,7 @@ use strum::{Display, EnumIter, EnumString, FromRepr};
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.common.enums",
+        module = "nautilus_trader.common",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -120,7 +120,7 @@ impl ComponentState {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.common.enums",
+        module = "nautilus_trader.common",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -188,7 +188,7 @@ pub enum ComponentTrigger {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.common.enums",
+        module = "nautilus_trader.common",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -229,7 +229,7 @@ pub enum Environment {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.common.enums",
+        module = "nautilus_trader.common",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -291,7 +291,7 @@ pub enum LogLevel {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.common.enums",
+        module = "nautilus_trader.common",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -377,7 +377,7 @@ impl From<Level> for LogColor {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.common.enums",
+        module = "nautilus_trader.common",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -412,6 +412,7 @@ pub enum LogFormat {
     Copy,
     Clone,
     Debug,
+    Default,
     Display,
     Hash,
     PartialEq,
@@ -432,7 +433,7 @@ pub enum LogFormat {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.common.enums",
+        module = "nautilus_trader.common",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -442,10 +443,40 @@ pub enum LogFormat {
     pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.common")
 )]
 pub enum SerializationEncoding {
+    /// The JavaScript Object Notation (JSON) encoding.
+    #[default]
+    #[serde(rename = "json")]
+    Json = 0,
     /// The MessagePack encoding.
     #[serde(rename = "msgpack")]
-    MsgPack = 0,
-    /// The JavaScript Object Notation (JSON) encoding.
-    #[serde(rename = "json")]
-    Json = 1,
+    MsgPack = 1,
+    /// The Cap'n Proto encoding.
+    #[serde(rename = "capnp")]
+    Capnp = 2,
+    /// The Simple Binary Encoding (SBE) encoding.
+    #[serde(rename = "sbe")]
+    Sbe = 3,
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::SerializationEncoding;
+
+    #[rstest]
+    fn serialization_encoding_default_is_json() {
+        assert_eq!(
+            SerializationEncoding::default(),
+            SerializationEncoding::Json
+        );
+    }
+
+    #[rstest]
+    fn serialization_encoding_repr_values_are_stable() {
+        assert_eq!(SerializationEncoding::Json as u8, 0);
+        assert_eq!(SerializationEncoding::MsgPack as u8, 1);
+        assert_eq!(SerializationEncoding::Capnp as u8, 2);
+        assert_eq!(SerializationEncoding::Sbe as u8, 3);
+    }
 }

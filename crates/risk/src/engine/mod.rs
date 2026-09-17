@@ -27,12 +27,15 @@ use nautilus_common::{
     clock::Clock,
     logging::{CMD, EVT, RECV},
     messages::{
-        execution::{ModifyOrder, SubmitOrder, SubmitOrderList, TradingCommand},
+        execution::{
+            BatchModifyOrders, ModifyOrder, PARAMS_CLOSE_POSITION, SubmitOrder, SubmitOrderList,
+            TradingCommand,
+        },
         system::trading::TradingStateChanged,
     },
     msgbus,
     msgbus::{MessagingSwitchboard, TypedHandler, TypedIntoHandler, get_message_bus},
-    runner::try_get_trading_cmd_sender,
+    runner::{TradingCommandMessage, try_get_trading_cmd_sender},
     throttler::{RateLimit, Throttler},
 };
 use nautilus_core::{UUID4, WeakCell};
@@ -42,34 +45,46 @@ use nautilus_execution::trailing::{
 use nautilus_model::{
     accounts::{Account, AccountAny},
     enums::{
-        OrderSide, OrderStatus, PositionSide, TimeInForce, TradingState, TrailingOffsetType,
-        TriggerType,
+        AggregationSource, OrderSide, OrderStatus, OrderType, PositionSide, PriceType, TimeInForce,
+        TradingState, TrailingOffsetType, TriggerType,
     },
-    events::{OrderDenied, OrderEventAny, OrderModifyRejected, PositionEvent},
+    events::{
+        OrderDenied, OrderDeniedReason, OrderEventAny, OrderModifyRejected, OrderPriceField,
+        PositionEvent,
+    },
     identifiers::{AccountId, InstrumentId},
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
-    types::{Currency, Money, Price, Quantity, quantity::QuantityRaw},
+    types::{Currency, Money, Price, Quantity, money::MoneyRaw, quantity::QuantityRaw},
 };
 use nautilus_portfolio::Portfolio;
 use rust_decimal::Decimal;
 use ustr::Ustr;
 
+// Returns cash and wallet accounts for sell-balance checks; margin and betting accounts
+// follow their own sell paths.
+fn cash_or_wallet_account(account: &AccountAny) -> Option<&dyn Account> {
+    match account {
+        AccountAny::Cash(cash) => Some(cash),
+        AccountAny::Wallet(wallet) => Some(wallet),
+        AccountAny::Margin(_) | AccountAny::Betting(_) => None,
+    }
+}
+
 fn format_rate_limit(rate_limit: &RateLimit) -> String {
-    let total_secs = rate_limit.interval_ns / 1_000_000_000;
-    let remainder_ns = rate_limit.interval_ns % 1_000_000_000;
+    let interval_ns = rate_limit.interval_ns();
+    let limit = rate_limit.limit();
+    let total_secs = interval_ns / 1_000_000_000;
+    let remainder_ns = interval_ns % 1_000_000_000;
     let hours = total_secs / 3600;
     let minutes = (total_secs % 3600) / 60;
     let seconds = total_secs % 60;
 
     if remainder_ns == 0 {
-        format!("{}/{hours:02}:{minutes:02}:{seconds:02}", rate_limit.limit)
+        format!("{limit}/{hours:02}:{minutes:02}:{seconds:02}")
     } else {
         let micros = remainder_ns / 1_000;
-        format!(
-            "{}/{hours:02}:{minutes:02}:{seconds:02}.{micros:06}",
-            rate_limit.limit
-        )
+        format!("{limit}/{hours:02}:{minutes:02}:{seconds:02}.{micros:06}")
     }
 }
 
@@ -149,13 +164,16 @@ impl RiskEngine {
         // In live mode the `TradingCommandSender` queues the command for the next
         // event-loop iteration, preventing a synchronous `deny_order()` from
         // dispatching an `OrderDenied` back into a strategy that still holds a
-        // mutable borrow — which would otherwise panic on `RefCell` re-entrancy.
-        // In backtest/test mode (no sender), falls back to the direct endpoint.
+        // mutable borrow - which would otherwise panic on `RefCell` re-entrancy.
+        // If no sender is installed, the queued endpoint falls back to direct dispatch.
         msgbus::register_trading_command_endpoint(
             MessagingSwitchboard::risk_engine_queue_execute(),
             TypedIntoHandler::from(move |cmd: TradingCommand| {
                 if let Some(sender) = try_get_trading_cmd_sender() {
-                    sender.execute(cmd);
+                    sender.execute(TradingCommandMessage::new(
+                        MessagingSwitchboard::risk_engine_execute(),
+                        cmd,
+                    ));
                 } else {
                     let endpoint = MessagingSwitchboard::risk_engine_execute();
                     msgbus::send_trading_command(endpoint, cmd);
@@ -177,8 +195,13 @@ impl RiskEngine {
         msgbus::subscribe_order_events(
             "events.order.*".into(),
             TypedHandler::from(move |event: &OrderEventAny| {
-                if let Some(rc) = weak_order_events.upgrade() {
-                    rc.borrow_mut().process(event.clone());
+                // Risk-generated events can publish while `execute` still owns the engine,
+                // and processing is observational, so skipping reentrant events is safe.
+                // TODO: Revisit this if order-event processing gains stateful behavior
+                if let Some(rc) = weak_order_events.upgrade()
+                    && let Ok(mut engine) = rc.try_borrow_mut()
+                {
+                    engine.process(event.clone());
                 }
             }),
             Some(10),
@@ -212,7 +235,7 @@ impl RiskEngine {
             let cache = cache;
             let clock = clock.clone();
             Box::new(move |command: TradingCommand| {
-                let reason = "Exceeded MAX_ORDER_SUBMIT_RATE";
+                let reason = OrderDeniedReason::RateLimitExceeded.to_string();
 
                 match command {
                     TradingCommand::SubmitOrder(submit_order) => {
@@ -223,7 +246,7 @@ impl RiskEngine {
 
                         Self::handle_submit_order_cache(&cache, &submit_order);
 
-                        let denied = Self::create_order_denied(&submit_order, reason, &clock);
+                        let denied = Self::create_order_denied(&submit_order, &reason, &clock);
 
                         let endpoint = MessagingSwitchboard::exec_engine_process();
                         msgbus::send_order_event(endpoint, denied);
@@ -248,7 +271,7 @@ impl RiskEngine {
                                     order.strategy_id(),
                                     order.instrument_id(),
                                     order.client_order_id(),
-                                    reason.into(),
+                                    reason.as_str().into(),
                                     UUID4::new(),
                                     timestamp,
                                     timestamp,
@@ -266,8 +289,7 @@ impl RiskEngine {
         };
 
         Throttler::new(
-            config.max_order_submit.limit,
-            config.max_order_submit.interval_ns,
+            config.max_order_submit,
             clock,
             "ORDER_SUBMIT_THROTTLER",
             success_handler,
@@ -311,8 +333,7 @@ impl RiskEngine {
         };
 
         Throttler::new(
-            config.max_order_modify.limit,
-            config.max_order_modify.interval_ns,
+            config.max_order_modify,
             clock,
             "ORDER_MODIFY_THROTTLER",
             success_handler,
@@ -379,7 +400,7 @@ impl RiskEngine {
             timestamp,
             false,
             order.venue_order_id(),
-            None,
+            order.account_id(),
         ))
     }
 
@@ -532,6 +553,18 @@ impl RiskEngine {
             );
         }
 
+        let mut full_position_exit_venues = self
+            .config
+            .full_position_exit_venues
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        full_position_exit_venues.sort_unstable();
+        map.insert(
+            "full_position_exit_venues".to_string(),
+            full_position_exit_venues.join(","),
+        );
+
         map.insert("debug".to_string(), self.config.debug.to_string());
         map
     }
@@ -547,6 +580,9 @@ impl RiskEngine {
                 self.handle_submit_order_list(submit_order_list);
             }
             TradingCommand::ModifyOrder(modify_order) => self.handle_modify_order(modify_order),
+            TradingCommand::ModifyOrders(modify_orders) => {
+                self.handle_batch_modify_orders(modify_orders);
+            }
             TradingCommand::QueryAccount(query_account) => {
                 Self::send_to_execution(TradingCommand::QueryAccount(query_account));
             }
@@ -588,14 +624,15 @@ impl RiskEngine {
                 if !order.would_reduce_only(pos_side, pos_quantity) {
                     self.deny_command(
                         TradingCommand::SubmitOrder(command),
-                        &format!("Reduce only order would increase position {position_id}"),
+                        &OrderDeniedReason::ReduceOnlyWouldIncreasePosition { position_id }
+                            .to_string(),
                     );
                     return; // Denied
                 }
             } else {
                 self.deny_command(
                     TradingCommand::SubmitOrder(command),
-                    &format!("Position {position_id} not found for reduce-only order"),
+                    &OrderDeniedReason::PositionNotFound { position_id }.to_string(),
                 );
                 return;
             }
@@ -609,21 +646,114 @@ impl RiskEngine {
         let Some(instrument) = instrument_exists else {
             self.deny_command(
                 TradingCommand::SubmitOrder(command.clone()),
-                &format!("Instrument for {} not found", command.instrument_id),
+                &OrderDeniedReason::InstrumentNotFound {
+                    instrument_id: command.instrument_id,
+                }
+                .to_string(),
             );
             return; // Denied
         };
 
-        if !self.check_order(&instrument, &order) {
+        let full_position_exit = self.is_full_position_exit(&command, &instrument, &order);
+
+        if !self.check_order(&instrument, &order, full_position_exit) {
             return; // Denied
         }
 
-        if !self.check_orders_risk(&instrument, &[order]) {
+        if !self.check_orders_risk(&instrument, &[order], full_position_exit) {
             return; // Denied
         }
 
         // Route through execution gateway for TradingState checks & throttling
         self.execution_gateway(&instrument, TradingCommand::SubmitOrder(command));
+    }
+
+    fn is_full_position_exit(
+        &self,
+        command: &SubmitOrder,
+        instrument: &InstrumentAny,
+        order: &OrderAny,
+    ) -> bool {
+        if !self
+            .config
+            .full_position_exit_venues
+            .contains(&instrument.id().venue)
+        {
+            return false;
+        }
+
+        if !Self::has_full_position_exit_intent(command) {
+            return false;
+        }
+
+        if command.instrument_id != order.instrument_id() {
+            return false;
+        }
+
+        if !Self::is_full_position_exit_instrument(instrument)
+            || !Self::is_full_position_exit_order(order)
+        {
+            return false;
+        }
+
+        self.full_position_exit_reduces(command, order)
+    }
+
+    fn has_full_position_exit_intent(command: &SubmitOrder) -> bool {
+        command
+            .params
+            .as_ref()
+            .and_then(|params| params.get_bool(PARAMS_CLOSE_POSITION))
+            .unwrap_or(false)
+    }
+
+    fn is_full_position_exit_instrument(instrument: &InstrumentAny) -> bool {
+        match instrument {
+            InstrumentAny::CryptoFuture(_) | InstrumentAny::CryptoPerpetual(_) => true,
+            InstrumentAny::PerpetualContract(_) => !instrument.is_inverse(),
+            _ => false,
+        }
+    }
+
+    fn is_full_position_exit_order(order: &OrderAny) -> bool {
+        matches!(
+            order.order_type(),
+            OrderType::StopMarket | OrderType::MarketIfTouched
+        ) && order.trigger_price().is_some()
+            && !order.is_reduce_only()
+            && order.quantity().is_positive()
+    }
+
+    fn full_position_exit_reduces(&self, command: &SubmitOrder, order: &OrderAny) -> bool {
+        let Some(position_id) = command.position_id else {
+            return false;
+        };
+        let position = {
+            let cache = self.cache.borrow();
+            if cache.position_id(&order.client_order_id()).copied() != Some(position_id) {
+                return false;
+            }
+            cache.position(&position_id).map(|position| {
+                (
+                    position.is_open(),
+                    position.instrument_id,
+                    position.side,
+                    position.quantity,
+                )
+            })
+        };
+        let Some((is_open, position_instrument_id, position_side, position_quantity)) = position
+        else {
+            return false;
+        };
+
+        is_open
+            && position_instrument_id == order.instrument_id()
+            && matches!(
+                (order.order_side(), position_side),
+                (OrderSide::Buy, PositionSide::Short) | (OrderSide::Sell, PositionSide::Long)
+            )
+            && order.would_reduce_only(position_side, position_quantity)
     }
 
     fn handle_submit_order_list(&mut self, command: SubmitOrderList) {
@@ -640,7 +770,10 @@ impl RiskEngine {
         if orders.len() != command.order_list.client_order_ids.len() {
             self.deny_order_list(
                 &orders,
-                &format!("Incomplete order list: missing orders in cache for {command}"),
+                &OrderDeniedReason::OrderListIncomplete {
+                    order_list_id: command.order_list.id,
+                }
+                .to_string(),
             );
             return; // Denied
         }
@@ -659,7 +792,7 @@ impl RiskEngine {
             let Some(instrument) = resolved else {
                 self.deny_command(
                     TradingCommand::SubmitOrderList(command),
-                    &format!("no instrument found for {instrument_id}"),
+                    &OrderDeniedReason::InstrumentNotFound { instrument_id }.to_string(),
                 );
                 return; // Denied
             };
@@ -670,12 +803,15 @@ impl RiskEngine {
             let Some(instrument) = instruments.get(&order.instrument_id()) else {
                 self.deny_order(
                     order,
-                    &format!("no instrument found for {}", order.instrument_id()),
+                    &OrderDeniedReason::InstrumentNotFound {
+                        instrument_id: order.instrument_id(),
+                    }
+                    .to_string(),
                 );
                 return; // Denied
             };
 
-            if !self.check_order(instrument, order) {
+            if !self.check_order(instrument, order, false) {
                 return; // Denied
             }
         }
@@ -685,18 +821,21 @@ impl RiskEngine {
         } else {
             self.deny_order_list(
                 &orders,
-                &format!(
-                    "no representative instrument found for {}",
-                    command.instrument_id
-                ),
+                &OrderDeniedReason::InstrumentNotFound {
+                    instrument_id: command.instrument_id,
+                }
+                .to_string(),
             );
             return; // Denied
         };
 
-        if !self.check_orders_risk(&representative, &orders) {
+        if !self.check_orders_risk(&representative, &orders, false) {
             self.deny_order_list(
                 &orders,
-                &format!("OrderList {} DENIED", command.order_list.id),
+                &OrderDeniedReason::OrderListDenied {
+                    order_list_id: command.order_list.id,
+                }
+                .to_string(),
             );
             return; // Denied
         }
@@ -710,6 +849,90 @@ impl RiskEngine {
             return;
         }
 
+        if !self.validate_modify_order(&command) {
+            return;
+        }
+
+        self.throttled_modify_order.send(command);
+    }
+
+    fn handle_batch_modify_orders(&mut self, command: BatchModifyOrders) {
+        if self.config.bypass {
+            Self::send_to_execution(TradingCommand::ModifyOrders(command));
+            return;
+        }
+
+        if command.modifies.is_empty() {
+            log::warn!("Cannot handle BatchModifyOrders: no modify commands");
+            return;
+        }
+
+        let mut rejected_client_order_ids = Vec::new();
+        let mut valid = true;
+
+        for modify in &command.modifies {
+            if modify.instrument_id != command.instrument_id {
+                if let Some(order) = self
+                    .cache
+                    .borrow()
+                    .order(&modify.client_order_id)
+                    .map(|o| o.clone())
+                {
+                    self.reject_modify_order(
+                        &order,
+                        &format!(
+                            "BatchModifyOrders instrument {} does not match child instrument {}",
+                            command.instrument_id, modify.instrument_id
+                        ),
+                    );
+                }
+                rejected_client_order_ids.push(modify.client_order_id);
+                valid = false;
+                continue;
+            }
+
+            if !self.validate_modify_order(modify) {
+                rejected_client_order_ids.push(modify.client_order_id);
+                valid = false;
+            }
+        }
+
+        if !valid {
+            let reason = "BatchModifyOrders rejected because one or more child modifications failed validation";
+
+            for modify in &command.modifies {
+                if rejected_client_order_ids.contains(&modify.client_order_id) {
+                    continue;
+                }
+
+                let Some(order) = Self::get_existing_order(&self.cache, modify) else {
+                    continue;
+                };
+
+                self.reject_modify_order(&order, reason);
+            }
+            return;
+        }
+
+        if !self
+            .throttled_modify_order
+            .try_reserve(command.modifies.len())
+        {
+            let reason = "Exceeded MAX_ORDER_MODIFY_RATE";
+
+            for modify in &command.modifies {
+                let Some(order) = Self::get_existing_order(&self.cache, modify) else {
+                    continue;
+                };
+                self.reject_modify_order(&order, reason);
+            }
+            return;
+        }
+
+        Self::send_to_execution(TradingCommand::ModifyOrders(command));
+    }
+
+    fn validate_modify_order(&self, command: &ModifyOrder) -> bool {
         let order_exists = {
             let cache = self.cache.borrow();
             cache.order(&command.client_order_id).map(|o| o.clone())
@@ -720,7 +943,7 @@ impl RiskEngine {
                 "ModifyOrder DENIED: Order with command.client_order_id: {} not found",
                 command.client_order_id
             );
-            return;
+            return false;
         };
 
         if order.is_closed() {
@@ -731,7 +954,7 @@ impl RiskEngine {
                     command.client_order_id
                 ),
             );
-            return;
+            return false;
         } else if order.status() == OrderStatus::PendingCancel {
             self.reject_modify_order(
                 &order,
@@ -740,7 +963,7 @@ impl RiskEngine {
                     command.client_order_id
                 ),
             );
-            return;
+            return false;
         }
 
         let maybe_instrument = {
@@ -753,35 +976,46 @@ impl RiskEngine {
                 &order,
                 &format!("no instrument found for {:?}", command.instrument_id),
             );
-            return; // Denied
+            return false;
         };
 
         // Check Price
-        let mut risk_msg = Self::check_price(&instrument, command.price);
-        if let Some(risk_msg) = risk_msg {
-            self.reject_modify_order(&order, &risk_msg);
-            return; // Denied
+        let mut reason = Self::check_price(&instrument, command.price, OrderPriceField::Price);
+        if let Some(reason) = reason {
+            self.reject_modify_order(&order, &reason.to_string());
+            return false;
         }
 
         // Check Trigger
-        risk_msg = Self::check_price(&instrument, command.trigger_price);
-        if let Some(risk_msg) = risk_msg {
-            self.reject_modify_order(&order, &risk_msg);
-            return; // Denied
+        reason = Self::check_price(
+            &instrument,
+            command.trigger_price,
+            OrderPriceField::TriggerPrice,
+        );
+
+        if let Some(reason) = reason {
+            self.reject_modify_order(&order, &reason.to_string());
+            return false;
         }
 
         // Check Quantity
-        risk_msg = Self::check_quantity(&instrument, command.quantity, order.is_quote_quantity());
-        if let Some(risk_msg) = risk_msg {
-            self.reject_modify_order(&order, &risk_msg);
-            return; // Denied
+        reason = Self::check_quantity(
+            &instrument,
+            command.quantity,
+            order.is_quote_quantity(),
+            false,
+        );
+
+        if let Some(reason) = reason {
+            self.reject_modify_order(&order, &reason.to_string());
+            return false;
         }
 
         // Check TradingState
         match self.trading_state {
             TradingState::Halted => {
                 self.reject_modify_order(&order, "TradingState is HALTED: Cannot modify order");
-                return;
+                return false;
             }
             TradingState::Reducing => {
                 if let Some(quantity) = command.quantity
@@ -796,32 +1030,40 @@ impl RiskEngine {
                             instrument.id()
                         ),
                     );
-                    return;
+                    return false;
                 }
             }
             TradingState::Active => {}
         }
 
-        self.throttled_modify_order.send(command);
+        true
     }
 
-    fn check_order(&self, instrument: &InstrumentAny, order: &OrderAny) -> bool {
+    fn check_order(
+        &self,
+        instrument: &InstrumentAny,
+        order: &OrderAny,
+        full_position_exit: bool,
+    ) -> bool {
         if !self.check_order_price(instrument, order)
-            || !self.check_order_quantity(instrument, order)
+            || !self.check_order_quantity(instrument, order, full_position_exit)
         {
             return false; // Denied
         }
 
         if order.time_in_force() == TimeInForce::Gtd {
             let Some(expire_time) = order.expire_time() else {
-                self.deny_order(order, "GTD order missing expire time");
+                self.deny_order(order, &OrderDeniedReason::MissingExpireTime.to_string());
                 return false; // Denied
             };
 
             if expire_time <= self.clock.borrow().timestamp_ns() {
                 self.deny_order(
                     order,
-                    &format!("GTD {} already past", expire_time.to_rfc3339()),
+                    &OrderDeniedReason::ExpireTimeInPast {
+                        expire_time: expire_time.to_rfc3339(),
+                    }
+                    .to_string(),
                 );
                 return false; // Denied
             }
@@ -832,17 +1074,22 @@ impl RiskEngine {
 
     fn check_order_price(&self, instrument: &InstrumentAny, order: &OrderAny) -> bool {
         if order.price().is_some() {
-            let risk_msg = Self::check_price(instrument, order.price());
-            if let Some(risk_msg) = risk_msg {
-                self.deny_order(order, &risk_msg);
+            let reason = Self::check_price(instrument, order.price(), OrderPriceField::Price);
+            if let Some(reason) = reason {
+                self.deny_order(order, &reason.to_string());
                 return false; // Denied
             }
         }
 
         if order.trigger_price().is_some() {
-            let risk_msg = Self::check_price(instrument, order.trigger_price());
-            if let Some(risk_msg) = risk_msg {
-                self.deny_order(order, &format!("trigger {risk_msg}"));
+            let reason = Self::check_price(
+                instrument,
+                order.trigger_price(),
+                OrderPriceField::TriggerPrice,
+            );
+
+            if let Some(reason) = reason {
+                self.deny_order(order, &reason.to_string());
                 return false; // Denied
             }
         }
@@ -850,22 +1097,33 @@ impl RiskEngine {
         true
     }
 
-    fn check_order_quantity(&self, instrument: &InstrumentAny, order: &OrderAny) -> bool {
-        let risk_msg = Self::check_quantity(
+    fn check_order_quantity(
+        &self,
+        instrument: &InstrumentAny,
+        order: &OrderAny,
+        full_position_exit: bool,
+    ) -> bool {
+        let reason = Self::check_quantity(
             instrument,
             Some(order.quantity()),
             order.is_quote_quantity(),
+            full_position_exit,
         );
 
-        if let Some(risk_msg) = risk_msg {
-            self.deny_order(order, &risk_msg);
+        if let Some(reason) = reason {
+            self.deny_order(order, &reason.to_string());
             return false; // Denied
         }
 
         true
     }
 
-    fn check_orders_risk(&self, instrument: &InstrumentAny, orders: &[OrderAny]) -> bool {
+    fn check_orders_risk(
+        &self,
+        instrument: &InstrumentAny,
+        orders: &[OrderAny],
+        full_position_exit: bool,
+    ) -> bool {
         let mut orders_by_account: AHashMap<Option<AccountId>, Vec<&OrderAny>> = AHashMap::new();
         for order in orders {
             orders_by_account
@@ -875,7 +1133,12 @@ impl RiskEngine {
         }
 
         for (account_id, account_orders) in &orders_by_account {
-            if !self.check_orders_risk_for_account(instrument, account_orders, *account_id) {
+            if !self.check_orders_risk_for_account(
+                instrument,
+                account_orders,
+                *account_id,
+                full_position_exit,
+            ) {
                 return false;
             }
         }
@@ -892,8 +1155,8 @@ impl RiskEngine {
         instrument: &InstrumentAny,
         orders: &[&OrderAny],
         account_id: Option<AccountId>,
+        full_position_exit: bool,
     ) -> bool {
-        let mut last_px: Option<Price> = None;
         let mut max_notional: Option<Money> = None;
 
         // Determine max notional
@@ -905,10 +1168,11 @@ impl RiskEngine {
                 for order in orders {
                     self.deny_order(
                         order,
-                        &format!(
-                            "Invalid max_notional_per_order for {}: {max_notional_setting_val}",
-                            instrument.id()
-                        ),
+                        &OrderDeniedReason::InvalidMaxNotionalPerOrder {
+                            instrument_id: instrument.id(),
+                            value: max_notional_setting_val,
+                        }
+                        .to_string(),
                     );
                 }
                 return false; // Denied
@@ -916,14 +1180,31 @@ impl RiskEngine {
             max_notional = Some(max_notional_value);
         }
 
+        let mut market_prices = Vec::with_capacity(orders.len());
+
+        for order in orders {
+            let price = match order {
+                OrderAny::Market(_) | OrderAny::MarketToLimit(_) => {
+                    self.market_order_price(instrument.id(), order.order_side())
+                }
+                _ => None,
+            };
+
+            market_prices.push(price);
+        }
+
         // Get account for risk checks: use explicit account_id if provided, otherwise venue lookup
         let resolved_account = {
             let cache = self.cache.borrow();
 
             if let Some(account_id) = account_id {
-                cache.account_owned(&account_id)
+                cache
+                    .account(&account_id)
+                    .map(|account| account.clone_without_events())
             } else {
-                cache.account_for_venue_owned(&instrument.id().venue)
+                cache
+                    .account_for_venue(&instrument.id().venue)
+                    .map(|account| account.clone_without_events())
             }
         };
 
@@ -932,19 +1213,35 @@ impl RiskEngine {
                 "Cannot find account for venue {} (account_id={account_id:?})",
                 instrument.id().venue
             );
+
+            for (&order, price) in orders.iter().zip(&market_prices) {
+                if matches!(order, OrderAny::Market(_) | OrderAny::MarketToLimit(_))
+                    && price.is_none()
+                {
+                    self.deny_no_market_price(instrument.id(), order);
+                    return false;
+                }
+            }
+
             return true;
         };
 
         let is_margin = matches!(account, AccountAny::Margin(_));
         let is_betting = matches!(account, AccountAny::Betting(_));
+        let is_wallet = matches!(account, AccountAny::Wallet(_));
         let free = match &account {
             AccountAny::Margin(margin) => margin.balance_free(Some(instrument.quote_currency())),
             AccountAny::Cash(cash) => cash.balance_free(Some(instrument.quote_currency())),
             AccountAny::Betting(betting) => betting.balance_free(Some(instrument.quote_currency())),
+            AccountAny::Wallet(wallet) => Some(
+                wallet
+                    .balance_free(Some(instrument.quote_currency()))
+                    .unwrap_or_else(|| Money::zero(instrument.quote_currency())),
+            ),
         };
         let allow_borrowing = match &account {
             AccountAny::Cash(cash) => cash.allow_borrowing,
-            AccountAny::Margin(_) | AccountAny::Betting(_) => false,
+            AccountAny::Margin(_) | AccountAny::Betting(_) | AccountAny::Wallet(_) => false,
         };
 
         if self.config.debug {
@@ -1036,50 +1333,40 @@ impl RiskEngine {
         let mut cum_margin_required: Option<Money> = None;
         let mut base_currency: Option<Currency> = None;
 
-        for order in orders {
+        for (&order, market_price) in orders.iter().zip(market_prices) {
             // Determine last price based on order type
-            last_px = match order {
+            let last_px = match order {
                 OrderAny::Market(_) | OrderAny::MarketToLimit(_) => {
-                    if last_px.is_none() {
-                        let quote_price = {
-                            let cache = self.cache.borrow();
-                            cache.quote(&instrument.id()).map(|last_quote| {
-                                match order.order_side() {
-                                    OrderSide::Buy => Ok(last_quote.ask_price),
-                                    OrderSide::Sell => Ok(last_quote.bid_price),
-                                    OrderSide::NoOrderSide => Err(format!(
-                                        "invalid `OrderSide`, was {}",
-                                        order.order_side()
-                                    )),
-                                }
-                            })
-                        };
+                    let Some(price) = market_price else {
+                        let is_reducing = !is_wallet
+                            && (order.is_reduce_only()
+                                || (order.is_sell()
+                                    && (cum_sell_qty_raw + order.quantity().raw)
+                                        <= available_long_qty_raw));
 
-                        if let Some(quote_price) = quote_price {
-                            match quote_price {
-                                Ok(price) => Some(price),
-                                Err(reason) => {
-                                    self.deny_order(order, &reason);
-                                    return false; // Denied
-                                }
-                            }
-                        } else {
-                            let cache = self.cache.borrow();
-                            let last_trade = cache.trade(&instrument.id());
-
-                            if let Some(last_trade) = last_trade {
-                                Some(last_trade.price)
-                            } else {
-                                log::warn!(
-                                    "Cannot check MARKET order risk: no prices for {}",
-                                    instrument.id()
-                                );
-                                continue;
-                            }
+                        if !order.is_quote_quantity()
+                            && order.is_sell()
+                            && !is_reducing
+                            && let Some(unleveraged) = cash_or_wallet_account(&account)
+                            && unleveraged.base_currency().is_none()
+                            && let Some(base_currency) = instrument.base_currency()
+                            && !self.check_cash_sell_balance(
+                                unleveraged,
+                                allow_borrowing,
+                                order,
+                                order.quantity(),
+                                base_currency,
+                                &mut cum_notional_sell,
+                            )
+                        {
+                            return false;
                         }
-                    } else {
-                        last_px
-                    }
+
+                        self.deny_no_market_price(instrument.id(), order);
+                        return false;
+                    };
+
+                    Some(price)
                 }
                 OrderAny::StopMarket(_) | OrderAny::MarketIfTouched(_) => order.trigger_price(),
                 OrderAny::TrailingStopMarket(_) | OrderAny::TrailingStopLimit(_) => {
@@ -1088,7 +1375,10 @@ impl RiskEngine {
                     } else {
                         // Validate trailing offset type is supported
                         let Some(offset_type) = order.trailing_offset_type() else {
-                            self.deny_order(order, "missing trailing offset type");
+                            self.deny_order(
+                                order,
+                                &OrderDeniedReason::MissingTrailingOffsetType.to_string(),
+                            );
                             return false; // Denied
                         };
 
@@ -1100,17 +1390,24 @@ impl RiskEngine {
                         ) {
                             self.deny_order(
                                 order,
-                                &format!("UNSUPPORTED_TRAILING_OFFSET_TYPE: {offset_type:?}"),
+                                &OrderDeniedReason::UnsupportedTrailingOffsetType { offset_type }
+                                    .to_string(),
                             );
                             return false;
                         }
 
                         let Some(trigger_type) = order.trigger_type() else {
-                            self.deny_order(order, "missing trigger type");
+                            self.deny_order(
+                                order,
+                                &OrderDeniedReason::MissingTriggerType.to_string(),
+                            );
                             return false; // Denied
                         };
                         let Some(trailing_offset) = order.trailing_offset() else {
-                            self.deny_order(order, "missing trailing offset");
+                            self.deny_order(
+                                order,
+                                &OrderDeniedReason::MissingTrailingOffset.to_string(),
+                            );
                             return false; // Denied
                         };
 
@@ -1124,7 +1421,7 @@ impl RiskEngine {
                                     trailing_stop_calculate_with_bid_ask(
                                         instrument.price_increment(),
                                         offset_type,
-                                        order.order_side_specified(),
+                                        order.order_side(),
                                         trailing_offset,
                                         quote.bid_price,
                                         quote.ask_price,
@@ -1143,7 +1440,7 @@ impl RiskEngine {
                                 trailing_stop_calculate_with_last(
                                     instrument.price_increment(),
                                     offset_type,
-                                    order.order_side_specified(),
+                                    order.order_side(),
                                     trailing_offset,
                                     last_trade.price,
                                 )
@@ -1154,7 +1451,7 @@ impl RiskEngine {
                                     trailing_stop_calculate_with_bid_ask(
                                         instrument.price_increment(),
                                         offset_type,
-                                        order.order_side_specified(),
+                                        order.order_side(),
                                         trailing_offset,
                                         quote.bid_price,
                                         quote.ask_price,
@@ -1186,7 +1483,11 @@ impl RiskEngine {
                                 continue;
                             }
                             Err(e) => {
-                                self.deny_order(order, &format!("TRAILING_STOP_CALC_FAILED: {e}"));
+                                self.deny_order(
+                                    order,
+                                    &OrderDeniedReason::TrailingStopCalculationFailed { detail: e }
+                                        .to_string(),
+                                );
                                 return false;
                             }
                         }
@@ -1213,7 +1514,6 @@ impl RiskEngine {
                         OrderSide::Buy => last_px.min(quote_tick.ask_price),
                         // SELL: could execute at best bid if above limit (but less quantity, so use limit)
                         OrderSide::Sell => last_px.max(quote_tick.bid_price),
-                        OrderSide::NoOrderSide => last_px,
                     }
                 } else {
                     last_px // No market data, use limit price
@@ -1233,15 +1533,17 @@ impl RiskEngine {
             // price and may differ from the venue fill, and some venues enforce
             // distinct per-order-type minimums. The venue is authoritative for
             // quote-denominated sizing; rely on `min_notional`/`max_notional` below.
-            if !order.is_quote_quantity() {
+            if !order.is_quote_quantity() && !full_position_exit {
                 if let Some(max_quantity) = instrument.max_quantity()
                     && effective_quantity > max_quantity
                 {
                     self.deny_order(
                         order,
-                        &format!(
-                            "QUANTITY_EXCEEDS_MAXIMUM: effective_quantity={effective_quantity}, max_quantity={max_quantity}"
-                        ),
+                        &OrderDeniedReason::QuantityExceedsMaximum {
+                            effective_quantity,
+                            max_quantity,
+                        }
+                        .to_string(),
                     );
                     return false; // Denied
                 }
@@ -1251,71 +1553,111 @@ impl RiskEngine {
                 {
                     self.deny_order(
                         order,
-                        &format!(
-                            "QUANTITY_BELOW_MINIMUM: effective_quantity={effective_quantity}, min_quantity={min_quantity}"
-                        ),
+                        &OrderDeniedReason::QuantityBelowMinimum {
+                            effective_quantity,
+                            min_quantity,
+                        }
+                        .to_string(),
                     );
                     return false; // Denied
                 }
             }
 
-            let notional =
-                instrument.calculate_notional_value(effective_quantity, last_px, Some(true));
+            let notional = match instrument.try_calculate_notional_value(
+                effective_quantity,
+                last_px,
+                Some(true),
+            ) {
+                Ok(notional) => notional,
+                Err(e) => {
+                    self.deny_order(
+                        order,
+                        &OrderDeniedReason::NotionalCalculationFailed {
+                            detail: e.to_string(),
+                        }
+                        .to_string(),
+                    );
+                    return false;
+                }
+            };
 
             if self.config.debug {
                 log::debug!("Notional: {notional:?}");
             }
 
             // Check MAX notional per order limit
-            if let Some(max_notional_value) = max_notional
+            if !full_position_exit
+                && let Some(max_notional_value) = max_notional
                 && notional > max_notional_value
             {
                 self.deny_order(
-                        order,
-                        &format!(
-                            "NOTIONAL_EXCEEDS_MAX_PER_ORDER: max_notional={max_notional_value:?}, notional={notional:?}"
-                        ),
-                    );
+                    order,
+                    &OrderDeniedReason::NotionalExceedsMaxPerOrder {
+                        max_notional: max_notional_value,
+                        notional,
+                    }
+                    .to_string(),
+                );
                 return false; // Denied
             }
 
-            // Check MIN notional instrument limit
-            if let Some(min_notional) = instrument.min_notional()
+            // Whole-position and reduce-only orders may close residual positions below the
+            // venue minimum
+            if !order.is_reduce_only()
+                && !full_position_exit
+                && let Some(min_notional) = instrument.min_notional()
                 && notional.currency == min_notional.currency
                 && notional < min_notional
             {
                 self.deny_order(
-                        order,
-                        &format!(
-                            "NOTIONAL_LESS_THAN_MIN_FOR_INSTRUMENT: min_notional={min_notional:?}, notional={notional:?}"
-                        ),
-                    );
+                    order,
+                    &OrderDeniedReason::NotionalBelowMinimum {
+                        min_notional,
+                        notional,
+                    }
+                    .to_string(),
+                );
                 return false; // Denied
             }
 
             // Check MAX notional instrument limit
-            if let Some(max_notional) = instrument.max_notional()
+            if !full_position_exit
+                && let Some(max_notional) = instrument.max_notional()
                 && notional.currency == max_notional.currency
                 && notional > max_notional
             {
                 self.deny_order(
-                        order,
-                        &format!(
-                            "NOTIONAL_GREATER_THAN_MAX_FOR_INSTRUMENT: max_notional={max_notional:?}, notional={notional:?}"
-                        ),
-                    );
+                    order,
+                    &OrderDeniedReason::NotionalExceedsMaximum {
+                        max_notional,
+                        notional,
+                    }
+                    .to_string(),
+                );
                 return false; // Denied
             }
 
             if is_margin {
                 // Margin account: check initial margin requirement
                 let margin_req = match &mut account {
-                    AccountAny::Margin(margin) => margin
-                        .calculate_initial_margin(instrument, effective_quantity, last_px, None)
-                        .unwrap_or_else(|e| {
-                            log::error!("Failed to calculate initial margin: {e}");
-                            Money::zero(instrument.quote_currency())
-                        }),
+                    AccountAny::Margin(margin) => match margin.calculate_initial_margin(
+                        instrument,
+                        effective_quantity,
+                        last_px,
+                        None,
+                    ) {
+                        Ok(margin) => margin,
+                        Err(e) => {
+                            self.deny_order(
+                                order,
+                                &OrderDeniedReason::InitialMarginCalculationFailed {
+                                    detail: e.to_string(),
+                                }
+                                .to_string(),
+                            );
+                            return false;
+                        }
+                    },
                     _ => unreachable!(),
                 };
 
@@ -1325,6 +1667,7 @@ impl RiskEngine {
 
                 // Determine if order is position-reducing
                 let is_reducing = order.is_reduce_only()
+                    || full_position_exit
                     || (order.is_sell()
                         && (cum_sell_qty_raw + effective_quantity.raw) <= available_long_qty_raw)
                     || (order.is_buy()
@@ -1364,16 +1707,30 @@ impl RiskEngine {
                 if margin_req > margin_free_val {
                     self.deny_order(
                         order,
-                        &format!(
-                            "MARGIN_EXCEEDS_FREE_BALANCE: free={margin_free_val}, margin_required={margin_req}"
-                        ),
+                        &OrderDeniedReason::InitialMarginExceedsFreeBalance {
+                            free_balance: margin_free_val,
+                            initial_margin: margin_req,
+                        }
+                        .to_string(),
                     );
                     return false;
                 }
 
                 // Cumulative margin check
                 match cum_margin_required.as_mut() {
-                    Some(cum) => cum.raw += margin_req.raw,
+                    Some(cum) => {
+                        let Some(total) = cum.checked_add(margin_req) else {
+                            self.deny_order(
+                                order,
+                                &OrderDeniedReason::CumulativeInitialMarginCalculationFailed {
+                                    detail: "total exceeds Money bounds".to_string(),
+                                }
+                                .to_string(),
+                            );
+                            return false;
+                        };
+                        *cum = total;
+                    }
                     None => cum_margin_required = Some(margin_req),
                 }
 
@@ -1386,47 +1743,64 @@ impl RiskEngine {
                 {
                     self.deny_order(
                         order,
-                        &format!(
-                            "CUM_MARGIN_EXCEEDS_FREE_BALANCE: free={margin_free_val}, cum_margin={cum_margin}"
-                        ),
+                        &OrderDeniedReason::CumulativeInitialMarginExceedsFreeBalance {
+                            free_balance: margin_free_val,
+                            cumulative_initial_margin: cum_margin,
+                        }
+                        .to_string(),
                     );
                     return false;
                 }
             } else {
                 // Cash account: check full notional value
-                let notional =
-                    instrument.calculate_notional_value(effective_quantity, last_px, None);
+                let notional = match instrument.try_calculate_notional_value(
+                    effective_quantity,
+                    last_px,
+                    None,
+                ) {
+                    Ok(notional) => notional,
+                    Err(e) => {
+                        self.deny_order(
+                            order,
+                            &OrderDeniedReason::NotionalCalculationFailed {
+                                detail: e.to_string(),
+                            }
+                            .to_string(),
+                        );
+                        return false;
+                    }
+                };
                 let order_balance_impact = if is_betting {
                     match &mut account {
-                        AccountAny::Betting(betting) => Money::from_raw(
-                            -betting
-                                .calculate_balance_locked(
-                                    instrument,
-                                    order.order_side(),
-                                    effective_quantity,
-                                    last_px,
-                                    None,
-                                )
-                                .unwrap_or_else(|e| {
-                                    log::error!("Failed to calculate betting balance locked: {e}");
-                                    Money::zero(instrument.quote_currency())
-                                })
-                                .raw,
-                            instrument.quote_currency(),
-                        ),
+                        AccountAny::Betting(betting) => {
+                            match betting.calculate_balance_locked(
+                                instrument,
+                                order.order_side(),
+                                effective_quantity,
+                                last_px,
+                                None,
+                            ) {
+                                Ok(locked) => {
+                                    Money::from_raw(-locked.raw, instrument.quote_currency())
+                                }
+                                Err(e) => {
+                                    self.deny_order(
+                                        order,
+                                        &OrderDeniedReason::BettingBalanceLockedCalculationFailed {
+                                            detail: e.to_string(),
+                                        }
+                                        .to_string(),
+                                    );
+                                    return false;
+                                }
+                            }
+                        }
                         _ => unreachable!(),
                     }
                 } else {
                     match order.order_side() {
                         OrderSide::Buy => Money::from_raw(-notional.raw, notional.currency),
                         OrderSide::Sell => Money::from_raw(notional.raw, notional.currency),
-                        OrderSide::NoOrderSide => {
-                            self.deny_order(
-                                order,
-                                &format!("invalid `OrderSide`, was {}", order.order_side()),
-                            );
-                            return false; // Denied
-                        }
                     }
                 };
 
@@ -1436,12 +1810,13 @@ impl RiskEngine {
 
                 // Check if order reduces an existing position
                 let is_position_reducing = if order.is_buy() {
-                    let reducing = order.is_reduce_only()
+                    let reducing = full_position_exit
                         || (cum_buy_qty_raw + effective_quantity.raw) <= available_short_qty_raw;
                     cum_buy_qty_raw += effective_quantity.raw;
                     reducing
                 } else if order.is_sell() {
                     let reducing = order.is_reduce_only()
+                        || full_position_exit
                         || (cum_sell_qty_raw + effective_quantity.raw) <= available_long_qty_raw;
                     cum_sell_qty_raw += effective_quantity.raw;
                     reducing
@@ -1449,7 +1824,7 @@ impl RiskEngine {
                     false
                 };
 
-                if is_position_reducing {
+                if is_position_reducing && !is_wallet {
                     if self.config.debug {
                         log::debug!("Position-reducing order skips balance check");
                     }
@@ -1463,9 +1838,11 @@ impl RiskEngine {
                 {
                     self.deny_order(
                         order,
-                        &format!(
-                            "NOTIONAL_EXCEEDS_FREE_BALANCE: free={free_val:?}, notional={notional:?}"
-                        ),
+                        &OrderDeniedReason::NotionalExceedsFreeBalance {
+                            free_balance: free_val,
+                            notional,
+                        }
+                        .to_string(),
                     );
                     return false;
                 }
@@ -1495,7 +1872,14 @@ impl RiskEngine {
                         && let (Some(free), Some(cum_notional_buy)) = (free, cum_notional_buy)
                         && cum_notional_buy > free
                     {
-                        self.deny_order(order, &format!("CUM_NOTIONAL_EXCEEDS_FREE_BALANCE: free={free}, cum_notional={cum_notional_buy}"));
+                        self.deny_order(
+                            order,
+                            &OrderDeniedReason::CumulativeNotionalExceedsFreeBalance {
+                                free_balance: free,
+                                cumulative_notional: cum_notional_buy,
+                            }
+                            .to_string(),
+                        );
                         return false; // Denied
                     }
                 } else if order.is_sell() {
@@ -1520,7 +1904,14 @@ impl RiskEngine {
                             && let (Some(free), Some(cum_notional_sell)) = (free, cum_notional_sell)
                             && cum_notional_sell > free
                         {
-                            self.deny_order(order, &format!("CUM_NOTIONAL_EXCEEDS_FREE_BALANCE: free={free}, cum_notional={cum_notional_sell}"));
+                            self.deny_order(
+                                order,
+                                &OrderDeniedReason::CumulativeNotionalExceedsFreeBalance {
+                                    free_balance: free,
+                                    cumulative_notional: cum_notional_sell,
+                                }
+                                .to_string(),
+                            );
                             return false;
                         }
 
@@ -1531,6 +1922,7 @@ impl RiskEngine {
                         AccountAny::Margin(_) => false,
                         AccountAny::Cash(cash) => cash.base_currency.is_some(),
                         AccountAny::Betting(betting) => betting.base_currency.is_some(),
+                        AccountAny::Wallet(wallet) => wallet.base_currency.is_some(),
                     };
 
                     if has_base_currency {
@@ -1554,71 +1946,30 @@ impl RiskEngine {
                             && let (Some(free), Some(cum_notional_sell)) = (free, cum_notional_sell)
                             && cum_notional_sell > free
                         {
-                            self.deny_order(order, &format!("CUM_NOTIONAL_EXCEEDS_FREE_BALANCE: free={free}, cum_notional={cum_notional_sell}"));
+                            self.deny_order(
+                                order,
+                                &OrderDeniedReason::CumulativeNotionalExceedsFreeBalance {
+                                    free_balance: free,
+                                    cumulative_notional: cum_notional_sell,
+                                }
+                                .to_string(),
+                            );
                             return false; // Denied
                         }
                     } else if let Some(base_currency) = base_currency {
-                        let cash_value_raw = match effective_quantity.raw.try_into() {
-                            Ok(value) => value,
-                            Err(e) => {
-                                self.deny_order(
-                                    order,
-                                    &format!("Unable to convert Quantity to f64: {e}"),
-                                );
-                                return false; // Denied
-                            }
-                        };
-                        let cash_value = Money::from_raw(cash_value_raw, base_currency);
-
-                        // Use base-currency free balance for sell checks
-                        let base_free = match &account {
-                            AccountAny::Margin(_) => None,
-                            AccountAny::Cash(cash) => cash.balance_free(Some(base_currency)),
-                            AccountAny::Betting(betting) => {
-                                betting.balance_free(Some(base_currency))
-                            }
+                        let Some(unleveraged) = cash_or_wallet_account(&account) else {
+                            unreachable!()
                         };
 
-                        if self.config.debug
-                            && let AccountAny::Cash(cash) = &account
-                        {
-                            log::debug!("Cash value: {cash_value:?}");
-                            log::debug!("Total: {:?}", cash.balance_total(Some(base_currency)));
-                            log::debug!("Locked: {:?}", cash.balance_locked(Some(base_currency)));
-                            log::debug!("Free: {base_free:?}");
-                        }
-
-                        if self.config.debug
-                            && let AccountAny::Betting(betting) = &account
-                        {
-                            log::debug!("Cash value: {cash_value:?}");
-                            log::debug!("Total: {:?}", betting.balance_total(Some(base_currency)));
-                            log::debug!(
-                                "Locked: {:?}",
-                                betting.balance_locked(Some(base_currency))
-                            );
-                            log::debug!("Free: {base_free:?}");
-                        }
-
-                        match cum_notional_sell {
-                            Some(mut value) => {
-                                value.raw += cash_value.raw;
-                                cum_notional_sell = Some(value);
-                            }
-                            None => cum_notional_sell = Some(cash_value),
-                        }
-
-                        if self.config.debug {
-                            log::debug!("Cumulative notional SELL: {cum_notional_sell:?}");
-                        }
-
-                        if !allow_borrowing
-                            && let (Some(base_free), Some(cum_notional_sell)) =
-                                (base_free, cum_notional_sell)
-                            && cum_notional_sell.raw > base_free.raw
-                        {
-                            self.deny_order(order, &format!("CUM_NOTIONAL_EXCEEDS_FREE_BALANCE: free={base_free}, cum_notional={cum_notional_sell}"));
-                            return false; // Denied
+                        if !self.check_cash_sell_balance(
+                            unleveraged,
+                            allow_borrowing,
+                            order,
+                            effective_quantity,
+                            base_currency,
+                            &mut cum_notional_sell,
+                        ) {
+                            return false;
                         }
                     }
                 }
@@ -1629,20 +1980,140 @@ impl RiskEngine {
         true // Passed
     }
 
-    fn check_price(instrument: &InstrumentAny, price: Option<Price>) -> Option<String> {
+    fn market_order_price(
+        &self,
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+    ) -> Option<Price> {
+        let price_type = match order_side {
+            OrderSide::Buy => PriceType::Ask,
+            OrderSide::Sell => PriceType::Bid,
+        };
+
+        let cache = self.cache.borrow();
+
+        if let Some(price) = cache.price(&instrument_id, price_type) {
+            return Some(price);
+        }
+
+        if let Some(price) = cache.price(&instrument_id, PriceType::Last) {
+            return Some(price);
+        }
+
+        let bar_price = |price_type| {
+            cache
+                .bar_types(
+                    Some(&instrument_id),
+                    Some(&price_type),
+                    AggregationSource::External,
+                )
+                .into_iter()
+                .filter_map(|bar_type| {
+                    cache
+                        .bar(bar_type)
+                        .map(|bar| (bar.ts_init, *bar_type, bar.close))
+                })
+                .max_by_key(|(ts_init, bar_type, _)| (*ts_init, *bar_type))
+                .map(|(_, _, price)| price)
+        };
+
+        bar_price(price_type).or_else(|| bar_price(PriceType::Last))
+    }
+
+    fn check_cash_sell_balance(
+        &self,
+        account: &dyn Account,
+        allow_borrowing: bool,
+        order: &OrderAny,
+        quantity: Quantity,
+        base_currency: Currency,
+        cum_notional_sell: &mut Option<Money>,
+    ) -> bool {
+        let cash_value_raw: MoneyRaw = match quantity.raw.try_into() {
+            Ok(value) => value,
+            Err(e) => {
+                self.deny_order(
+                    order,
+                    &OrderDeniedReason::QuantityConversionFailed {
+                        detail: e.to_string(),
+                    }
+                    .to_string(),
+                );
+                return false;
+            }
+        };
+
+        let cash_value = Money::from_raw(cash_value_raw, base_currency);
+        let base_free = account
+            .balance_free(Some(base_currency))
+            .unwrap_or_else(|| Money::zero(base_currency));
+
+        if self.config.debug {
+            log::debug!("Cash value: {cash_value:?}");
+            log::debug!("Total: {:?}", account.balance_total(Some(base_currency)));
+            log::debug!("Locked: {:?}", account.balance_locked(Some(base_currency)));
+            log::debug!("Free: {base_free:?}");
+        }
+
+        match cum_notional_sell {
+            Some(value) => value.raw += cash_value.raw,
+            None => *cum_notional_sell = Some(cash_value),
+        }
+
+        if self.config.debug {
+            log::debug!("Cumulative notional SELL: {cum_notional_sell:?}");
+        }
+
+        if !allow_borrowing
+            && let Some(cum_notional_sell) = *cum_notional_sell
+            && cum_notional_sell.raw > base_free.raw
+        {
+            self.deny_order(
+                order,
+                &OrderDeniedReason::CumulativeNotionalExceedsFreeBalance {
+                    free_balance: base_free,
+                    cumulative_notional: cum_notional_sell,
+                }
+                .to_string(),
+            );
+            return false;
+        }
+
+        true
+    }
+
+    fn deny_no_market_price(&self, instrument_id: InstrumentId, order: &OrderAny) {
+        self.deny_order(
+            order,
+            &OrderDeniedReason::MarketPriceUnavailable {
+                order_type: order.order_type(),
+                instrument_id,
+            }
+            .to_string(),
+        );
+    }
+
+    fn check_price(
+        instrument: &InstrumentAny,
+        price: Option<Price>,
+        field: OrderPriceField,
+    ) -> Option<OrderDeniedReason> {
         let price_val = price?;
 
         if price_val.precision > instrument.price_precision() {
-            return Some(format!(
-                "price {} invalid (precision {} > {})",
-                price_val,
-                price_val.precision,
-                instrument.price_precision()
-            ));
+            return Some(OrderDeniedReason::PricePrecisionExceedsMaximum {
+                field,
+                price: price_val,
+                price_precision: price_val.precision,
+                max_precision: instrument.price_precision(),
+            });
         }
 
         if !instrument.allows_negative_price() && price_val.raw <= 0 {
-            return Some(format!("price {price_val} invalid (<= 0)"));
+            return Some(OrderDeniedReason::PriceNotPositive {
+                field,
+                price: price_val,
+            });
         }
 
         None
@@ -1652,21 +2123,22 @@ impl RiskEngine {
         instrument: &InstrumentAny,
         quantity: Option<Quantity>,
         is_quote_quantity: bool,
-    ) -> Option<String> {
+        full_position_exit: bool,
+    ) -> Option<OrderDeniedReason> {
         let quantity_val = quantity?;
 
         // Check precision
         if quantity_val.precision > instrument.size_precision() {
-            return Some(format!(
-                "quantity {} invalid (precision {} > {})",
-                quantity_val,
-                quantity_val.precision,
-                instrument.size_precision()
-            ));
+            return Some(OrderDeniedReason::QuantityPrecisionExceedsMaximum {
+                quantity: quantity_val,
+                quantity_precision: quantity_val.precision,
+                max_precision: instrument.size_precision(),
+            });
         }
 
-        // Skip min/max checks for quote quantities (they will be checked in check_orders_risk using effective_quantity)
-        if is_quote_quantity {
+        // Base-quantity bounds do not apply to quote-denominated or validated whole-position
+        // exits. Applicable quote-quantity notional limits are checked during account risk.
+        if is_quote_quantity || full_position_exit {
             return None;
         }
 
@@ -1674,18 +2146,20 @@ impl RiskEngine {
         if let Some(max_quantity) = instrument.max_quantity()
             && quantity_val > max_quantity
         {
-            return Some(format!(
-                "quantity {quantity_val} invalid (> maximum trade size of {max_quantity})"
-            ));
+            return Some(OrderDeniedReason::QuantityExceedsMaximum {
+                effective_quantity: quantity_val,
+                max_quantity,
+            });
         }
 
         // Check minimum quantity
         if let Some(min_quantity) = instrument.min_quantity()
             && quantity_val < min_quantity
         {
-            return Some(format!(
-                "quantity {quantity_val} invalid (< minimum trade size of {min_quantity})"
-            ));
+            return Some(OrderDeniedReason::QuantityBelowMinimum {
+                effective_quantity: quantity_val,
+                min_quantity,
+            });
         }
 
         None
@@ -1798,7 +2272,7 @@ impl RiskEngine {
                     };
 
                     if let Some(ref order) = order {
-                        self.deny_order(order, "TradingState::HALTED");
+                        self.deny_order(order, &OrderDeniedReason::TradingHalted.to_string());
                     }
                 }
                 TradingCommand::SubmitOrderList(submit_order_list) => {
@@ -1806,7 +2280,7 @@ impl RiskEngine {
                         &submit_order_list.order_list.client_order_ids,
                         &submit_order_list,
                     );
-                    self.deny_order_list(&orders, "TradingState::HALTED");
+                    self.deny_order_list(&orders, &OrderDeniedReason::TradingHalted.to_string());
                 }
                 _ => {}
             },
@@ -1820,28 +2294,20 @@ impl RiskEngine {
                                 .map(|o| o.clone())
                         };
 
-                        if let Some(ref order) = order {
-                            if order.is_buy() && self.portfolio.is_net_long(&instrument.id()) {
-                                self.deny_order(
-                                    order,
-                                    &format!(
-                                        "BUY when TradingState::REDUCING and LONG {}",
-                                        instrument.id()
-                                    ),
-                                );
-                                return;
-                            } else if order.is_sell()
-                                && self.portfolio.is_net_short(&instrument.id())
-                            {
-                                self.deny_order(
-                                    order,
-                                    &format!(
-                                        "SELL when TradingState::REDUCING and SHORT {}",
-                                        instrument.id()
-                                    ),
-                                );
-                                return;
-                            }
+                        if let Some(ref order) = order
+                            && ((order.is_buy() && self.portfolio.is_net_long(&instrument.id()))
+                                || (order.is_sell()
+                                    && self.portfolio.is_net_short(&instrument.id())))
+                        {
+                            self.deny_order(
+                                order,
+                                &OrderDeniedReason::TradingStateReducing {
+                                    order_side: order.order_side(),
+                                    instrument_id: instrument.id(),
+                                }
+                                .to_string(),
+                            );
+                            return;
                         }
                     }
                     TradingCommand::SubmitOrderList(submit_order_list) => {
@@ -1852,22 +2318,17 @@ impl RiskEngine {
 
                         for order in &orders {
                             let order_instrument_id = order.instrument_id();
-                            if order.is_buy() && self.portfolio.is_net_long(&order_instrument_id) {
-                                self.deny_order_list(
-                                    &orders,
-                                    &format!(
-                                        "BUY when TradingState::REDUCING and LONG {order_instrument_id}",
-                                    ),
-                                );
-                                return;
-                            } else if order.is_sell()
-                                && self.portfolio.is_net_short(&order_instrument_id)
+                            if (order.is_buy() && self.portfolio.is_net_long(&order_instrument_id))
+                                || (order.is_sell()
+                                    && self.portfolio.is_net_short(&order_instrument_id))
                             {
                                 self.deny_order_list(
                                     &orders,
-                                    &format!(
-                                        "SELL when TradingState::REDUCING and SHORT {order_instrument_id}",
-                                    ),
+                                    &OrderDeniedReason::TradingStateReducing {
+                                        order_side: order.order_side(),
+                                        instrument_id: order_instrument_id,
+                                    }
+                                    .to_string(),
                                 );
                                 return;
                             }

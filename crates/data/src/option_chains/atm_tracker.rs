@@ -18,11 +18,12 @@
 //! ATM price is always derived from the exchange-provided forward price
 //! embedded in each option greeks/ticker update.
 
+use nautilus_core::correctness::CorrectnessResult;
 use nautilus_model::{data::option_chain::OptionGreeks, types::Price};
 
 /// Tracks the raw ATM price reactively from the forward price in option greeks.
 ///
-/// Does not interact with cache — receives updates via handler callbacks.
+/// Does not interact with cache - receives updates via handler callbacks.
 /// Closest-strike resolution is delegated to `StrikeRange::resolve()`.
 #[derive(Debug)]
 pub struct AtmTracker {
@@ -61,14 +62,27 @@ impl AtmTracker {
 
     /// Updates from an option greeks event.
     ///
-    /// Extracts `underlying_price` from the greeks — the exchange-provided
+    /// Extracts `underlying_price` from the greeks - the exchange-provided
     /// forward price for this expiry. Returns `true` if the ATM price was updated.
     pub fn update_from_option_greeks(&mut self, greeks: &OptionGreeks) -> bool {
+        self.try_update_from_option_greeks(greeks).unwrap_or(false)
+    }
+
+    /// Updates from an option greeks event with correctness checking.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the exchange-provided forward price is outside the
+    /// representable [`Price`] range.
+    pub fn try_update_from_option_greeks(
+        &mut self,
+        greeks: &OptionGreeks,
+    ) -> CorrectnessResult<bool> {
         if let Some(fwd) = greeks.underlying_price {
-            self.atm_price = Some(Price::new(fwd, self.forward_precision));
-            return true;
+            self.atm_price = Some(Price::new_checked(fwd, self.forward_precision)?);
+            return Ok(true);
         }
-        false
+        Ok(false)
     }
 }
 
@@ -103,6 +117,22 @@ mod tests {
         };
         assert!(tracker.update_from_option_greeks(&greeks));
         assert_eq!(tracker.atm_price().unwrap(), Price::from("50500.00"));
+    }
+
+    #[rstest]
+    fn test_atm_tracker_try_update_from_option_greeks_rejects_invalid_forward_price() {
+        let mut tracker = AtmTracker::new();
+        tracker.set_initial_price(Price::from("50000.00"));
+        let greeks = OptionGreeks {
+            instrument_id: InstrumentId::from("BTC-20240101-50000-C.DERIBIT"),
+            underlying_price: Some(f64::NAN),
+            ..Default::default()
+        };
+
+        let error = tracker.try_update_from_option_greeks(&greeks).unwrap_err();
+
+        assert_eq!(error.to_string(), "invalid f64 for 'value', was NaN");
+        assert_eq!(tracker.atm_price().unwrap(), Price::from("50000.00"));
     }
 
     #[rstest]

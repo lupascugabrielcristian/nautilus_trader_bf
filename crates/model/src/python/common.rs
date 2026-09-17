@@ -14,7 +14,7 @@
 // -------------------------------------------------------------------------------------------------
 
 use indexmap::IndexMap;
-use nautilus_core::python::{IntoPyObjectNautilusExt, to_pyvalue_err};
+use nautilus_core::python::to_pyvalue_err;
 use pyo3::{
     conversion::IntoPyObjectExt,
     prelude::*,
@@ -25,7 +25,7 @@ use strum::IntoEnumIterator;
 
 use crate::types::{Currency, Money};
 
-pub const PY_MODULE_MODEL: &str = "nautilus_trader.core.nautilus_pyo3.model";
+pub const PY_MODULE_MODEL: &str = "nautilus_trader.model";
 
 /// Python iterator over the variants of an enum.
 #[allow(missing_debug_implementations)]
@@ -33,7 +33,7 @@ pub const PY_MODULE_MODEL: &str = "nautilus_trader.core.nautilus_pyo3.model";
 #[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")]
 pub struct EnumIterator {
     // Type erasure for code reuse, generic types can't be exposed to Python
-    iter: Box<dyn Iterator<Item = Py<PyAny>> + Send + Sync>,
+    iter: Box<dyn Iterator<Item = PyResult<Py<PyAny>>> + Send + Sync>,
 }
 
 #[pymethods]
@@ -43,17 +43,13 @@ impl EnumIterator {
         slf
     }
 
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> Option<Py<PyAny>> {
-        slf.iter.next()
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
+        slf.iter.next().transpose()
     }
 }
 
 impl EnumIterator {
     /// Creates a new Python iterator over the variants of an enum.
-    ///
-    /// # Panics
-    ///
-    /// Panics if conversion of enum variants into Python objects fails.
     #[must_use]
     pub fn new<'py, E>(py: Python<'py>) -> Self
     where
@@ -63,7 +59,7 @@ impl EnumIterator {
         Self {
             iter: Box::new(
                 E::iter()
-                    .map(|var| var.into_py_any_unwrap(py))
+                    .map(|var| var.into_py_any(py))
                     // Force eager evaluation because `py` isn't `Send`
                     .collect::<Vec<_>>()
                     .into_iter(),
@@ -178,10 +174,7 @@ pub fn commissions_from_indexmap<'py>(
 
 #[cfg(test)]
 mod tests {
-    use pyo3::{
-        prelude::*,
-        types::{PyBool, PyInt, PyString},
-    };
+    use pyo3::types::{PyBool, PyInt, PyString};
     use rstest::rstest;
     use serde_json::{Value, json};
 

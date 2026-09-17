@@ -17,10 +17,10 @@
 //!
 //! This example exercises three features:
 //!
-//! 1. **Tags** — `provider.list_tags()` to list available event categories.
-//! 2. **Raw event query** — `provider.http_client().inner().get_gamma_events()`
+//! 1. **Tags** - `provider.list_tags()` to list available event categories.
+//! 2. **Raw event query** - `provider.http_client().inner().get_gamma_events()`
 //!    to inspect enriched `GammaEvent` fields (liquidity, volume, category).
-//! 3. **`EventParamsFilter`** — Provider integration that fetches instruments
+//! 3. **`EventParamsFilter`** - Provider integration that fetches instruments
 //!    from events matching the query params.
 //!
 //! # Usage
@@ -181,10 +181,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (i, instrument) in instruments.into_iter().enumerate().take(30) {
         let id = Instrument::id(instrument);
         let expiration = Instrument::expiration_ns(instrument).map_or("N/A".to_string(), |ns| {
-            let secs = (ns.as_u64() / 1_000_000_000) as i64;
-            chrono::DateTime::from_timestamp(secs, 0).map_or("N/A".to_string(), |dt| {
-                dt.format("%Y-%m-%d %H:%M UTC").to_string()
-            })
+            ns.to_datetime_utc()
+                .strftime("%Y-%m-%d %H:%M UTC")
+                .to_string()
         });
 
         if let InstrumentAny::BinaryOption(opt) = instrument {

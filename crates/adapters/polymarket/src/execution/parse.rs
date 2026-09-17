@@ -15,6 +15,8 @@
 
 //! Parsing functions for Polymarket execution reports.
 
+use anyhow::Context;
+use jiff::Timestamp;
 use nautilus_core::{
     UUID4, UnixNanos,
     datetime::{NANOSECONDS_IN_MILLISECOND, NANOSECONDS_IN_SECOND},
@@ -30,7 +32,7 @@ use rust_decimal::Decimal;
 
 use crate::{
     common::{
-        consts::{DUST_SNAP_THRESHOLD, USDC_DECIMALS},
+        consts::{DUST_SNAP_THRESHOLD_DEC, USDC_DECIMALS},
         enums::{
             PolymarketEventType, PolymarketLiquiditySide, PolymarketOrderSide,
             PolymarketOrderStatus,
@@ -89,7 +91,6 @@ pub fn determine_order_side(
         match order_side {
             OrderSide::Buy => OrderSide::Sell,
             OrderSide::Sell => OrderSide::Buy,
-            other => other,
         }
     }
 }
@@ -102,16 +103,17 @@ pub fn determine_order_side(
 ///
 /// Format: `{trade_id[..27]}-{venue_order_id[last 8]}` = 36 chars.
 pub fn make_composite_trade_id(trade_id: &str, venue_order_id: &str) -> TradeId {
+    TradeId::from(composite_trade_id_value(trade_id, venue_order_id).as_str())
+}
+
+pub(super) fn composite_trade_id_value(trade_id: &str, venue_order_id: &str) -> String {
     let prefix_len = trade_id.len().min(27);
     let suffix_len = venue_order_id.len().min(8);
     let suffix_start = venue_order_id.len().saturating_sub(suffix_len);
-    TradeId::from(
-        format!(
-            "{}-{}",
-            &trade_id[..prefix_len],
-            &venue_order_id[suffix_start..]
-        )
-        .as_str(),
+    format!(
+        "{}-{}",
+        &trade_id[..prefix_len],
+        &venue_order_id[suffix_start..]
     )
 }
 
@@ -125,41 +127,78 @@ pub fn parse_order_status_report(
     size_precision: u8,
     ts_init: UnixNanos,
 ) -> OrderStatusReport {
-    let venue_order_id = VenueOrderId::from(order.id.as_str());
+    let expire_time = order
+        .expiration
+        .as_deref()
+        .and_then(parse_expiration_nanos)
+        .map(UnixNanos::from);
+    parse_validated_order_status_report(
+        order,
+        OrderReportParseContext {
+            instrument_id,
+            account_id,
+            client_order_id,
+            venue_order_id: VenueOrderId::from(order.id.as_str()),
+            price_precision,
+            size_precision,
+            ts_accepted: UnixNanos::from(order.created_at * NANOSECONDS_IN_SECOND),
+            expire_time,
+            ts_init,
+        },
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct OrderReportParseContext {
+    pub instrument_id: InstrumentId,
+    pub account_id: AccountId,
+    pub client_order_id: Option<ClientOrderId>,
+    pub venue_order_id: VenueOrderId,
+    pub price_precision: u8,
+    pub size_precision: u8,
+    pub ts_accepted: UnixNanos,
+    pub expire_time: Option<UnixNanos>,
+    pub ts_init: UnixNanos,
+}
+
+pub(super) fn parse_validated_order_status_report(
+    order: &PolymarketOpenOrder,
+    ctx: OrderReportParseContext,
+) -> OrderStatusReport {
     let order_side = OrderSide::from(order.side);
     let time_in_force = TimeInForce::from(order.order_type);
-    let order_status = OrderStatus::from(order.status);
-    let quantity = Quantity::from_decimal_dp(order.original_size, size_precision)
-        .unwrap_or_else(|_| Quantity::zero(size_precision));
-    let raw_filled_qty = Quantity::from_decimal_dp(order.size_matched, size_precision)
-        .unwrap_or_else(|_| Quantity::zero(size_precision));
+    let quantity = Quantity::from_decimal_dp(order.original_size, ctx.size_precision)
+        .unwrap_or_else(|_| Quantity::zero(ctx.size_precision));
+    let raw_filled_qty = Quantity::from_decimal_dp(order.size_matched, ctx.size_precision)
+        .unwrap_or_else(|_| Quantity::zero(ctx.size_precision));
+    // `Matched` does not mean fully filled, so resolve the status from the filled quantity.
+    let order_status = if order.status == PolymarketOrderStatus::Matched {
+        recovered_terminal_order_status(time_in_force, quantity, raw_filled_qty)
+    } else {
+        OrderStatus::from(order.status)
+    };
     let filled_qty = snap_filled_qty_to_quantity(quantity, raw_filled_qty, order_status);
-    let price = Price::from_decimal_dp(order.price, price_precision)
-        .unwrap_or_else(|_| Price::zero(price_precision));
-
-    let ts_accepted = UnixNanos::from(order.created_at * NANOSECONDS_IN_SECOND);
+    let price = Price::from_decimal_dp(order.price, ctx.price_precision)
+        .unwrap_or_else(|_| Price::zero(ctx.price_precision));
 
     let mut report = OrderStatusReport::new(
-        account_id,
-        instrument_id,
-        client_order_id,
-        venue_order_id,
-        order_side,
+        ctx.account_id,
+        ctx.instrument_id,
+        ctx.client_order_id,
+        ctx.venue_order_id,
+        order_side.into(),
         OrderType::Limit,
         time_in_force,
         order_status,
         quantity,
         filled_qty,
-        ts_accepted,
-        ts_accepted, // ts_last
-        ts_init,
+        ctx.ts_accepted,
+        ctx.ts_accepted, // ts_last
+        ctx.ts_init,
         None, // report_id
     );
     report.price = Some(price);
-    // CLOB V2 emits `expiration` as Unix seconds; "0" means no expiration.
-    if let Some(nanos) = order.expiration.as_deref().and_then(parse_expiration_nanos) {
-        report.expire_time = Some(UnixNanos::from(nanos));
-    }
+    report.expire_time = ctx.expire_time;
     report
 }
 
@@ -167,7 +206,7 @@ pub fn parse_order_status_report(
 /// `None` for `"0"`, missing values, unparsable input, or values that
 /// overflow `u64` when scaled to nanoseconds (e.g. accidentally-passed
 /// millisecond timestamps that exceed Unix-seconds bounds).
-fn parse_expiration_nanos(value: &str) -> Option<u64> {
+pub(super) fn parse_expiration_nanos(value: &str) -> Option<u64> {
     let secs: u64 = value.parse().ok()?;
     if secs == 0 {
         return None;
@@ -175,11 +214,20 @@ fn parse_expiration_nanos(value: &str) -> Option<u64> {
     secs.checked_mul(NANOSECONDS_IN_SECOND)
 }
 
+// panics-doc-ok (transitive via validating identifier constructors)
 /// Parses a [`PolymarketTradeReport`] into a [`FillReport`].
 ///
 /// Produces one fill report for the overall trade. The `trade_id` is
 /// derived from the Polymarket trade ID. Commission is computed from the
-/// instrument's effective taker fee rate and the fill notional.
+/// instrument's effective taker fee rate, fee exponent, and fill notional.
+///
+/// # Errors
+///
+/// Returns an error if the computed commission cannot be represented as [`Money`].
+///
+/// # Panics
+///
+/// Panics if the trade identifiers are invalid.
 #[expect(clippy::too_many_arguments)]
 pub fn parse_fill_report(
     trade: &PolymarketTradeReport,
@@ -190,28 +238,74 @@ pub fn parse_fill_report(
     size_precision: u8,
     currency: Currency,
     taker_fee_rate: Decimal,
+    fee_exponent: f64,
     ts_init: UnixNanos,
-) -> FillReport {
-    let venue_order_id = VenueOrderId::from(trade.taker_order_id.as_str());
-    let trade_id = TradeId::from(trade.id.as_str());
+) -> anyhow::Result<FillReport> {
+    parse_validated_fill_report(
+        trade,
+        TakerFillParseContext {
+            instrument_id,
+            account_id,
+            client_order_id,
+            venue_order_id: VenueOrderId::from(trade.taker_order_id.as_str()),
+            trade_id: TradeId::from(trade.id.as_str()),
+            price_precision,
+            size_precision,
+            currency,
+            taker_fee_rate,
+            fee_exponent,
+            ts_event: parse_timestamp(&trade.match_time).unwrap_or(ts_init),
+            ts_init,
+        },
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TakerFillParseContext {
+    pub instrument_id: InstrumentId,
+    pub account_id: AccountId,
+    pub client_order_id: Option<ClientOrderId>,
+    pub venue_order_id: VenueOrderId,
+    pub trade_id: TradeId,
+    pub price_precision: u8,
+    pub size_precision: u8,
+    pub currency: Currency,
+    pub taker_fee_rate: Decimal,
+    pub fee_exponent: f64,
+    pub ts_event: UnixNanos,
+    pub ts_init: UnixNanos,
+}
+
+pub(super) fn parse_validated_fill_report(
+    trade: &PolymarketTradeReport,
+    ctx: TakerFillParseContext,
+) -> anyhow::Result<FillReport> {
     let order_side = OrderSide::from(trade.side);
-    let last_qty = Quantity::from_decimal_dp(trade.size, size_precision)
-        .unwrap_or_else(|_| Quantity::zero(size_precision));
-    let last_px = Price::from_decimal_dp(trade.price, price_precision)
-        .unwrap_or_else(|_| Price::zero(price_precision));
+    let last_qty = Quantity::from_decimal_dp(trade.size, ctx.size_precision)
+        .unwrap_or_else(|_| Quantity::zero(ctx.size_precision));
+    let last_px = Price::from_decimal_dp(trade.price, ctx.price_precision)
+        .unwrap_or_else(|_| Price::zero(ctx.price_precision));
     let liquidity_side = parse_liquidity_side(trade.trader_side);
 
-    let commission_value =
-        compute_commission(taker_fee_rate, trade.size, trade.price, liquidity_side);
-    let commission = Money::new(commission_value, currency);
+    let commission_value = compute_commission(
+        ctx.taker_fee_rate,
+        ctx.fee_exponent,
+        trade.size,
+        trade.price,
+        liquidity_side,
+    );
+    let commission = Money::from_decimal(commission_value, ctx.currency).with_context(|| {
+        format!(
+            "failed to represent commission {commission_value} for {} as Money",
+            ctx.instrument_id
+        )
+    })?;
 
-    let ts_event = parse_timestamp(&trade.match_time).unwrap_or(ts_init);
-
-    FillReport {
-        account_id,
-        instrument_id,
-        venue_order_id,
-        trade_id,
+    Ok(FillReport {
+        account_id: ctx.account_id,
+        instrument_id: ctx.instrument_id,
+        venue_order_id: ctx.venue_order_id,
+        trade_id: ctx.trade_id,
         order_side,
         last_qty,
         last_px,
@@ -219,18 +313,27 @@ pub fn parse_fill_report(
         liquidity_side,
         avg_px: None,
         report_id: UUID4::new(),
-        ts_event,
-        ts_init,
-        client_order_id,
+        ts_event: ctx.ts_event,
+        ts_init: ctx.ts_init,
+        client_order_id: ctx.client_order_id,
         venue_position_id: None,
-    }
+    })
 }
 
+// panics-doc-ok (transitive via validating identifier constructors)
 /// Builds a [`FillReport`] from a [`PolymarketMakerOrder`] and trade-level context.
 ///
 /// Used by both the WS stream handler and REST fill report generation since both
 /// share the same [`PolymarketMakerOrder`] type for maker fills. Maker fills never
 /// pay commission per Polymarket's fee rules.
+///
+/// # Errors
+///
+/// Returns an error if the computed commission cannot be represented as [`Money`].
+///
+/// # Panics
+///
+/// Panics if the maker order or generated trade identifier is invalid.
 #[expect(clippy::too_many_arguments)]
 pub fn build_maker_fill_report(
     mo: &PolymarketMakerOrder,
@@ -246,41 +349,89 @@ pub fn build_maker_fill_report(
     liquidity_side: LiquiditySide,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
-) -> FillReport {
-    let venue_order_id = VenueOrderId::from(mo.order_id.as_str());
-    let fill_trade_id = make_composite_trade_id(trade_id, &mo.order_id);
+) -> anyhow::Result<FillReport> {
+    parse_validated_maker_fill_report(
+        mo,
+        trader_side,
+        trade_side,
+        taker_asset_id,
+        MakerFillParseContext {
+            account_id,
+            instrument_id,
+            venue_order_id: VenueOrderId::from(mo.order_id.as_str()),
+            trade_id: make_composite_trade_id(trade_id, &mo.order_id),
+            price_precision,
+            size_precision,
+            currency,
+            liquidity_side,
+            ts_event,
+            ts_init,
+        },
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct MakerFillParseContext {
+    pub account_id: AccountId,
+    pub instrument_id: InstrumentId,
+    pub venue_order_id: VenueOrderId,
+    pub trade_id: TradeId,
+    pub price_precision: u8,
+    pub size_precision: u8,
+    pub currency: Currency,
+    pub liquidity_side: LiquiditySide,
+    pub ts_event: UnixNanos,
+    pub ts_init: UnixNanos,
+}
+
+pub(super) fn parse_validated_maker_fill_report(
+    mo: &PolymarketMakerOrder,
+    trader_side: PolymarketLiquiditySide,
+    trade_side: PolymarketOrderSide,
+    taker_asset_id: &str,
+    ctx: MakerFillParseContext,
+) -> anyhow::Result<FillReport> {
     let order_side = determine_order_side(
         trader_side,
         trade_side,
         taker_asset_id,
         mo.asset_id.as_str(),
     );
-    let last_qty = Quantity::from_decimal_dp(mo.matched_amount, size_precision)
-        .unwrap_or_else(|_| Quantity::zero(size_precision));
-    let last_px = Price::from_decimal_dp(mo.price, price_precision)
-        .unwrap_or_else(|_| Price::zero(price_precision));
-    // Maker fills always pay zero commission per Polymarket docs:
-    // https://docs.polymarket.com/trading/fees
-    let commission_value =
-        compute_commission(Decimal::ZERO, mo.matched_amount, mo.price, liquidity_side);
+    let last_qty = Quantity::from_decimal_dp(mo.matched_amount, ctx.size_precision)
+        .unwrap_or_else(|_| Quantity::zero(ctx.size_precision));
+    let last_px = Price::from_decimal_dp(mo.price, ctx.price_precision)
+        .unwrap_or_else(|_| Price::zero(ctx.price_precision));
+    let commission_value = compute_commission(
+        Decimal::ZERO,
+        1.0,
+        mo.matched_amount,
+        mo.price,
+        ctx.liquidity_side,
+    );
+    let commission = Money::from_decimal(commission_value, ctx.currency).with_context(|| {
+        format!(
+            "failed to represent commission {commission_value} for {} as Money",
+            ctx.instrument_id
+        )
+    })?;
 
-    FillReport {
-        account_id,
-        instrument_id,
-        venue_order_id,
-        trade_id: fill_trade_id,
+    Ok(FillReport {
+        account_id: ctx.account_id,
+        instrument_id: ctx.instrument_id,
+        venue_order_id: ctx.venue_order_id,
+        trade_id: ctx.trade_id,
         order_side,
         last_qty,
         last_px,
-        commission: Money::new(commission_value, currency),
-        liquidity_side,
+        commission,
+        liquidity_side: ctx.liquidity_side,
         avg_px: None,
         report_id: UUID4::new(),
-        ts_event,
-        ts_init,
+        ts_event: ctx.ts_event,
+        ts_init: ctx.ts_init,
         client_order_id: None,
         venue_position_id: None,
-    }
+    })
 }
 
 /// Returns the effective taker fee rate for a Polymarket instrument.
@@ -350,10 +501,7 @@ pub fn adjust_market_buy_amount(
         );
     }
 
-    let base = price * (Decimal::ONE - price);
-    let base_f64: f64 = base.try_into().unwrap_or(0.0);
-    let curve = Decimal::try_from(base_f64.powf(fee_exponent)).unwrap_or(Decimal::ZERO);
-    let platform_fee_rate = fee_rate * curve;
+    let platform_fee_rate = fee_curve_rate(fee_rate, price, fee_exponent);
 
     let platform_fee = amount / price * platform_fee_rate;
     let total_cost = amount + platform_fee + amount * builder_taker_fee_rate;
@@ -375,12 +523,10 @@ pub fn adjust_market_buy_amount(
     Ok(adjusted)
 }
 
-/// Computes a pUSD commission using Polymarket's fee formula.
+/// Computes a pUSD commission using Polymarket's platform fee formula.
 ///
-/// `fee = C * feeRate * p * (1 - p)` where C is shares, feeRate is the effective
-/// taker rate from the market's `feeSchedule`, and p is the share price. Fees peak
-/// at p = 0.50 and decrease symmetrically toward the extremes. Only taker fills pay;
-/// maker fills always return zero. Rounded to 5 decimal places (0.00001 pUSD minimum).
+/// `fee = C * feeRate * (p * (1 - p))^exponent`, paid only by takers.
+/// The fee is rounded to 5 decimal places.
 ///
 /// The `fee_rate` here is the effective rate from `feeSchedule.rate` (e.g. 0.03 for
 /// 3%), not the `fee_rate_bps` field on a V2 trade response. The response field is
@@ -392,17 +538,24 @@ pub fn adjust_market_buy_amount(
 /// <https://docs.polymarket.com/trading/fees>
 pub fn compute_commission(
     fee_rate: Decimal,
+    fee_exponent: f64,
     size: Decimal,
     price: Decimal,
     liquidity_side: LiquiditySide,
-) -> f64 {
+) -> Decimal {
     if liquidity_side != LiquiditySide::Taker || fee_rate.is_zero() {
-        return 0.0;
+        return Decimal::ZERO;
     }
 
-    let commission = size * fee_rate * price * (Decimal::ONE - price);
-    let rounded = commission.round_dp(5);
-    rounded.to_string().parse().unwrap_or(0.0)
+    let commission = size * fee_curve_rate(fee_rate, price, fee_exponent);
+    commission.round_dp(5)
+}
+
+fn fee_curve_rate(fee_rate: Decimal, price: Decimal, fee_exponent: f64) -> Decimal {
+    let base = price * (Decimal::ONE - price);
+    let base_f64: f64 = base.try_into().unwrap_or(0.0);
+    let curve = Decimal::try_from(base_f64.powf(fee_exponent)).unwrap_or(Decimal::ZERO);
+    fee_rate * curve
 }
 
 /// Sums `last_qty` across fills as a decimal.
@@ -426,8 +579,29 @@ pub(crate) fn weighted_average_price(
     Some(weighted / total_filled)
 }
 
+/// Resolves the terminal status of a venue-terminal order from its filled quantity.
+///
+/// Polymarket reports a terminated order as `MATCHED` whether or not it filled completely: an IOC
+/// underfill was killed, any other non-dust remainder was canceled. Dust remainders stay `Filled`.
+pub(crate) fn recovered_terminal_order_status(
+    time_in_force: TimeInForce,
+    quantity: Quantity,
+    filled_qty: Quantity,
+) -> OrderStatus {
+    if time_in_force == TimeInForce::Ioc && filled_qty < quantity {
+        return OrderStatus::Canceled;
+    }
+
+    let dust_diff = (quantity.as_decimal() - filled_qty.as_decimal()).abs();
+    if filled_qty >= quantity || dust_diff < DUST_SNAP_THRESHOLD_DEC {
+        OrderStatus::Filled
+    } else {
+        OrderStatus::Canceled
+    }
+}
+
 /// At terminal `Filled` status, snap `filled_qty` to `quantity` when the
-/// difference is within `DUST_SNAP_THRESHOLD`. Polymarket reports `size_matched`
+/// difference is within `DUST_SNAP_THRESHOLD_DEC`. Polymarket reports `size_matched`
 /// directly from venue truncation: CLOB cent-tick rounding (underfill) or V2
 /// market-BUY USDC-scale truncation (overfill). Without this snap an order at
 /// `MATCHED` can show non-zero leaves to the engine.
@@ -441,8 +615,8 @@ pub(crate) fn snap_filled_qty_to_quantity(
     if order_status != OrderStatus::Filled {
         return filled_qty;
     }
-    let diff = quantity.as_f64() - filled_qty.as_f64();
-    if diff != 0.0 && diff.abs() < DUST_SNAP_THRESHOLD {
+    let diff = quantity.as_decimal() - filled_qty.as_decimal();
+    if !diff.is_zero() && diff.abs() < DUST_SNAP_THRESHOLD_DEC {
         quantity
     } else {
         filled_qty
@@ -564,17 +738,24 @@ pub fn calculate_market_price(
 pub fn parse_timestamp(ts_str: &str) -> Option<UnixNanos> {
     if let Ok(n) = ts_str.parse::<u64>() {
         return if n > 1_000_000_000_000 {
-            Some(UnixNanos::from(n * NANOSECONDS_IN_MILLISECOND))
+            n.checked_mul(NANOSECONDS_IN_MILLISECOND)
+                .map(UnixNanos::from)
         } else {
-            Some(UnixNanos::from(n * NANOSECONDS_IN_SECOND))
+            n.checked_mul(NANOSECONDS_IN_SECOND).map(UnixNanos::from)
         };
     }
-    let dt = chrono::DateTime::parse_from_rfc3339(ts_str).ok()?;
-    Some(UnixNanos::from(dt.timestamp_nanos_opt()? as u64))
+    let dt = ts_str.parse::<Timestamp>().ok()?;
+    Some(UnixNanos::from(u64::try_from(dt.as_nanosecond()).ok()?))
 }
 
 #[cfg(test)]
 mod tests {
+    use nautilus_execution::models::fee::{FeeModel, ProbabilityPriceFeeModel};
+    use nautilus_model::{
+        enums::{OrderSide, OrderType},
+        instruments::{Instrument, InstrumentAny, stubs::binary_option},
+        orders::{OrderAny, builder::OrderTestBuilder, stubs::TestOrderStubs},
+    };
     use rstest::rstest;
     use rust_decimal_macros::dec;
     use ustr::Ustr;
@@ -625,7 +806,7 @@ mod tests {
             OrderSide::Buy,
             Quantity::new(qty, 4),
             Price::new(px, 4),
-            Money::new(0.0, Currency::pUSD()),
+            Money::zero(Currency::pUSD()),
             LiquiditySide::Taker,
             None,
             None,
@@ -633,6 +814,21 @@ mod tests {
             UnixNanos::default(),
             None,
         )
+    }
+
+    fn binary_option_fill_order(
+        instrument: &InstrumentAny,
+        liquidity_side: LiquiditySide,
+        price: &str,
+    ) -> OrderAny {
+        let limit_order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .price(Price::from(price))
+            .quantity(Quantity::from("100.00"))
+            .build();
+
+        TestOrderStubs::make_filled_order(&limit_order, instrument, liquidity_side)
     }
 
     #[rstest]
@@ -687,41 +883,36 @@ mod tests {
         assert_eq!(balance.free, balance.total);
     }
 
-    /// Polymarket fee formula: `fee = C * feeRate * p * (1 - p)`
-    /// Rates are the category-specific taker rates from `feeSchedule.rate`.
-    /// Reference: <https://docs.polymarket.com/trading/fees>
     #[rstest]
-    #[case::crypto_p50("0.072", "0.50", 1.8)]
-    #[case::crypto_p01("0.072", "0.01", 0.07128)]
-    #[case::crypto_p05("0.072", "0.05", 0.342)]
-    #[case::crypto_p10("0.072", "0.10", 0.648)]
-    #[case::crypto_p30("0.072", "0.30", 1.512)]
-    #[case::crypto_p70("0.072", "0.70", 1.512)]
-    #[case::crypto_p90("0.072", "0.90", 0.648)]
-    #[case::crypto_p99("0.072", "0.99", 0.07128)]
-    #[case::sports_p50("0.03", "0.50", 0.75)]
-    #[case::sports_p30("0.03", "0.30", 0.63)]
-    #[case::sports_p70("0.03", "0.70", 0.63)]
-    #[case::politics_p50("0.04", "0.50", 1.0)]
-    #[case::politics_p30("0.04", "0.30", 0.84)]
-    #[case::economics_p50("0.05", "0.50", 1.25)]
-    #[case::economics_p30("0.05", "0.30", 1.05)]
-    #[case::geopolitics_p50("0", "0.50", 0.0)]
+    #[case::crypto_p50("0.07", "0.50", dec!(1.75))]
+    #[case::crypto_p01("0.07", "0.01", dec!(0.0693))]
+    #[case::crypto_p05("0.07", "0.05", dec!(0.3325))]
+    #[case::crypto_p10("0.07", "0.10", dec!(0.63))]
+    #[case::crypto_p30("0.07", "0.30", dec!(1.47))]
+    #[case::crypto_p70("0.07", "0.70", dec!(1.47))]
+    #[case::crypto_p90("0.07", "0.90", dec!(0.63))]
+    #[case::crypto_p99("0.07", "0.99", dec!(0.0693))]
+    #[case::sports_p50("0.05", "0.50", dec!(1.25))]
+    #[case::sports_p30("0.05", "0.30", dec!(1.05))]
+    #[case::sports_p70("0.05", "0.70", dec!(1.05))]
+    #[case::politics_p50("0.04", "0.50", dec!(1.0))]
+    #[case::politics_p30("0.04", "0.30", dec!(0.84))]
+    #[case::economics_p50("0.05", "0.50", dec!(1.25))]
+    #[case::economics_p30("0.05", "0.30", dec!(1.05))]
+    #[case::geopolitics_p50("0", "0.50", dec!(0.0))]
     fn test_compute_commission_docs_table(
         #[case] fee_rate: &str,
         #[case] price: &str,
-        #[case] expected: f64,
+        #[case] expected: Decimal,
     ) {
         let commission = compute_commission(
             Decimal::from_str_exact(fee_rate).unwrap(),
+            1.0,
             dec!(100),
             Decimal::from_str_exact(price).unwrap(),
             LiquiditySide::Taker,
         );
-        assert!(
-            (commission - expected).abs() < 1e-10,
-            "at p={price}, fee_rate={fee_rate}: expected {expected}, was {commission}"
-        );
+        assert_eq!(commission, expected);
     }
 
     #[rstest]
@@ -731,14 +922,12 @@ mod tests {
         // Expected: 15.4639 * 0.97 * 0.072 * (1 - 0.97) = 0.03240
         let commission = compute_commission(
             dec!(0.072),
+            1.0,
             Decimal::from_str_exact("15.463900").unwrap(),
             dec!(0.97),
             LiquiditySide::Taker,
         );
-        assert!(
-            (commission - 0.03240).abs() < 1e-5,
-            "expected 0.03240, was {commission}"
-        );
+        assert_eq!(commission, dec!(0.03240));
     }
 
     #[rstest]
@@ -749,25 +938,68 @@ mod tests {
         // Correct: 0.0334 * 0.98 * 0.072 * (1 - 0.98) = 0.00005
         let commission = compute_commission(
             dec!(0.072),
+            1.0,
             Decimal::from_str_exact("0.033400").unwrap(),
             dec!(0.98),
             LiquiditySide::Taker,
         );
-        assert!(
-            (commission - 0.00005).abs() < 1e-5,
-            "expected 0.00005, was {commission}"
-        );
+        assert_eq!(commission, dec!(0.00005));
     }
 
     #[rstest]
     fn test_compute_commission_maker_is_zero() {
         let commission = compute_commission(
             Decimal::from_str_exact("0.072").unwrap(),
+            1.0,
             dec!(100),
             Decimal::from_str_exact("0.50").unwrap(),
             LiquiditySide::Maker,
         );
-        assert_eq!(commission, 0.0);
+        assert_eq!(commission, dec!(0));
+    }
+
+    #[rstest]
+    fn test_compute_commission_uses_fee_exponent() {
+        let commission =
+            compute_commission(dec!(0.04), 2.0, dec!(10), dec!(0.5), LiquiditySide::Taker);
+        assert_eq!(commission, dec!(0.025));
+    }
+
+    #[rstest]
+    #[case::crypto_taker("0.07", "0.970", LiquiditySide::Taker)]
+    #[case::sports_taker("0.05", "0.500", LiquiditySide::Taker)]
+    #[case::politics_taker("0.04", "0.300", LiquiditySide::Taker)]
+    #[case::maker_zero("0.03", "0.500", LiquiditySide::Maker)]
+    fn test_probability_price_fee_model_matches_polymarket_commission(
+        #[case] taker_fee: &str,
+        #[case] price: &str,
+        #[case] liquidity_side: LiquiditySide,
+    ) {
+        let mut binary = binary_option();
+        binary.maker_fee = Decimal::ZERO;
+        binary.taker_fee = Decimal::from_str_exact(taker_fee).unwrap();
+        let instrument = InstrumentAny::BinaryOption(binary);
+        let order = binary_option_fill_order(&instrument, liquidity_side, price);
+        let fee_model = ProbabilityPriceFeeModel;
+
+        let commission = fee_model
+            .get_commission(
+                &order,
+                Quantity::from("100.00"),
+                Price::from(price),
+                &instrument,
+            )
+            .unwrap();
+
+        let expected = compute_commission(
+            Decimal::from_str_exact(taker_fee).unwrap(),
+            1.0,
+            dec!(100),
+            Decimal::from_str_exact(price).unwrap(),
+            liquidity_side,
+        );
+
+        assert_eq!(commission.as_decimal(), expected);
     }
 
     /// Reference computations for `adjust_market_buy_amount` follow the SDK
@@ -829,16 +1061,16 @@ mod tests {
 
     #[rstest]
     fn test_adjust_market_buy_amount_crypto_fee_rate() {
-        // Polymarket "Crypto" tier uses fee_rate = 0.072.
-        // amount=100, balance=100, price=0.5, fee_rate=0.072, exp=1, builder=0
-        // platform_fee_rate = 0.072 * 0.25 = 0.018
-        // platform_fee = 100/0.5 * 0.018 = 3.6; total_cost = 103.6
-        // divisor = 1 + 0.018/0.5 = 1.036; raw = 100/1.036
+        // Polymarket "Crypto" tier uses fee_rate = 0.07.
+        // amount=100, balance=100, price=0.5, fee_rate=0.07, exp=1, builder=0
+        // platform_fee_rate = 0.07 * 0.25 = 0.0175
+        // platform_fee = 100/0.5 * 0.0175 = 3.5; total_cost = 103.5
+        // divisor = 1 + 0.0175/0.5 = 1.035; raw = 100/1.035
         let adjusted =
-            adjust_market_buy_amount(dec!(100), dec!(100), dec!(0.5), dec!(0.072), 1.0, dec!(0))
+            adjust_market_buy_amount(dec!(100), dec!(100), dec!(0.5), dec!(0.07), 1.0, dec!(0))
                 .unwrap();
-        // 100 / 1.036 == 96.5250965...; truncate to 6dp.
-        assert_eq!(adjusted, dec!(96.525096));
+        // 100 / 1.035 == 96.6183574...; truncate to 6dp.
+        assert_eq!(adjusted, dec!(96.618357));
     }
 
     #[rstest]
@@ -1179,7 +1411,7 @@ mod tests {
 
         assert_eq!(report.account_id, account_id);
         assert_eq!(report.instrument_id, instrument_id);
-        assert_eq!(report.order_side, OrderSide::Buy);
+        assert_eq!(report.order_side, Some(OrderSide::Buy));
         assert_eq!(report.order_type, OrderType::Limit);
         assert_eq!(report.time_in_force, TimeInForce::Gtc);
         assert_eq!(report.order_status, OrderStatus::Accepted);
@@ -1249,6 +1481,98 @@ mod tests {
         );
     }
 
+    /// A `MATCHED` underfill must reach a terminal status, and `Filled` must never carry
+    /// `filled_qty < quantity`. Dust remainders still resolve as `Filled` (see #3728).
+    #[rstest]
+    // Partially filled then canceled: terminal, not `Filled`.
+    #[case::gtc_real_partial(PolymarketOrderType::GTC, dec!(10), dec!(7), OrderStatus::Canceled)]
+    // Dust underfill: stays `Filled`, `filled_qty` snaps up to `quantity`.
+    #[case::gtc_dust_underfill(PolymarketOrderType::GTC, dec!(100), dec!(99.997714), OrderStatus::Filled)]
+    // GTC exact fill.
+    #[case::gtc_exact(PolymarketOrderType::GTC, dec!(10), dec!(10), OrderStatus::Filled)]
+    // FAK underfill is killed by the venue: unchanged.
+    #[case::fak_partial(PolymarketOrderType::FAK, dec!(30), dec!(20), OrderStatus::Canceled)]
+    fn test_parse_order_status_report_matched_resolves_terminal_status(
+        #[case] order_type: PolymarketOrderType,
+        #[case] original_size: Decimal,
+        #[case] size_matched: Decimal,
+        #[case] expected_status: OrderStatus,
+    ) {
+        let order = PolymarketOpenOrder {
+            associate_trades: None,
+            id: "0xterminal".to_string(),
+            status: PolymarketOrderStatus::Matched,
+            market: Ustr::from("0xmarket"),
+            original_size,
+            outcome: PolymarketOutcome::yes(),
+            maker_address: "0xmaker".to_string(),
+            owner: "owner".to_string(),
+            price: dec!(0.5),
+            side: PolymarketOrderSide::Buy,
+            size_matched,
+            asset_id: Ustr::from("token"),
+            expiration: None,
+            order_type,
+            created_at: 1_784_118_677,
+        };
+
+        let report = parse_order_status_report(
+            &order,
+            InstrumentId::from("TEST-TOKEN.POLYMARKET"),
+            AccountId::from("POLYMARKET-001"),
+            None,
+            3,
+            6,
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert_eq!(report.order_status, expected_status);
+        if report.order_status == OrderStatus::Filled {
+            assert!(
+                report.filled_qty >= report.quantity,
+                "a Filled report must not carry filled_qty < quantity, was filled_qty={} quantity={}",
+                report.filled_qty,
+                report.quantity
+            );
+        }
+    }
+
+    #[rstest]
+    fn test_parse_order_status_report_maps_partial_fak_match_to_canceled() {
+        let order = PolymarketOpenOrder {
+            associate_trades: Some(vec!["trade-partial-fak".to_string()]),
+            id: "0xpartial-fak".to_string(),
+            status: PolymarketOrderStatus::Matched,
+            market: Ustr::from("0xmarket"),
+            original_size: dec!(30),
+            outcome: PolymarketOutcome::yes(),
+            maker_address: "0xmaker".to_string(),
+            owner: "owner".to_string(),
+            price: dec!(0.093),
+            side: PolymarketOrderSide::Buy,
+            size_matched: dec!(20),
+            asset_id: Ustr::from("token"),
+            expiration: Some("0".to_string()),
+            order_type: PolymarketOrderType::FAK,
+            created_at: 1_784_118_677,
+        };
+
+        let report = parse_order_status_report(
+            &order,
+            InstrumentId::from("TEST-TOKEN.POLYMARKET"),
+            AccountId::from("POLYMARKET-001"),
+            None,
+            3,
+            6,
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert_eq!(report.order_status, OrderStatus::Canceled);
+        assert_eq!(report.time_in_force, TimeInForce::Ioc);
+        assert_eq!(report.quantity, Quantity::from("30.000000"));
+        assert_eq!(report.filled_qty, Quantity::from("20.000000"));
+    }
+
     #[rstest]
     #[case::null(None, None)]
     #[case::zero_string(Some("0"), None)]
@@ -1294,6 +1618,34 @@ mod tests {
     }
 
     #[rstest]
+    fn test_parse_fill_report_errors_when_commission_is_unrepresentable() {
+        let path = "test_data/http_trade_report.json";
+        let content = std::fs::read_to_string(path).expect("Failed to read test data");
+        let trade: PolymarketTradeReport =
+            serde_json::from_str(&content).expect("Failed to parse test data");
+
+        let result = parse_fill_report(
+            &trade,
+            InstrumentId::from("TEST-TOKEN.POLYMARKET"),
+            AccountId::from("POLYMARKET-001"),
+            None,
+            4,
+            6,
+            Currency::pUSD(),
+            // Large enough that the commission exceeds Money's fixed-point range, while the
+            // Decimal arithmetic itself stays well inside its own limits
+            Decimal::from_i128_with_scale(100_000_000_000_000_000_000_000_000i128, 0),
+            1.0,
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert!(
+            result.is_err(),
+            "an unrepresentable commission must surface as an error rather than panicking"
+        );
+    }
+
+    #[rstest]
     fn test_parse_fill_report_from_fixture() {
         let path = "test_data/http_trade_report.json";
         let content = std::fs::read_to_string(path).expect("Failed to read test data");
@@ -1313,18 +1665,20 @@ mod tests {
             6,
             currency,
             Decimal::ZERO,
+            1.0,
             UnixNanos::from(1_000_000_000u64),
-        );
+        )
+        .expect("fixture commission is representable");
 
         assert_eq!(report.account_id, account_id);
         assert_eq!(report.instrument_id, instrument_id);
         assert_eq!(report.order_side, OrderSide::Buy);
         assert_eq!(report.liquidity_side, LiquiditySide::Taker);
-        assert_eq!(report.commission.as_f64(), 0.0);
+        assert_eq!(report.commission.as_decimal(), dec!(0.0));
     }
 
     #[rstest]
-    fn test_parse_fill_report_forwards_taker_fee_rate() {
+    fn test_parse_fill_report_forwards_fee_schedule() {
         let path = "test_data/http_trade_report.json";
         let content = std::fs::read_to_string(path).expect("Failed to read test data");
         let trade: PolymarketTradeReport =
@@ -1334,7 +1688,7 @@ mod tests {
         let account_id = AccountId::from("POLYMARKET-001");
         let currency = Currency::pUSD();
 
-        // Sports rate: 25 shares * 0.03 * 0.5 * 0.5 = 0.1875 pUSD
+        // Expected: 25 * 0.03 * (0.5 * 0.5)^2 = 0.04688 pUSD after rounding.
         let report = parse_fill_report(
             &trade,
             instrument_id,
@@ -1344,11 +1698,13 @@ mod tests {
             6,
             currency,
             dec!(0.03),
+            2.0,
             UnixNanos::from(1_000_000_000u64),
-        );
+        )
+        .expect("fixture commission is representable");
 
         assert_eq!(report.liquidity_side, LiquiditySide::Taker);
-        assert!((report.commission.as_f64() - 0.1875).abs() < 1e-10);
+        assert_eq!(report.commission.as_decimal(), dec!(0.04688));
     }
 
     #[rstest]
@@ -1363,6 +1719,7 @@ mod tests {
             create_instrument_from_def(&defs[0], UnixNanos::from(1_000_000_000u64)).unwrap();
 
         assert_eq!(instrument_taker_fee(&instrument), dec!(0.03));
+        assert_eq!(instrument_fee_exponent(&instrument), 1.0);
     }
 
     #[rstest]

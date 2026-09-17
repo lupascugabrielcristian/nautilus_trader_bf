@@ -29,7 +29,7 @@ use nautilus_core::{
         msgpack::{FromMsgPack, ToMsgPack},
     },
 };
-use pyo3::{basic::CompareOp, prelude::*, types::PyDict};
+use pyo3::{IntoPyObjectExt, basic::CompareOp, prelude::*, types::PyDict};
 
 use super::ERROR_MONOTONICITY;
 use crate::{
@@ -161,14 +161,18 @@ impl InstrumentClose {
 
     /// Return JSON encoded bytes representation of the object.
     #[pyo3(name = "to_json_bytes")]
-    fn py_to_json_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        self.to_json_bytes().unwrap().into_py_any_unwrap(py)
+    fn py_to_json_bytes(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.to_json_bytes()
+            .map_err(to_pyvalue_err)?
+            .into_py_any(py)
     }
 
     /// Return `MsgPack` encoded bytes representation of the object.
     #[pyo3(name = "to_msgpack_bytes")]
-    fn py_to_msgpack_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        self.to_msgpack_bytes().unwrap().into_py_any_unwrap(py)
+    fn py_to_msgpack_bytes(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.to_msgpack_bytes()
+            .map_err(to_pyvalue_err)?
+            .into_py_any(py)
     }
 }
 
@@ -187,31 +191,6 @@ impl InstrumentClose {
     }
 }
 
-impl InstrumentClose {
-    /// Creates a new [`InstrumentClose`] from a Python object reference.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `PyErr` if retrieving any attribute or converting types fails.
-    pub fn from_pyobject(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let instrument_id = obj.getattr("instrument_id")?.extract::<InstrumentId>()?;
-        let close_price = obj.getattr("close_price")?.extract::<Price>()?;
-        let close_type = obj
-            .getattr("close_type")?
-            .extract::<InstrumentCloseType>()?;
-        let ts_event = obj.getattr("ts_event")?.extract::<u64>()?;
-        let ts_init = obj.getattr("ts_init")?.extract::<u64>()?;
-
-        Ok(Self {
-            instrument_id,
-            close_price,
-            close_type,
-            ts_event: ts_event.into(),
-            ts_init: ts_init.into(),
-        })
-    }
-}
-
 /// Transforms the given Python objects into a vector of [`InstrumentClose`] objects.
 ///
 /// # Errors
@@ -222,7 +201,7 @@ pub fn pyobjects_to_instrument_closes(
 ) -> PyResult<Vec<InstrumentClose>> {
     let closes = data
         .into_iter()
-        .map(|obj| InstrumentClose::from_pyobject(&obj))
+        .map(|obj| obj.extract::<InstrumentClose>().map_err(PyErr::from))
         .collect::<PyResult<Vec<InstrumentClose>>>()?;
 
     // Validate monotonically increasing by timestamp initialization

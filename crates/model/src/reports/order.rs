@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{fmt::Display, str::FromStr};
+use std::fmt::Display;
 
 use nautilus_core::{UUID4, UnixNanos};
 use rust_decimal::Decimal;
@@ -34,7 +34,7 @@ use crate::{
 #[serde(tag = "type")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -50,7 +50,8 @@ pub struct OrderStatusReport {
     /// The venue assigned order ID.
     pub venue_order_id: VenueOrderId,
     /// The order side.
-    pub order_side: OrderSide,
+    #[serde(with = "crate::enums::serde_option_order_side")]
+    pub order_side: Option<OrderSide>,
     /// The order type.
     pub order_type: OrderType,
     /// The order time in force.
@@ -78,21 +79,26 @@ pub struct OrderStatusReport {
     /// The parent order ID for contingent child orders, if available.
     pub parent_order_id: Option<ClientOrderId>,
     /// The orders contingency type.
-    pub contingency_type: ContingencyType,
+    #[serde(default, with = "crate::enums::serde_option_contingency_type")]
+    pub contingency_type: Option<ContingencyType>,
     /// The order expiration (UNIX epoch nanoseconds), zero for no expiration.
     pub expire_time: Option<UnixNanos>,
     /// The order price (LIMIT).
     pub price: Option<Price>,
+    /// The order activation price (trailing stop).
+    pub activation_price: Option<Price>,
     /// The order trigger price (STOP).
     pub trigger_price: Option<Price>,
     /// The trigger type for the order.
+    #[serde(default, with = "crate::enums::serde_option_trigger_type")]
     pub trigger_type: Option<TriggerType>,
     /// The trailing offset for the orders limit price.
     pub limit_offset: Option<Decimal>,
     /// The trailing offset for the orders trigger price (STOP).
     pub trailing_offset: Option<Decimal>,
     /// The trailing offset type.
-    pub trailing_offset_type: TrailingOffsetType,
+    #[serde(default, with = "crate::enums::serde_option_trailing_offset_type")]
+    pub trailing_offset_type: Option<TrailingOffsetType>,
     /// The order average fill price.
     pub avg_px: Option<Decimal>,
     /// The quantity of the `LIMIT` order to display on the public book (iceberg).
@@ -116,7 +122,7 @@ impl OrderStatusReport {
         instrument_id: InstrumentId,
         client_order_id: Option<ClientOrderId>,
         venue_order_id: VenueOrderId,
-        order_side: OrderSide,
+        order_side: Option<OrderSide>,
         order_type: OrderType,
         time_in_force: TimeInForce,
         order_status: OrderStatus,
@@ -146,14 +152,15 @@ impl OrderStatusReport {
             venue_position_id: None,
             linked_order_ids: None,
             parent_order_id: None,
-            contingency_type: ContingencyType::default(),
+            contingency_type: None,
             expire_time: None,
             price: None,
+            activation_price: None,
             trigger_price: None,
             trigger_type: None,
             limit_offset: None,
             trailing_offset: None,
-            trailing_offset_type: TrailingOffsetType::default(),
+            trailing_offset_type: None,
             avg_px: None,
             display_qty: None,
             post_only: false,
@@ -209,25 +216,17 @@ impl OrderStatusReport {
     }
 
     /// Sets the average price.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `avg_px` cannot be converted to a valid `Decimal`.
-    pub fn with_avg_px(mut self, avg_px: f64) -> anyhow::Result<Self> {
-        if !avg_px.is_finite() {
-            anyhow::bail!(
-                "avg_px must be finite, was: {} (is_nan: {}, is_infinite: {})",
-                avg_px,
-                avg_px.is_nan(),
-                avg_px.is_infinite()
-            );
-        }
+    #[must_use]
+    pub const fn with_avg_px(mut self, avg_px: Decimal) -> Self {
+        self.avg_px = Some(avg_px);
+        self
+    }
 
-        self.avg_px =
-            Some(Decimal::from_str(&avg_px.to_string()).map_err(|e| {
-                anyhow::anyhow!("Failed to convert avg_px to Decimal: {avg_px} ({e})")
-            })?);
-        Ok(self)
+    /// Sets the activation price.
+    #[must_use]
+    pub const fn with_activation_price(mut self, activation_price: Price) -> Self {
+        self.activation_price = Some(activation_price);
+        self
     }
 
     /// Sets the trigger price.
@@ -264,7 +263,7 @@ impl OrderStatusReport {
         mut self,
         trailing_offset_type: TrailingOffsetType,
     ) -> Self {
-        self.trailing_offset_type = trailing_offset_type;
+        self.trailing_offset_type = Some(trailing_offset_type);
         self
     }
 
@@ -313,7 +312,7 @@ impl OrderStatusReport {
     /// Sets the contingency type.
     #[must_use]
     pub const fn with_contingency_type(mut self, contingency_type: ContingencyType) -> Self {
-        self.contingency_type = contingency_type;
+        self.contingency_type = Some(contingency_type);
         self
     }
 
@@ -370,6 +369,7 @@ impl Display for OrderStatusReport {
                 contingency_type={}, \
                 expire_time={:?}, \
                 price={:?}, \
+                activation_price={:?}, \
                 trigger_price={:?}, \
                 trigger_type={:?}, \
                 limit_offset={:?}, \
@@ -385,7 +385,9 @@ impl Display for OrderStatusReport {
             self.account_id,
             self.instrument_id,
             self.venue_order_id,
-            self.order_side,
+            self.order_side
+                .as_ref()
+                .map_or("NO_ORDER_SIDE", AsRef::as_ref),
             self.order_type,
             self.time_in_force,
             self.order_status,
@@ -400,14 +402,19 @@ impl Display for OrderStatusReport {
             self.venue_position_id,
             self.linked_order_ids,
             self.parent_order_id,
-            self.contingency_type,
+            self.contingency_type
+                .as_ref()
+                .map_or("NO_CONTINGENCY", AsRef::as_ref),
             self.expire_time,
             self.price,
+            self.activation_price,
             self.trigger_price,
             self.trigger_type,
             self.limit_offset,
             self.trailing_offset,
-            self.trailing_offset_type,
+            self.trailing_offset_type
+                .as_ref()
+                .map_or("NO_TRAILING_OFFSET", AsRef::as_ref),
             self.avg_px,
             self.display_qty,
             self.post_only,
@@ -443,7 +450,7 @@ mod tests {
             InstrumentId::from("AUDUSD.SIM"),
             Some(ClientOrderId::from("O-19700101-000000-001-001-1")),
             VenueOrderId::from("1"),
-            OrderSide::Buy,
+            OrderSide::Buy.into(),
             OrderType::Limit,
             TimeInForce::Gtc,
             OrderStatus::Accepted,
@@ -467,7 +474,7 @@ mod tests {
             Some(ClientOrderId::from("O-19700101-000000-001-001-1"))
         );
         assert_eq!(report.venue_order_id, VenueOrderId::from("1"));
-        assert_eq!(report.order_side, OrderSide::Buy);
+        assert_eq!(report.order_side, OrderSide::Buy.into());
         assert_eq!(report.order_type, OrderType::Limit);
         assert_eq!(report.time_in_force, TimeInForce::Gtc);
         assert_eq!(report.order_status, OrderStatus::Accepted);
@@ -482,14 +489,14 @@ mod tests {
         assert_eq!(report.venue_position_id, None);
         assert_eq!(report.linked_order_ids, None);
         assert_eq!(report.parent_order_id, None);
-        assert_eq!(report.contingency_type, ContingencyType::default());
+        assert_eq!(report.contingency_type, None);
         assert_eq!(report.expire_time, None);
         assert_eq!(report.price, None);
         assert_eq!(report.trigger_price, None);
         assert_eq!(report.trigger_type, None);
         assert_eq!(report.limit_offset, None);
         assert_eq!(report.trailing_offset, None);
-        assert_eq!(report.trailing_offset_type, TrailingOffsetType::default());
+        assert_eq!(report.trailing_offset_type, None);
         assert_eq!(report.avg_px, None);
         assert_eq!(report.display_qty, None);
         assert!(!report.post_only);
@@ -505,7 +512,7 @@ mod tests {
             InstrumentId::from("AUDUSD.SIM"),
             None,
             VenueOrderId::from("1"),
-            OrderSide::Buy,
+            OrderSide::Buy.into(),
             OrderType::Market,
             TimeInForce::Ioc,
             OrderStatus::Filled,
@@ -525,15 +532,14 @@ mod tests {
     }
 
     #[rstest]
-    #[expect(clippy::panic_in_result_fn)]
-    fn test_order_status_report_builder_methods() -> anyhow::Result<()> {
+    fn test_order_status_report_builder_methods() {
         let report = test_order_status_report()
             .with_client_order_id(ClientOrderId::from("O-19700101-000000-001-001-2"))
             .with_order_list_id(OrderListId::from("OL-001"))
             .with_venue_position_id(PositionId::from("P-001"))
             .with_parent_order_id(ClientOrderId::from("O-PARENT"))
             .with_price(Price::from("1.00000"))
-            .with_avg_px(1.00001)?
+            .with_avg_px(dec!(1.00001))
             .with_trigger_price(Price::from("0.99000"))
             .with_trigger_type(TriggerType::Default)
             .with_limit_offset(dec!(0.0001))
@@ -563,15 +569,17 @@ mod tests {
         assert_eq!(report.trigger_type, Some(TriggerType::Default));
         assert_eq!(report.limit_offset, Some(dec!(0.0001)));
         assert_eq!(report.trailing_offset, Some(dec!(0.0002)));
-        assert_eq!(report.trailing_offset_type, TrailingOffsetType::BasisPoints);
+        assert_eq!(
+            report.trailing_offset_type,
+            Some(TrailingOffsetType::BasisPoints),
+        );
         assert_eq!(report.display_qty, Some(Quantity::from("50")));
         assert_eq!(report.expire_time, Some(UnixNanos::from(4_000_000_000)));
         assert!(report.post_only);
         assert!(report.reduce_only);
         assert_eq!(report.cancel_reason, Some("User requested".to_string()));
         assert_eq!(report.ts_triggered, Some(UnixNanos::from(1_500_000_000)));
-        assert_eq!(report.contingency_type, ContingencyType::Oco);
-        Ok(())
+        assert_eq!(report.contingency_type, Some(ContingencyType::Oco));
     }
 
     #[rstest]
@@ -614,7 +622,7 @@ mod tests {
             InstrumentId::from("AUDUSD.SIM"),
             None,
             VenueOrderId::from("1"),
-            OrderSide::Buy,
+            OrderSide::Buy.into(),
             OrderType::Market,
             TimeInForce::Ioc,
             OrderStatus::Filled,
@@ -631,7 +639,7 @@ mod tests {
             InstrumentId::from("AUDUSD.SIM"),
             None,
             VenueOrderId::from("2"),
-            OrderSide::Sell,
+            OrderSide::Sell.into(),
             OrderType::StopMarket,
             TimeInForce::Gtc,
             OrderStatus::Accepted,
@@ -657,7 +665,7 @@ mod tests {
             InstrumentId::from("AUDUSD.SIM"),
             Some(ClientOrderId::from("O-19700101-000000-001-001-1")),
             VenueOrderId::from("1"),
-            OrderSide::Buy,
+            OrderSide::Buy.into(),
             OrderType::Limit,
             TimeInForce::Gtc,
             OrderStatus::Filled,
@@ -675,8 +683,7 @@ mod tests {
     }
 
     #[rstest]
-    #[expect(clippy::panic_in_result_fn)]
-    fn test_order_status_report_with_optional_fields() -> anyhow::Result<()> {
+    fn test_order_status_report_with_optional_fields() {
         let mut report = test_order_status_report();
 
         // Initially no optional fields set
@@ -688,7 +695,7 @@ mod tests {
         // Test builder pattern with various optional fields
         report = report
             .with_price(Price::from("1.00000"))
-            .with_avg_px(1.00001)?
+            .with_avg_px(dec!(1.00001))
             .with_post_only(true)
             .with_reduce_only(true);
 
@@ -696,7 +703,6 @@ mod tests {
         assert_eq!(report.avg_px, Some(dec!(1.00001)));
         assert!(report.post_only);
         assert!(report.reduce_only);
-        Ok(())
     }
 
     #[rstest]
@@ -706,7 +712,7 @@ mod tests {
             InstrumentId::from("AUDUSD.SIM"),
             Some(ClientOrderId::from("O-19700101-000000-001-001-1")),
             VenueOrderId::from("1"),
-            OrderSide::Buy,
+            OrderSide::Buy.into(),
             OrderType::Limit,
             TimeInForce::Gtc,
             OrderStatus::PartiallyFilled,
@@ -733,7 +739,7 @@ mod tests {
             InstrumentId::from("AUDUSD.SIM"),
             None,
             VenueOrderId::from("1"),
-            OrderSide::Buy,
+            OrderSide::Buy.into(),
             OrderType::StopLimit,
             TimeInForce::Gtc,
             OrderStatus::Triggered,
@@ -765,7 +771,7 @@ mod tests {
             InstrumentId::from("AUDUSD.SIM"),
             None,
             VenueOrderId::from("1"),
-            OrderSide::Buy,
+            OrderSide::Buy.into(),
             OrderType::Limit,
             TimeInForce::Gtc,
             OrderStatus::Accepted,
@@ -794,7 +800,7 @@ mod tests {
             InstrumentId::from("AUDUSD.SIM"),
             None,
             VenueOrderId::from("1"),
-            OrderSide::Buy,
+            OrderSide::Buy.into(),
             OrderType::StopMarket,
             TimeInForce::Gtc,
             OrderStatus::Accepted,
@@ -823,7 +829,7 @@ mod tests {
             InstrumentId::from("AUDUSD.SIM"),
             None,
             VenueOrderId::from("1"),
-            OrderSide::Buy,
+            OrderSide::Buy.into(),
             OrderType::Limit,
             TimeInForce::Gtc,
             OrderStatus::Accepted,
@@ -852,7 +858,7 @@ mod tests {
             InstrumentId::from("AUDUSD.SIM"),
             None,
             VenueOrderId::from("1"),
-            OrderSide::Buy,
+            OrderSide::Buy.into(),
             OrderType::Limit,
             TimeInForce::Gtc,
             OrderStatus::Accepted,
@@ -881,7 +887,7 @@ mod tests {
             InstrumentId::from("AUDUSD.SIM"),
             None,
             VenueOrderId::from("1"),
-            OrderSide::Buy,
+            OrderSide::Buy.into(),
             OrderType::Market,
             TimeInForce::Ioc,
             OrderStatus::Accepted,
@@ -912,7 +918,7 @@ mod tests {
             InstrumentId::from("AUDUSD.SIM"),
             None,
             VenueOrderId::from("1"),
-            OrderSide::Buy,
+            OrderSide::Buy.into(),
             OrderType::StopLimit,
             TimeInForce::Gtc,
             OrderStatus::Accepted,
@@ -934,7 +940,7 @@ mod tests {
             InstrumentId::from("AUDUSD.SIM"),
             None,
             VenueOrderId::from("1"),
-            OrderSide::Buy,
+            OrderSide::Buy.into(),
             OrderType::StopLimit,
             TimeInForce::Gtc,
             OrderStatus::Accepted,
@@ -956,7 +962,7 @@ mod tests {
             InstrumentId::from("AUDUSD.SIM"),
             None,
             VenueOrderId::from("1"),
-            OrderSide::Buy,
+            OrderSide::Buy.into(),
             OrderType::StopLimit,
             TimeInForce::Gtc,
             OrderStatus::Accepted,

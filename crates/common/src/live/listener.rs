@@ -17,13 +17,14 @@
 
 use bytes::Bytes;
 use futures::stream::Stream;
+use ustr::Ustr;
 
-use crate::msgbus::{BusMessage, MStr, Topic};
+use crate::{
+    enums::SerializationEncoding,
+    msgbus::{BusMessage, BusPayloadType, MStr, Topic},
+};
 
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.common")
-)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "nautilus_trader.common"))]
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.common")
@@ -71,7 +72,15 @@ impl MessageBusListener {
     /// Publishes a message with the given `topic` and `payload`.
     pub fn publish<T: Into<MStr<Topic>>>(&self, topic: T, payload: Bytes) {
         let topic = topic.into();
-        let msg = BusMessage::new(*topic, payload);
+
+        // Listener messages are untyped, so they use default bus headers.
+        let msg = BusMessage::new(
+            *topic,
+            BusPayloadType::Custom(Ustr::default()),
+            payload,
+            SerializationEncoding::default(),
+        );
+
         if let Err(e) = self.tx.send(msg) {
             log::error!("Failed to send message: {e}");
         }

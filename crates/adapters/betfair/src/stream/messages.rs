@@ -32,7 +32,10 @@ use serde::{Deserialize, Deserializer, Serialize, de::Visitor};
 use ustr::Ustr;
 
 use crate::common::{
-    consts::{STREAM_OP_AUTHENTICATION, STREAM_OP_HEARTBEAT, STREAM_OP_RACE_SUBSCRIPTION},
+    consts::{
+        STREAM_OP_AUTHENTICATION, STREAM_OP_CRICKET_SUBSCRIPTION, STREAM_OP_HEARTBEAT,
+        STREAM_OP_RACE_SUBSCRIPTION,
+    },
     enums::{
         ChangeType, LapseStatusReasonCode, MarketBettingType, MarketDataFilterField, MarketStatus,
         PriceLadderType, RunnerStatus, SegmentType, StatusErrorCode, StreamingOrderStatus,
@@ -61,6 +64,8 @@ pub enum StreamMessage {
     OrderChange(OCM),
     #[serde(rename = "rcm")]
     RaceChange(RCM),
+    #[serde(rename = "ccm")]
+    CricketChange(CCM),
 }
 
 /// Connection confirmation sent on stream connect.
@@ -587,6 +592,17 @@ impl Authentication {
             session,
         }
     }
+
+    /// Creates a correlated authentication request.
+    #[must_use]
+    pub fn with_id(app_key: String, session: String, id: u64) -> Self {
+        Self {
+            op: STREAM_OP_AUTHENTICATION.to_string(),
+            id: Some(id),
+            app_key,
+            session,
+        }
+    }
 }
 
 /// Market subscription request.
@@ -642,6 +658,24 @@ impl RaceSubscription {
     pub fn new(id: u64) -> Self {
         Self {
             op: STREAM_OP_RACE_SUBSCRIPTION.to_string(),
+            id: Some(id),
+        }
+    }
+}
+
+/// Cricket stream subscription request.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CricketSubscription {
+    pub op: String,
+    pub id: Option<u64>,
+}
+
+impl CricketSubscription {
+    #[must_use]
+    pub fn new(id: u64) -> Self {
+        Self {
+            op: STREAM_OP_CRICKET_SUBSCRIPTION.to_string(),
             id: Some(id),
         }
     }
@@ -802,6 +836,40 @@ pub struct RaceProgressChange {
     pub jumps: Option<Vec<Jump>>,
 }
 
+/// Cricket Change Message (CCM) - live cricket match data.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CCM {
+    /// Subscription identifier.
+    pub id: Option<u64>,
+    /// Publish time (epoch millis).
+    pub pt: u64,
+    /// Clock token (may be integer or string depending on feed state).
+    pub clk: Option<serde_json::Value>,
+    /// Cricket match changes (None on heartbeat).
+    pub cc: Option<Vec<CricketChange>>,
+}
+
+/// Delta update for a single cricket match within a CCM.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CricketChange {
+    /// Betfair event identifier.
+    #[serde(default, deserialize_with = "deserialize_optional_string_lenient")]
+    pub event_id: Option<String>,
+    /// Betfair market identifier.
+    pub market_id: Option<String>,
+    /// Fixture metadata.
+    pub fixture_info: Option<serde_json::Value>,
+    /// Home team metadata.
+    pub home_team: Option<serde_json::Value>,
+    /// Away team metadata.
+    pub away_team: Option<serde_json::Value>,
+    /// Match statistics.
+    pub match_stats: Option<serde_json::Value>,
+    /// Match incidents.
+    pub incident_list_wrapper: Option<serde_json::Value>,
+}
+
 /// Jump obstacle location data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Jump {
@@ -892,6 +960,75 @@ mod tests {
         assert!(!msgs.is_empty(), "{fixture}: empty array");
         for msg in &msgs {
             assert!(matches!(msg, StreamMessage::OrderChange(_)), "{fixture}");
+        }
+    }
+
+    #[rstest]
+    fn test_stream_decode_mcm_segments() {
+        let data = load_test_json("stream/mcm_SEGMENTS.jsonl");
+        let expected = [
+            (SegmentType::SegStart, "1.100001", None),
+            (SegmentType::Seg, "1.100002", None),
+            (SegmentType::SegEnd, "1.100003", Some("mcm-segment-clk")),
+        ];
+
+        let messages: Vec<StreamMessage> = data
+            .lines()
+            .map(|line| stream_decode(line.as_bytes()).unwrap())
+            .collect();
+
+        assert_eq!(messages.len(), expected.len());
+        for (message, (segment_type, market_id, clk)) in messages.into_iter().zip(expected) {
+            let StreamMessage::MarketChange(mcm) = message else {
+                panic!("Expected MarketChange");
+            };
+            assert_eq!(mcm.id, Some(1));
+            assert_eq!(mcm.pt, 1_700_000_000_000);
+            assert_eq!(mcm.clk.as_deref(), clk);
+            assert_eq!(mcm.initial_clk, None);
+            assert_eq!(mcm.ct, None);
+            assert_eq!(mcm.conflate_ms, None);
+            assert_eq!(mcm.heartbeat_ms, None);
+            assert_eq!(mcm.segment_type, Some(segment_type));
+            assert_eq!(mcm.status, None);
+            let market_changes = mcm.mc.unwrap();
+            assert_eq!(market_changes.len(), 1);
+            assert_eq!(market_changes[0].id, market_id);
+        }
+    }
+
+    #[rstest]
+    fn test_stream_decode_ocm_segments() {
+        let data = load_test_json("stream/ocm_SEGMENTS.jsonl");
+        let expected = [
+            (SegmentType::SegStart, "1.100001", None),
+            (SegmentType::Seg, "1.100002", None),
+            (SegmentType::SegEnd, "1.100003", Some("ocm-segment-clk")),
+        ];
+
+        let messages: Vec<StreamMessage> = data
+            .lines()
+            .map(|line| stream_decode(line.as_bytes()).unwrap())
+            .collect();
+
+        assert_eq!(messages.len(), expected.len());
+        for (message, (segment_type, market_id, clk)) in messages.into_iter().zip(expected) {
+            let StreamMessage::OrderChange(ocm) = message else {
+                panic!("Expected OrderChange");
+            };
+            assert_eq!(ocm.id, Some(1));
+            assert_eq!(ocm.pt, 1_700_000_000_000);
+            assert_eq!(ocm.clk.as_deref(), clk);
+            assert_eq!(ocm.initial_clk, None);
+            assert_eq!(ocm.ct, None);
+            assert_eq!(ocm.conflate_ms, None);
+            assert_eq!(ocm.heartbeat_ms, None);
+            assert_eq!(ocm.segment_type, Some(segment_type));
+            assert_eq!(ocm.status, None);
+            let order_changes = ocm.oc.unwrap();
+            assert_eq!(order_changes.len(), 1);
+            assert_eq!(order_changes[0].id, market_id);
+            assert_eq!(order_changes[0].orc.as_ref().unwrap().len(), 0);
         }
     }
 
@@ -1012,6 +1149,22 @@ mod tests {
                 assert_eq!(ids, vec![35467839, 24947967, 299569, 31422647, 41694785]);
             }
             other => panic!("Expected RaceChange, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_stream_decode_ccm_single() {
+        let data = load_test_json("stream/ccm_single.json");
+        let msg = stream_decode(data.as_bytes()).unwrap();
+        match msg {
+            StreamMessage::CricketChange(ccm) => {
+                let cc = ccm.cc.as_ref().unwrap();
+                assert_eq!(cc.len(), 1);
+                assert_eq!(cc[0].event_id.as_deref(), Some("35741575"));
+                assert_eq!(cc[0].market_id.as_deref(), Some("1.259334639"));
+                assert!(cc[0].match_stats.is_some());
+            }
+            other => panic!("Expected CricketChange, was {other:?}"),
         }
     }
 

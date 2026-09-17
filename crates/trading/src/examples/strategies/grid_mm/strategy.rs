@@ -23,7 +23,7 @@ use nautilus_model::{
     data::QuoteTick,
     enums::{OrderSide, TimeInForce},
     events::{OrderCanceled, OrderExpired, OrderFilled, OrderRejected},
-    identifiers::{ClientOrderId, StrategyId},
+    identifiers::ClientOrderId,
     instruments::{Instrument, InstrumentAny},
     orders::Order,
     types::{Price, Quantity},
@@ -143,6 +143,32 @@ nautilus_strategy!(GridMarketMaker, {
         // GTD expiry means the grid is gone; reset so re-quoting is not suppressed
         self.last_quoted_mid = None;
     }
+
+    fn on_order_filled(&mut self, event: &OrderFilled) {
+        // Only discard once fully filled; partial fills must keep the ID so a
+        // subsequent self-cancel is not misclassified as external.
+        let closed = {
+            let cache = self.cache();
+            cache
+                .order(&event.client_order_id)
+                .is_some_and(|o| o.is_closed())
+        };
+
+        if closed {
+            self.pending_self_cancels.remove(&event.client_order_id);
+        }
+    }
+
+    fn on_order_canceled(&mut self, event: &OrderCanceled) {
+        if self.pending_self_cancels.remove(&event.client_order_id) {
+            return;
+        }
+
+        if self.config.on_cancel_resubmit {
+            // Reset so the next incoming quote triggers a full grid resubmission
+            self.last_quoted_mid = None;
+        }
+    }
 });
 
 impl Debug for GridMarketMaker {
@@ -159,14 +185,10 @@ impl DataActor for GridMarketMaker {
         let instrument_id = self.config.instrument_id;
         let (instrument, size_precision, min_quantity) = {
             let cache = self.cache();
-            let instrument = cache
-                .instrument(&instrument_id)
-                .ok_or_else(|| anyhow::anyhow!("Instrument {instrument_id} not found in cache"))?;
-            (
-                instrument.clone(),
-                instrument.size_precision(),
-                instrument.min_quantity(),
-            )
+            let instrument = cache.try_instrument(&instrument_id)?;
+            let size_precision = instrument.size_precision();
+            let min_quantity = instrument.min_quantity();
+            (instrument, size_precision, min_quantity)
         };
         self.price_precision = Some(instrument.price_precision());
         self.instrument = Some(instrument);
@@ -183,8 +205,8 @@ impl DataActor for GridMarketMaker {
 
     fn on_stop(&mut self) -> anyhow::Result<()> {
         let instrument_id = self.config.instrument_id;
-        self.cancel_all_orders(instrument_id, None, None, None)?;
-        self.close_all_positions(instrument_id, None, None, None, None, None, None)?;
+        self.cancel_all_orders(instrument_id, None, None, true, None)?;
+        self.close_all_positions(instrument_id, None, None, None, None, None, None, None)?;
         self.unsubscribe_quotes(instrument_id, None, None);
         Ok(())
     }
@@ -197,7 +219,7 @@ impl DataActor for GridMarketMaker {
         let mid = Price::new(mid_f64, price_precision);
 
         let instrument_id = self.config.instrument_id;
-        let strategy_id = StrategyId::from(self.actor_id.inner().as_str());
+        let strategy_id = self.strategy_id().expect("Strategy must be registered");
 
         // Always requote when the grid is empty, even if mid is within threshold
         let has_resting = {
@@ -222,21 +244,17 @@ impl DataActor for GridMarketMaker {
             let strategy = Some(&strategy_id);
             let ids: Vec<ClientOrderId> = {
                 let cache = self.cache();
-                cache
-                    .orders_open(None, inst, strategy, None, None)
-                    .iter()
-                    .chain(
-                        cache
-                            .orders_inflight(None, inst, strategy, None, None)
-                            .iter(),
-                    )
-                    .map(|o| o.client_order_id())
+                let open = cache.orders_open(None, inst, strategy, None, None);
+                let inflight = cache.orders_inflight(None, inst, strategy, None, None);
+                open.iter()
+                    .chain(inflight.iter())
+                    .map(Order::client_order_id)
                     .collect()
             };
             self.pending_self_cancels.extend(ids);
         }
 
-        self.cancel_all_orders(instrument_id, None, None, None)?;
+        self.cancel_all_orders(instrument_id, None, None, true, None)?;
 
         // Compute worst-case per-side exposure for max_position checks,
         // since cancels are async and pending orders may still fill
@@ -263,15 +281,9 @@ impl DataActor for GridMarketMaker {
             let mut seen = AHashSet::new();
 
             // Deduplicate open/inflight (can overlap during state transitions)
-            for order in cache
-                .orders_open(None, instrument_id, strategy, None, None)
-                .iter()
-                .chain(
-                    cache
-                        .orders_inflight(None, instrument_id, strategy, None, None)
-                        .iter(),
-                )
-            {
+            let open = cache.orders_open(None, instrument_id, strategy, None, None);
+            let inflight = cache.orders_inflight(None, instrument_id, strategy, None, None);
+            for order in open.iter().chain(inflight.iter()) {
                 if !seen.insert(order.client_order_id()) {
                     continue;
                 }
@@ -303,7 +315,7 @@ impl DataActor for GridMarketMaker {
 
         let (tif, expire_time) = match self.config.expire_time_secs {
             Some(secs) => {
-                let now_ns = self.core.clock().timestamp_ns();
+                let now_ns = self.clock().timestamp_ns();
                 let expire_ns = now_ns + secs * 1_000_000_000;
                 (Some(TimeInForce::Gtd), Some(expire_ns))
             }
@@ -311,7 +323,7 @@ impl DataActor for GridMarketMaker {
         };
 
         for (side, price) in grid {
-            let order = self.core.order_factory().limit(
+            let order = self.order().limit(
                 instrument_id,
                 side,
                 trade_size,
@@ -333,34 +345,6 @@ impl DataActor for GridMarketMaker {
         }
 
         self.last_quoted_mid = Some(mid);
-        Ok(())
-    }
-
-    fn on_order_filled(&mut self, event: &OrderFilled) -> anyhow::Result<()> {
-        // Only discard once fully filled; partial fills must keep the ID so a
-        // subsequent self-cancel is not misclassified as external.
-        let closed = {
-            let cache = self.cache();
-            cache
-                .order(&event.client_order_id)
-                .is_some_and(|o| o.is_closed())
-        };
-
-        if closed {
-            self.pending_self_cancels.remove(&event.client_order_id);
-        }
-        Ok(())
-    }
-
-    fn on_order_canceled(&mut self, event: &OrderCanceled) -> anyhow::Result<()> {
-        if self.pending_self_cancels.remove(&event.client_order_id) {
-            return Ok(());
-        }
-
-        if self.config.on_cancel_resubmit {
-            // Reset so the next incoming quote triggers a full grid resubmission
-            self.last_quoted_mid = None;
-        }
         Ok(())
     }
 

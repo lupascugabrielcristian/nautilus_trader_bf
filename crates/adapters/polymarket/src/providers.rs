@@ -24,13 +24,18 @@ use nautilus_model::{
     identifiers::InstrumentId,
     instruments::{Instrument, InstrumentAny},
 };
+use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use crate::{
     common::consts::GAMMA_CONDITION_IDS_BATCH_SIZE,
     config::PolymarketInstrumentProviderConfig,
     filters::InstrumentFilter,
-    http::{gamma::PolymarketGammaHttpClient, models::GammaTag, query::GetGammaMarketsParams},
+    http::{
+        gamma::PolymarketGammaHttpClient,
+        models::GammaTag,
+        query::{GetGammaEventsParams, GetGammaMarketsParams},
+    },
 };
 
 /// Provides Polymarket instruments via the Gamma API.
@@ -210,46 +215,76 @@ impl PolymarketInstrumentProvider {
         Ok(())
     }
 
+    /// Loads instruments for the given Gamma series IDs additively into the store.
+    ///
+    /// Resolves each series to its active, unresolved events and loads their
+    /// markets. Unlike [`Self::load_all`], this does **not** clear existing
+    /// instruments or mark the store as initialized.
+    pub async fn load_by_series_ids(&mut self, series_ids: Vec<u64>) -> anyhow::Result<()> {
+        let instruments = self
+            .http_client
+            .request_instruments_by_event_params(series_events_params(series_ids))
+            .await?;
+        self.add_instruments(instruments);
+        Ok(())
+    }
+
     /// Initializes the provider using its configured bootstrap scope.
     pub async fn initialize(&mut self, reload: bool) -> anyhow::Result<()> {
         if self.store.is_initialized() && !reload {
             return Ok(());
         }
 
-        if self.config.should_load_all() {
-            self.load_scoped_all().await?;
-            self.store.set_initialized();
+        let should_load_all = has_bootstrap_scope(&self.config, &self.filters);
+        let has_load_ids = self.config.has_load_ids();
+
+        if !should_load_all && !has_load_ids {
+            if self.config.log_warnings {
+                log::warn!(
+                    "No Polymarket instrument bootstrap configured: set instrument_config.load_all, instrument_config.load_ids, instrument_config.filters, instrument_config.event_slugs, instrument_config.market_slugs, instrument_config.event_slug_builder, or instrument_config.series_ids, or register an instrument filter"
+                );
+            }
             return Ok(());
         }
 
-        if self.config.has_load_ids() {
-            let load_ids = self.config.load_ids.clone().unwrap_or_default();
-            let filters = self.config.filters.clone();
-            self.load_ids(&load_ids, filters.as_ref()).await?;
-            self.store.set_initialized();
-            return Ok(());
-        }
-
-        if self.config.log_warnings {
+        // Registered `InstrumentFilter`s take precedence over the Gamma filter map,
+        // so say when the map is being dropped rather than ignoring it silently.
+        if self.config.log_warnings
+            && !self.filters.is_empty()
+            && self.config.has_nonempty_filters()
+        {
             log::warn!(
-                "No Polymarket instrument bootstrap configured: set instrument_config.load_all, instrument_config.load_ids, instrument_config.event_slugs, instrument_config.market_slugs, or instrument_config.event_slug_builder"
+                "Registered instrument filters take precedence: instrument_config.filters is ignored for this bootstrap"
             );
         }
+
+        if should_load_all {
+            self.load_scoped_all().await?;
+        }
+
+        if has_load_ids {
+            // Deliberately not passed `config.filters`: `load_ids` names instruments
+            // explicitly, so intersecting it with the filter map would silently drop
+            // any ID that falls outside those filters. The scopes are additive, and
+            // an explicitly requested instrument is requested unconditionally.
+            let load_ids = self.config.load_ids.clone().unwrap_or_default();
+            self.load_ids(&load_ids, None).await?;
+        }
+
+        // Registered filters take precedence over the `filters` map, so a map paired with an
+        // accept-only filter loads nothing while `should_load_all()` still reports true. Latching
+        // empty would strand the provider against a later `initialize(false)`.
+        let sourced_by_registered_filters = !has_load_ids && !self.filters.is_empty();
+
+        if sourced_by_registered_filters && self.store.count() == 0 {
+            return Ok(());
+        }
+
+        self.store.set_initialized();
         Ok(())
     }
 
     async fn load_scoped_all(&mut self) -> anyhow::Result<()> {
-        let has_explicit_slug_scope = self.config.event_slug_builder.is_some()
-            || self
-                .config
-                .event_slugs
-                .as_ref()
-                .is_some_and(|slugs| !slugs.is_empty())
-            || self
-                .config
-                .market_slugs
-                .as_ref()
-                .is_some_and(|slugs| !slugs.is_empty());
         let event_slugs = self.resolve_event_slugs()?;
         let market_slugs = self
             .config
@@ -259,6 +294,33 @@ impl PolymarketInstrumentProvider {
             .into_iter()
             .filter(|slug| !slug.trim().is_empty())
             .collect::<Vec<_>>();
+        let series_ids = self.config.series_ids.clone().unwrap_or_default();
+
+        // The clearing bulk load must run before the additive scoped loads.
+        // Explicit scoping never broadens into an unfiltered full-universe fetch,
+        // but every filter-driven query is bounded, so it composes with explicit
+        // scopes instead of being silently dropped. Registered `InstrumentFilter`s
+        // count here just as the Gamma filter map does, otherwise this path would
+        // drop them while `fetch_configured_instruments` keeps them, and the
+        // bootstrap and interval-refresh universes would diverge.
+        //
+        // This deliberately does not go through `load_all`, which marks the store
+        // initialized on completion. The additive scopes below are still
+        // outstanding at this point, and a failure in one of them would otherwise
+        // leave an initialized-but-incomplete store that makes a subsequent
+        // `initialize(false)` short-circuit and skip the missing scopes for good.
+        if !self.config.has_explicit_scope()
+            || self.config.has_nonempty_filters()
+            || !self.filters.is_empty()
+        {
+            let filters = self.config.filters.clone();
+            let instruments = self.fetch_bulk_instruments(filters.as_ref()).await?;
+            self.replace_instruments(instruments);
+        }
+
+        if !series_ids.is_empty() {
+            self.load_by_series_ids(series_ids).await?;
+        }
 
         if !event_slugs.is_empty() {
             self.load_by_event_slugs(event_slugs).await?;
@@ -268,12 +330,7 @@ impl PolymarketInstrumentProvider {
             self.load_by_slugs(market_slugs).await?;
         }
 
-        if has_explicit_slug_scope {
-            return Ok(());
-        }
-
-        let filters = self.config.filters.clone();
-        self.load_all(filters.as_ref()).await
+        Ok(())
     }
 
     fn resolve_event_slugs(&self) -> anyhow::Result<Vec<String>> {
@@ -295,6 +352,38 @@ impl PolymarketInstrumentProvider {
     /// each filter's methods that return `Some`.
     async fn load_filtered(&self) -> anyhow::Result<Vec<InstrumentAny>> {
         fetch_instruments(&self.http_client, &self.filters).await
+    }
+
+    /// Fetches the bulk instrument universe without mutating provider state.
+    ///
+    /// Registered [`InstrumentFilter`]s take precedence; otherwise a non-empty
+    /// Gamma filter map bounds the query, and an absent or empty map falls back
+    /// to the full universe.
+    async fn fetch_bulk_instruments(
+        &self,
+        filters: Option<&HashMap<String, String>>,
+    ) -> anyhow::Result<Vec<InstrumentAny>> {
+        if !self.filters.is_empty() {
+            return self.load_filtered().await;
+        }
+
+        match filters {
+            Some(map) if !map.is_empty() => {
+                let params = build_gamma_params_from_hashmap(map)?;
+                self.http_client.request_instruments_by_params(params).await
+            }
+            _ => self.http_client.request_instruments().await,
+        }
+    }
+
+    /// Replaces the store contents, leaving the initialized flag untouched.
+    ///
+    /// Callers that complete a full bootstrap are responsible for marking the
+    /// store initialized once every scope has succeeded.
+    fn replace_instruments(&mut self, instruments: Vec<InstrumentAny>) {
+        self.store.clear();
+        self.token_index.clear();
+        self.add_instruments(instruments);
     }
 }
 
@@ -369,16 +458,8 @@ pub async fn fetch_configured_instruments(
 ) -> anyhow::Result<Vec<InstrumentAny>> {
     let mut instruments = Vec::new();
 
-    if config.should_load_all() {
-        let has_explicit_slug_scope = config.event_slug_builder.is_some()
-            || config
-                .event_slugs
-                .as_ref()
-                .is_some_and(|slugs| !slugs.is_empty())
-            || config
-                .market_slugs
-                .as_ref()
-                .is_some_and(|slugs| !slugs.is_empty());
+    if has_bootstrap_scope(config, filters) {
+        let has_explicit_scope = config.has_explicit_scope();
         let event_slugs = if let Some(builder) = config.event_slug_builder.as_ref() {
             builder.build_event_slugs()?
         } else {
@@ -399,6 +480,30 @@ pub async fn fetch_configured_instruments(
             .filter(|slug| !slug.trim().is_empty())
             .collect::<Vec<_>>();
 
+        let series_ids = config.series_ids.clone().unwrap_or_default();
+
+        // Explicit scoping never broadens into an unfiltered full-universe
+        // fetch, but every filter-driven query is bounded, so it composes with
+        // explicit series and slug scopes instead of being silently dropped.
+        // This mirrors `load_scoped_all`, which the interval refresh and
+        // `request_instruments` paths must stay consistent with.
+        if !filters.is_empty() {
+            instruments.extend(fetch_instruments(http_client, filters).await?);
+        } else if let Some(map) = config.filters.as_ref().filter(|map| !map.is_empty()) {
+            let params = build_gamma_params_from_hashmap(map)?;
+            instruments.extend(http_client.request_instruments_by_params(params).await?);
+        } else if !has_explicit_scope {
+            instruments.extend(http_client.request_instruments().await?);
+        }
+
+        if !series_ids.is_empty() {
+            instruments.extend(
+                http_client
+                    .request_instruments_by_event_params(series_events_params(series_ids))
+                    .await?,
+            );
+        }
+
         if !event_slugs.is_empty() {
             instruments.extend(
                 http_client
@@ -414,30 +519,13 @@ pub async fn fetch_configured_instruments(
                     .await?,
             );
         }
+    }
 
-        if has_explicit_slug_scope {
-            // Explicit slug scoping should never broaden into a full-universe fetch.
-        } else if filters.is_empty() {
-            if let Some(map) = config.filters.as_ref() {
-                if map.is_empty() {
-                    instruments.extend(http_client.request_instruments().await?);
-                } else {
-                    let params = build_gamma_params_from_hashmap(map);
-                    instruments.extend(http_client.request_instruments_by_params(params).await?);
-                }
-            } else {
-                instruments.extend(http_client.request_instruments().await?);
-            }
-        } else {
-            instruments.extend(fetch_instruments(http_client, filters).await?);
-        }
-    } else if config.has_load_ids() {
-        let base_params = config
-            .filters
-            .as_ref()
-            .map(build_gamma_params_from_hashmap)
-            .unwrap_or_default();
-
+    if config.has_load_ids() {
+        // Queried by condition ID alone. Merging `config.filters` in here would
+        // intersect an explicit scope with a filter scope, so an ID outside those
+        // filters would never load despite being named directly. Mirrors the
+        // `load_ids` call in `initialize`.
         let condition_ids = config
             .load_ids
             .clone()
@@ -450,17 +538,43 @@ pub async fn fetch_configured_instruments(
 
         for chunk in condition_ids.chunks(GAMMA_CONDITION_IDS_BATCH_SIZE) {
             let params = GetGammaMarketsParams {
-                condition_ids: Some(chunk.join(",")),
-                ..base_params.clone()
+                condition_ids: Some(chunk.to_vec()),
+                ..Default::default()
             };
             instruments.extend(http_client.request_instruments_by_params(params).await?);
         }
     }
 
+    // Deduplicated but NOT filtered by `accept` here. `fetch_instruments` already
+    // applies acceptance to the results of filter-driven queries, which is the only
+    // place it belongs: applying it again across the whole collection would let a
+    // registered filter reject series, slug, and ID instruments that the provider's
+    // `load_scoped_all` adds unconditionally, so a refresh would silently drop
+    // instruments the bootstrap had loaded.
     let mut seen = AHashSet::new();
     instruments.retain(|inst| seen.insert(inst.id()));
-    instruments.retain(|inst| filters.iter().all(|f| f.accept(inst)));
     Ok(instruments)
+}
+
+// Registered filters live on the provider, not the config, so the config predicate alone cannot
+// see them. Source methods are deliberately not evaluated: they are documented as re-evaluated
+// each load cycle, so probing here would consume a batch the fetch then misses.
+fn has_bootstrap_scope(
+    config: &PolymarketInstrumentProviderConfig,
+    filters: &[Arc<dyn InstrumentFilter>],
+) -> bool {
+    config.should_load_all() || !filters.is_empty()
+}
+
+/// Builds the Gamma events query that resolves series IDs to their active,
+/// unresolved events.
+fn series_events_params(series_ids: Vec<u64>) -> GetGammaEventsParams {
+    GetGammaEventsParams {
+        series_id: Some(series_ids),
+        active: Some(true),
+        closed: Some(false),
+        ..Default::default()
+    }
 }
 
 /// Extracts the condition ID from an instrument symbol.
@@ -478,83 +592,445 @@ pub fn extract_condition_id(instrument_id: &InstrumentId) -> anyhow::Result<Stri
         })
 }
 
-/// Builds `GetGammaMarketsParams` from a `HashMap<String, String>`.
-pub fn build_gamma_params_from_hashmap(map: &HashMap<String, String>) -> GetGammaMarketsParams {
+/// Builds validated market keyset parameters from string key/value filters.
+///
+/// # Errors
+///
+/// Returns an error for unknown keys, malformed values, or invalid filter combinations.
+pub fn build_gamma_params_from_hashmap(
+    map: &HashMap<String, String>,
+) -> anyhow::Result<GetGammaMarketsParams> {
+    for key in map.keys() {
+        match key.as_str() {
+            "is_active"
+            | "active"
+            | "closed"
+            | "archived"
+            | "id"
+            | "limit"
+            | "offset"
+            | "order"
+            | "ascending"
+            | "slug"
+            | "clob_token_ids"
+            | "condition_ids"
+            | "question_ids"
+            | "market_maker_address"
+            | "liquidity_num_min"
+            | "liquidity_num_max"
+            | "volume_num_min"
+            | "volume_num_max"
+            | "start_date_min"
+            | "start_date_max"
+            | "end_date_min"
+            | "end_date_max"
+            | "tag_id"
+            | "related_tags"
+            | "tag_match"
+            | "decimalized"
+            | "cyom"
+            | "rfq_enabled"
+            | "uma_resolution_status"
+            | "game_id"
+            | "sports_market_types"
+            | "include_tag"
+            | "locale"
+            | "max_markets" => {}
+            _ => anyhow::bail!("Unknown Gamma market filter key '{key}'"),
+        }
+    }
+
     let mut params = GetGammaMarketsParams::default();
 
+    if map
+        .get("is_active")
+        .map(|value| parse_gamma_filter_bool("market", "is_active", value))
+        .transpose()?
+        .unwrap_or(false)
+    {
+        params.active = Some(true);
+        params.archived = Some(false);
+        params.closed = Some(false);
+    }
+
     if let Some(v) = map.get("active") {
-        params.active = v.parse().ok();
+        params.active = Some(parse_gamma_filter_bool("market", "active", v)?);
     }
 
     if let Some(v) = map.get("closed") {
-        params.closed = v.parse().ok();
+        params.closed = Some(parse_gamma_filter_bool("market", "closed", v)?);
     }
 
     if let Some(v) = map.get("archived") {
-        params.archived = v.parse().ok();
+        params.archived = Some(parse_gamma_filter_bool("market", "archived", v)?);
+    }
+
+    if let Some(v) = map.get("id") {
+        params.id = Some(parse_gamma_numeric_filter_list("market", "id", v)?);
     }
 
     if let Some(v) = map.get("slug") {
-        params.slug = Some(v.clone());
+        params.slug = Some(parse_gamma_filter_list("market", "slug", v)?);
     }
 
     if let Some(v) = map.get("tag_id") {
-        params.tag_id = Some(v.clone());
+        params.tag_id = Some(parse_gamma_numeric_filter_list("market", "tag_id", v)?);
     }
 
     if let Some(v) = map.get("condition_ids") {
-        params.condition_ids = Some(v.clone());
+        params.condition_ids = Some(parse_gamma_filter_list("market", "condition_ids", v)?);
     }
 
     if let Some(v) = map.get("clob_token_ids") {
-        params.clob_token_ids = Some(v.clone());
+        params.clob_token_ids = Some(parse_gamma_filter_list("market", "clob_token_ids", v)?);
+    }
+
+    if let Some(v) = map.get("question_ids") {
+        params.question_ids = Some(parse_gamma_filter_list("market", "question_ids", v)?);
+    }
+
+    if let Some(v) = map.get("market_maker_address") {
+        params.market_maker_address = Some(parse_gamma_filter_list(
+            "market",
+            "market_maker_address",
+            v,
+        )?);
     }
 
     if let Some(v) = map.get("liquidity_num_min") {
-        params.liquidity_num_min = v.parse().ok();
+        params.liquidity_num_min = Some(parse_gamma_filter_decimal(
+            "market",
+            "liquidity_num_min",
+            v,
+        )?);
     }
 
     if let Some(v) = map.get("liquidity_num_max") {
-        params.liquidity_num_max = v.parse().ok();
+        params.liquidity_num_max = Some(parse_gamma_filter_decimal(
+            "market",
+            "liquidity_num_max",
+            v,
+        )?);
     }
 
     if let Some(v) = map.get("volume_num_min") {
-        params.volume_num_min = v.parse().ok();
+        params.volume_num_min = Some(parse_gamma_filter_decimal("market", "volume_num_min", v)?);
     }
 
     if let Some(v) = map.get("volume_num_max") {
-        params.volume_num_max = v.parse().ok();
+        params.volume_num_max = Some(parse_gamma_filter_decimal("market", "volume_num_max", v)?);
     }
 
     if let Some(v) = map.get("order") {
-        params.order = Some(v.clone());
+        params.order = Some(parse_gamma_filter_string("market", "order", v)?);
     }
 
     if let Some(v) = map.get("ascending") {
-        params.ascending = v.parse().ok();
+        params.ascending = Some(parse_gamma_filter_bool("market", "ascending", v)?);
     }
 
     if let Some(v) = map.get("limit") {
-        params.limit = v.parse().ok();
+        params.limit = Some(parse_gamma_filter_u32("market", "limit", v)?.min(100));
+    }
+
+    if let Some(v) = map.get("offset") {
+        params.offset = Some(parse_gamma_filter_u32("market", "offset", v)?);
+    }
+
+    if let Some(v) = map.get("start_date_min") {
+        params.start_date_min = Some(parse_gamma_filter_string("market", "start_date_min", v)?);
+    }
+
+    if let Some(v) = map.get("start_date_max") {
+        params.start_date_max = Some(parse_gamma_filter_string("market", "start_date_max", v)?);
+    }
+
+    if let Some(v) = map.get("end_date_min") {
+        params.end_date_min = Some(parse_gamma_filter_string("market", "end_date_min", v)?);
+    }
+
+    if let Some(v) = map.get("end_date_max") {
+        params.end_date_max = Some(parse_gamma_filter_string("market", "end_date_max", v)?);
+    }
+
+    if let Some(v) = map.get("related_tags") {
+        params.related_tags = Some(parse_gamma_filter_bool("market", "related_tags", v)?);
+    }
+
+    if let Some(v) = map.get("tag_match") {
+        params.tag_match = Some(parse_gamma_filter_string("market", "tag_match", v)?);
+    }
+
+    if let Some(v) = map.get("decimalized") {
+        params.decimalized = Some(parse_gamma_filter_bool("market", "decimalized", v)?);
+    }
+
+    if let Some(v) = map.get("cyom") {
+        params.cyom = Some(parse_gamma_filter_bool("market", "cyom", v)?);
+    }
+
+    if let Some(v) = map.get("rfq_enabled") {
+        params.rfq_enabled = Some(parse_gamma_filter_bool("market", "rfq_enabled", v)?);
+    }
+
+    if let Some(v) = map.get("uma_resolution_status") {
+        params.uma_resolution_status = Some(parse_gamma_filter_string(
+            "market",
+            "uma_resolution_status",
+            v,
+        )?);
+    }
+
+    if let Some(v) = map.get("game_id") {
+        params.game_id = Some(parse_gamma_filter_string("market", "game_id", v)?);
+    }
+
+    if let Some(v) = map.get("sports_market_types") {
+        params.sports_market_types =
+            Some(parse_gamma_filter_list("market", "sports_market_types", v)?);
+    }
+
+    if let Some(v) = map.get("include_tag") {
+        params.include_tag = Some(parse_gamma_filter_bool("market", "include_tag", v)?);
+    }
+
+    if let Some(v) = map.get("locale") {
+        params.locale = Some(parse_gamma_filter_string("market", "locale", v)?);
     }
 
     if let Some(v) = map.get("max_markets") {
-        params.max_markets = v.parse().ok();
+        params.max_markets = Some(parse_gamma_filter_u32("market", "max_markets", v)?);
     }
 
-    params
+    params.validate_keyset().map_err(|e| anyhow::anyhow!(e))?;
+    Ok(params)
+}
+
+/// Builds validated event keyset parameters from string key/value filters.
+///
+/// # Errors
+///
+/// Returns an error for unknown keys, malformed values, or invalid filter combinations.
+pub fn build_gamma_event_params_from_hashmap(
+    map: &HashMap<String, String>,
+) -> anyhow::Result<GetGammaEventsParams> {
+    for key in map.keys() {
+        match key.as_str() {
+            "is_active" | "active" | "closed" | "archived" | "id" | "slug" | "live"
+            | "featured" | "cyom" | "title_search" | "liquidity_min" | "liquidity_max"
+            | "volume_min" | "volume_max" | "start_date_min" | "start_date_max"
+            | "end_date_min" | "end_date_max" | "start_time_min" | "start_time_max" | "tag_id"
+            | "tag_slug" | "exclude_tag_id" | "related_tags" | "tag_match" | "series_id"
+            | "game_id" | "event_date" | "event_week" | "featured_order" | "recurrence"
+            | "created_by" | "parent_event_id" | "include_children" | "partner_slug"
+            | "include_chat" | "include_template" | "include_best_lines" | "locale" | "order"
+            | "ascending" | "limit" | "offset" | "max_events" => {}
+            _ => anyhow::bail!("Unknown Gamma event filter key '{key}'"),
+        }
+    }
+
+    let mut params = GetGammaEventsParams::default();
+
+    if map
+        .get("is_active")
+        .map(|value| parse_gamma_filter_bool("event", "is_active", value))
+        .transpose()?
+        .unwrap_or(false)
+    {
+        params.active = Some(true);
+        params.archived = Some(false);
+        params.closed = Some(false);
+    }
+
+    macro_rules! set_bool {
+        ($field:ident) => {
+            if let Some(value) = map.get(stringify!($field)) {
+                params.$field = Some(parse_gamma_filter_bool("event", stringify!($field), value)?);
+            }
+        };
+    }
+    macro_rules! set_string {
+        ($field:ident) => {
+            if let Some(value) = map.get(stringify!($field)) {
+                params.$field = Some(parse_gamma_filter_string(
+                    "event",
+                    stringify!($field),
+                    value,
+                )?);
+            }
+        };
+    }
+    macro_rules! set_decimal {
+        ($field:ident) => {
+            if let Some(value) = map.get(stringify!($field)) {
+                params.$field = Some(parse_gamma_filter_decimal(
+                    "event",
+                    stringify!($field),
+                    value,
+                )?);
+            }
+        };
+    }
+    macro_rules! set_u32 {
+        ($field:ident) => {
+            if let Some(value) = map.get(stringify!($field)) {
+                params.$field = Some(parse_gamma_filter_u32("event", stringify!($field), value)?);
+            }
+        };
+    }
+    macro_rules! set_u64 {
+        ($field:ident) => {
+            if let Some(value) = map.get(stringify!($field)) {
+                params.$field = Some(parse_gamma_filter_u64("event", stringify!($field), value)?);
+            }
+        };
+    }
+    macro_rules! set_strings {
+        ($field:ident) => {
+            if let Some(value) = map.get(stringify!($field)) {
+                params.$field = Some(parse_gamma_filter_list("event", stringify!($field), value)?);
+            }
+        };
+    }
+    macro_rules! set_u64s {
+        ($field:ident) => {
+            if let Some(value) = map.get(stringify!($field)) {
+                params.$field = Some(parse_gamma_numeric_filter_list(
+                    "event",
+                    stringify!($field),
+                    value,
+                )?);
+            }
+        };
+    }
+
+    set_bool!(active);
+    set_bool!(closed);
+    set_bool!(archived);
+    set_bool!(live);
+    set_bool!(featured);
+    set_bool!(cyom);
+    set_bool!(related_tags);
+    set_bool!(featured_order);
+    set_bool!(include_children);
+    set_bool!(include_chat);
+    set_bool!(include_template);
+    set_bool!(include_best_lines);
+    set_bool!(ascending);
+    set_strings!(slug);
+    set_strings!(created_by);
+    set_u64s!(id);
+    set_u64s!(tag_id);
+    set_u64s!(exclude_tag_id);
+    set_u64s!(series_id);
+    set_u64s!(game_id);
+    set_string!(title_search);
+    set_string!(start_date_min);
+    set_string!(start_date_max);
+    set_string!(end_date_min);
+    set_string!(end_date_max);
+    set_string!(start_time_min);
+    set_string!(start_time_max);
+    set_string!(tag_slug);
+    set_string!(tag_match);
+    set_string!(event_date);
+    set_string!(recurrence);
+    set_string!(partner_slug);
+    set_string!(locale);
+    set_string!(order);
+    set_decimal!(liquidity_min);
+    set_decimal!(liquidity_max);
+    set_decimal!(volume_min);
+    set_decimal!(volume_max);
+    set_u32!(event_week);
+    set_u32!(limit);
+    set_u32!(offset);
+    set_u32!(max_events);
+    set_u64!(parent_event_id);
+
+    params.validate_keyset().map_err(anyhow::Error::msg)?;
+    Ok(params)
+}
+
+fn parse_gamma_filter_bool(scope: &str, key: &str, value: &str) -> anyhow::Result<bool> {
+    if value.eq_ignore_ascii_case("true") {
+        Ok(true)
+    } else if value.eq_ignore_ascii_case("false") {
+        Ok(false)
+    } else {
+        anyhow::bail!("Gamma {scope} filter '{key}' must be true or false, was '{value}'")
+    }
+}
+
+fn parse_gamma_filter_u32(scope: &str, key: &str, value: &str) -> anyhow::Result<u32> {
+    value.parse::<u32>().map_err(|e| {
+        anyhow::anyhow!("Gamma {scope} filter '{key}' must be an unsigned integer: {e}")
+    })
+}
+
+fn parse_gamma_filter_u64(scope: &str, key: &str, value: &str) -> anyhow::Result<u64> {
+    value.parse::<u64>().map_err(|e| {
+        anyhow::anyhow!("Gamma {scope} filter '{key}' must be an unsigned integer: {e}")
+    })
+}
+
+fn parse_gamma_filter_decimal(scope: &str, key: &str, value: &str) -> anyhow::Result<Decimal> {
+    value
+        .parse::<Decimal>()
+        .map_err(|e| anyhow::anyhow!("Gamma {scope} filter '{key}' must be a decimal number: {e}"))
+}
+
+fn parse_gamma_filter_list(scope: &str, key: &str, value: &str) -> anyhow::Result<Vec<String>> {
+    let values = value
+        .split(',')
+        .map(str::trim)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    if values.is_empty() || values.iter().any(String::is_empty) {
+        anyhow::bail!("Gamma {scope} filter '{key}' must contain non-empty comma-separated values")
+    }
+    Ok(values)
+}
+
+fn parse_gamma_numeric_filter_list(
+    scope: &str,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<Vec<u64>> {
+    parse_gamma_filter_list(scope, key, value)?
+        .into_iter()
+        .map(|item| {
+            item.parse::<u64>().map_err(|e| {
+                anyhow::anyhow!(
+                    "Gamma {scope} filter '{key}' values must be unsigned integers: {e}"
+                )
+            })
+        })
+        .collect()
+}
+
+fn parse_gamma_filter_string(scope: &str, key: &str, value: &str) -> anyhow::Result<String> {
+    if value.trim().is_empty() {
+        anyhow::bail!("Gamma {scope} filter '{key}' cannot be empty")
+    }
+    Ok(value.to_string())
 }
 
 /// Resolves a tag slug to a tag ID by querying the Gamma tags endpoint.
 pub async fn resolve_tag_slug(
     client: &PolymarketGammaHttpClient,
     slug: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<u64> {
     let tags = client.request_tags().await?;
-    tags.iter()
+    let tag_id = tags
+        .iter()
         .find(|t| t.slug.as_deref() == Some(slug))
-        .map(|t| t.id.clone())
-        .ok_or_else(|| anyhow::anyhow!("Tag slug '{slug}' not found"))
+        .map(|t| t.id.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Tag slug '{slug}' not found"))?;
+    tag_id
+        .parse::<u64>()
+        .map_err(|e| anyhow::anyhow!("Tag slug '{slug}' returned invalid ID '{tag_id}': {e}"))
 }
 
 #[async_trait(?Send)]
@@ -568,27 +1044,8 @@ impl InstrumentProvider for PolymarketInstrumentProvider {
     }
 
     async fn load_all(&mut self, filters: Option<&HashMap<String, String>>) -> anyhow::Result<()> {
-        let instruments = if self.filters.is_empty() {
-            // If HashMap filters are provided, convert to Gamma params
-            if let Some(map) = filters {
-                if map.is_empty() {
-                    self.http_client.request_instruments().await?
-                } else {
-                    let params = build_gamma_params_from_hashmap(map);
-                    self.http_client
-                        .request_instruments_by_params(params)
-                        .await?
-                }
-            } else {
-                self.http_client.request_instruments().await?
-            }
-        } else {
-            self.load_filtered().await?
-        };
-
-        self.store.clear();
-        self.token_index.clear();
-        self.add_instruments(instruments);
+        let instruments = self.fetch_bulk_instruments(filters).await?;
+        self.replace_instruments(instruments);
         self.store.set_initialized();
 
         Ok(())
@@ -623,11 +1080,12 @@ impl InstrumentProvider for PolymarketInstrumentProvider {
 
         let base_params = filters
             .map(build_gamma_params_from_hashmap)
+            .transpose()?
             .unwrap_or_default();
 
         for chunk in condition_ids.chunks(GAMMA_CONDITION_IDS_BATCH_SIZE) {
             let params = GetGammaMarketsParams {
-                condition_ids: Some(chunk.join(",")),
+                condition_ids: Some(chunk.to_vec()),
                 ..base_params.clone()
             };
             let instruments = self
@@ -652,7 +1110,7 @@ impl InstrumentProvider for PolymarketInstrumentProvider {
         // Try direct fetch via condition_id extracted from symbol
         if let Ok(cid) = extract_condition_id(instrument_id) {
             let params = GetGammaMarketsParams {
-                condition_ids: Some(cid),
+                condition_ids: Some(vec![cid]),
                 ..Default::default()
             };
 
@@ -665,8 +1123,12 @@ impl InstrumentProvider for PolymarketInstrumentProvider {
             }
         }
 
-        // Fallback: full load_all if not initialized
-        if !self.store.is_initialized() {
+        // Fallback: full load_all if not initialized. A provider with an explicit
+        // scope is excluded: `load_all` would broaden it into the full-universe
+        // fetch that scoping exists to avoid, and would also clear the partially
+        // loaded store and mark it initialized, making a later `initialize(false)`
+        // skip the scopes it still owes after a failed bootstrap.
+        if !self.store.is_initialized() && !self.config.has_explicit_scope() {
             self.load_all(filters).await?;
         }
 

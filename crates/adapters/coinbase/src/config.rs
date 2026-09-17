@@ -15,7 +15,7 @@
 
 //! Configuration structures for the Coinbase adapter.
 
-use nautilus_model::enums::AccountType;
+use nautilus_model::{enums::AccountType, identifiers::AccountId};
 use nautilus_network::websocket::TransportBackend;
 use serde::{Deserialize, Serialize};
 
@@ -29,7 +29,7 @@ use crate::common::{
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.coinbase", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.coinbase", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -68,6 +68,18 @@ pub struct CoinbaseDataClientConfig {
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(CoinbaseDataClientConfig {
+    base_url_rest: Option<String>,
+    base_url_ws: Option<String>,
+    environment: CoinbaseEnvironment,
+    http_timeout_secs: u64,
+    ws_timeout_secs: u64,
+    update_instruments_interval_mins: u64,
+    derivatives_poll_interval_secs: u64,
+    transport_backend: TransportBackend,
+});
 
 impl Default for CoinbaseDataClientConfig {
     fn default() -> Self {
@@ -116,13 +128,16 @@ impl CoinbaseDataClientConfig {
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.coinbase", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.coinbase", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.coinbase")
 )]
-pub struct CoinbaseExecClientConfig {
+pub struct CoinbaseExecutionClientConfig {
+    /// Account identifier for the execution client.
+    #[builder(default = AccountId::from("COINBASE-001"))]
+    pub account_id: AccountId,
     /// CDP API key name (falls back to `COINBASE_API_KEY` env var).
     pub api_key: Option<String>,
     /// CDP API secret in PEM format (falls back to `COINBASE_API_SECRET` env var).
@@ -168,13 +183,30 @@ pub struct CoinbaseExecClientConfig {
     pub transport_backend: TransportBackend,
 }
 
-impl Default for CoinbaseExecClientConfig {
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(CoinbaseExecutionClientConfig {
+    account_id: AccountId,
+    base_url_rest: Option<String>,
+    base_url_ws: Option<String>,
+    environment: CoinbaseEnvironment,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    account_type: AccountType,
+    default_margin_type: Option<CoinbaseMarginType>,
+    default_leverage: Option<rust_decimal::Decimal>,
+    retail_portfolio_id: Option<String>,
+    transport_backend: TransportBackend,
+});
+
+impl Default for CoinbaseExecutionClientConfig {
     fn default() -> Self {
         Self::builder().build()
     }
 }
 
-impl CoinbaseExecClientConfig {
+impl CoinbaseExecutionClientConfig {
     /// Creates a new configuration with default settings.
     #[must_use]
     pub fn new() -> Self {
@@ -265,7 +297,7 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_defaults() {
-        let config = CoinbaseExecClientConfig::default();
+        let config = CoinbaseExecutionClientConfig::default();
         assert_eq!(config.environment, CoinbaseEnvironment::Live);
         assert_eq!(config.http_timeout_secs, 10);
         assert_eq!(config.max_retries, 3);
@@ -273,7 +305,7 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_ws_url_uses_user_endpoint() {
-        let config = CoinbaseExecClientConfig::default();
+        let config = CoinbaseExecutionClientConfig::default();
         assert!(config.ws_url().contains("user"));
     }
 
@@ -297,8 +329,8 @@ derivatives_poll_interval_secs = 60
 
     #[rstest]
     fn test_exec_config_toml_empty_uses_defaults() {
-        let config: CoinbaseExecClientConfig = toml::from_str("").unwrap();
-        let expected = CoinbaseExecClientConfig::default();
+        let config: CoinbaseExecutionClientConfig = toml::from_str("").unwrap();
+        let expected = CoinbaseExecutionClientConfig::default();
 
         assert_eq!(config.environment, expected.environment);
         assert_eq!(config.http_timeout_secs, expected.http_timeout_secs);

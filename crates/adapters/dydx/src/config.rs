@@ -17,7 +17,7 @@
 
 use std::num::NonZeroU32;
 
-use nautilus_model::identifiers::{AccountId, TraderId};
+use nautilus_model::identifiers::AccountId;
 use nautilus_network::{ratelimiter::quota::Quota, websocket::TransportBackend};
 use serde::{Deserialize, Serialize};
 
@@ -165,6 +165,14 @@ fn default_data_retry_delay_max_ms() -> u64 {
     5000
 }
 
+fn default_max_ws_connections() -> usize {
+    8
+}
+
+fn default_per_channel_subscription_limit() -> usize {
+    32
+}
+
 impl DydxAdapterConfig {
     /// Creates a config with URLs and chain ID resolved for the given network.
     ///
@@ -241,7 +249,7 @@ impl Default for DydxAdapterConfig {
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.dydx", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.dydx", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -278,7 +286,28 @@ pub struct DydxDataClientConfig {
     #[serde(default)]
     #[builder(default)]
     pub transport_backend: TransportBackend,
+    /// Maximum number of WebSocket connections in the Indexer pool.
+    ///
+    /// New connections are spun up lazily once the per-channel subscription
+    /// limit (32 by default on hosted Indexer) is reached on every existing
+    /// connection. Default `8` supports up to 256 markets per 32-limit channel.
+    #[serde(default = "default_max_ws_connections")]
+    #[builder(default = default_max_ws_connections())]
+    pub max_ws_connections: usize,
+    /// Per-connection subscription limit for each rate-limited Indexer channel
+    /// (`v4_trades`, `v4_candles`, `v4_orderbook`, `v4_markets`).
+    ///
+    /// Defaults to `32`, matching the hosted Indexer. Self-hosted Indexer
+    /// deployments may raise this.
+    #[serde(default = "default_per_channel_subscription_limit")]
+    #[builder(default = default_per_channel_subscription_limit())]
+    pub per_channel_subscription_limit: usize,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(DydxDataClientConfig {
+    network: DydxNetwork,
+});
 
 impl DydxDataClientConfig {
     /// Returns whether this is a testnet configuration.
@@ -299,16 +328,13 @@ impl Default for DydxDataClientConfig {
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.dydx", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.dydx", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.dydx")
 )]
-pub struct DydxExecClientConfig {
-    /// The trader ID for the client.
-    #[builder(default = TraderId::from("TRADER-001"))]
-    pub trader_id: TraderId,
+pub struct DydxExecutionClientConfig {
     /// The account ID for the client.
     #[builder(default = AccountId::from("DYDX-001"))]
     pub account_id: AccountId,
@@ -366,7 +392,15 @@ pub struct DydxExecClientConfig {
     pub transport_backend: TransportBackend,
 }
 
-impl Default for DydxExecClientConfig {
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(DydxExecutionClientConfig {
+    account_id: AccountId,
+    network: DydxNetwork,
+    wallet_address: Option<String>,
+    subaccount_number: u32,
+});
+
+impl Default for DydxExecutionClientConfig {
     fn default() -> Self {
         Self {
             grpc_rate_limit_per_second: default_grpc_rate_limit_per_second(),
@@ -375,7 +409,7 @@ impl Default for DydxExecClientConfig {
     }
 }
 
-impl DydxExecClientConfig {
+impl DydxExecutionClientConfig {
     /// Returns the gRPC URLs to use, with fallback support.
     ///
     /// Returns `grpc_urls` if non-empty, otherwise uses `grpc_endpoint` if provided,
@@ -582,10 +616,8 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_toml_empty_uses_defaults() {
-        let config: DydxExecClientConfig = toml::from_str("").unwrap();
-        let expected = DydxExecClientConfig::default();
-
-        assert_eq!(config.trader_id, expected.trader_id);
+        let config: DydxExecutionClientConfig = toml::from_str("").unwrap();
+        let expected = DydxExecutionClientConfig::default();
         assert_eq!(config.account_id, expected.account_id);
         assert_eq!(config.network, expected.network);
         assert_eq!(config.subaccount_number, expected.subaccount_number);

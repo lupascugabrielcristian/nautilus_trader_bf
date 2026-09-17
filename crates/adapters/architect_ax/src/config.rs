@@ -15,7 +15,7 @@
 
 //! Configuration structures for the AX Exchange adapter.
 
-use nautilus_model::identifiers::{AccountId, TraderId};
+use nautilus_model::identifiers::AccountId;
 use nautilus_network::websocket::TransportBackend;
 use serde::{Deserialize, Serialize};
 
@@ -24,10 +24,7 @@ use crate::common::{credential::credential_env_vars, enums::AxEnvironment};
 /// Configuration for the AX Exchange live data client.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.adapters.architect_ax", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -75,10 +72,29 @@ pub struct AxDataClientConfig {
     /// Funding rate poll interval in minutes.
     #[builder(default = 15)]
     pub funding_rate_poll_interval_mins: u64,
-    /// WebSocket transport backend (defaults to `Tungstenite`).
+    /// WebSocket transport backend.
+    ///
+    /// Defaults to `Sockudo` when `transport-sockudo` is enabled, otherwise `Tungstenite`.
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(AxDataClientConfig {
+    environment: AxEnvironment,
+    base_url_http: Option<String>,
+    base_url_ws_public: Option<String>,
+    base_url_ws_private: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    heartbeat_interval_secs: u64,
+    recv_window_ms: u64,
+    update_instruments_interval_mins: u64,
+    funding_rate_poll_interval_mins: u64,
+    transport_backend: TransportBackend,
+});
 
 impl Default for AxDataClientConfig {
     fn default() -> Self {
@@ -130,10 +146,7 @@ impl AxDataClientConfig {
 /// Configuration for the AX Exchange live execution client.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.adapters.architect_ax", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -141,10 +154,7 @@ impl AxDataClientConfig {
 )]
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
-pub struct AxExecClientConfig {
-    /// The trader ID for the client.
-    #[builder(default = TraderId::from("TRADER-001"))]
-    pub trader_id: TraderId,
+pub struct AxExecutionClientConfig {
     /// The account ID for the client.
     #[builder(default = AccountId::from("AX-001"))]
     pub account_id: AccountId,
@@ -184,18 +194,37 @@ pub struct AxExecClientConfig {
     /// Cancel all open orders when the orders WebSocket disconnects.
     #[builder(default)]
     pub cancel_on_disconnect: bool,
-    /// WebSocket transport backend (defaults to `Tungstenite`).
+    /// WebSocket transport backend.
+    ///
+    /// Defaults to `Sockudo` when `transport-sockudo` is enabled, otherwise `Tungstenite`.
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
 
-impl Default for AxExecClientConfig {
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(AxExecutionClientConfig {
+    account_id: AccountId,
+    environment: AxEnvironment,
+    base_url_http: Option<String>,
+    base_url_orders: Option<String>,
+    base_url_ws_private: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    heartbeat_interval_secs: u64,
+    recv_window_ms: u64,
+    cancel_on_disconnect: bool,
+    transport_backend: TransportBackend,
+});
+
+impl Default for AxExecutionClientConfig {
     fn default() -> Self {
         Self::builder().build()
     }
 }
 
-impl AxExecClientConfig {
+impl AxExecutionClientConfig {
     /// Creates a configuration with default values.
     #[must_use]
     pub fn new() -> Self {
@@ -280,7 +309,7 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_sandbox_urls_match_consts() {
-        let config = AxExecClientConfig::builder()
+        let config = AxExecutionClientConfig::builder()
             .environment(AxEnvironment::Sandbox)
             .build();
         assert_eq!(config.http_base_url(), AX_HTTP_SANDBOX_URL);
@@ -290,7 +319,7 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_production_urls_match_consts() {
-        let config = AxExecClientConfig::builder()
+        let config = AxExecutionClientConfig::builder()
             .environment(AxEnvironment::Production)
             .build();
         assert_eq!(config.http_base_url(), AX_HTTP_URL);
@@ -300,13 +329,13 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_cancel_on_disconnect_default_false() {
-        let config = AxExecClientConfig::default();
+        let config = AxExecutionClientConfig::default();
         assert!(!config.cancel_on_disconnect);
     }
 
     #[rstest]
     fn test_exec_config_cancel_on_disconnect_enabled() {
-        let config = AxExecClientConfig::builder()
+        let config = AxExecutionClientConfig::builder()
             .cancel_on_disconnect(true)
             .build();
         assert!(config.cancel_on_disconnect);
@@ -317,7 +346,7 @@ mod tests {
         let data = AxDataClientConfig::default();
         assert_eq!(data.environment, AxEnvironment::Sandbox);
 
-        let exec = AxExecClientConfig::default();
+        let exec = AxExecutionClientConfig::default();
         assert_eq!(exec.environment, AxEnvironment::Sandbox);
     }
 
@@ -341,10 +370,8 @@ update_instruments_interval_mins = 5
 
     #[rstest]
     fn test_exec_config_toml_empty_uses_defaults() {
-        let config: AxExecClientConfig = toml::from_str("").unwrap();
-        let expected = AxExecClientConfig::default();
-
-        assert_eq!(config.trader_id, expected.trader_id);
+        let config: AxExecutionClientConfig = toml::from_str("").unwrap();
+        let expected = AxExecutionClientConfig::default();
         assert_eq!(config.account_id, expected.account_id);
         assert_eq!(config.environment, expected.environment);
         assert_eq!(config.http_timeout_secs, expected.http_timeout_secs);

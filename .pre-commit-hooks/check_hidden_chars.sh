@@ -3,7 +3,7 @@
 # Ensure no hidden control or problematic unicode characters in source files
 #
 # This hook detects characters that could be used to hide malicious content:
-# - Control chars (U+0001–U+0008, U+000E–U+001F)
+# - Control chars (U+0001-U+0008, U+000E-U+001F)
 # - Zero-width spaces (U+200B, U+200C, U+200D)
 # - BOM (U+FEFF)
 # - Right-to-left override chars (U+202D, U+202E)
@@ -28,9 +28,10 @@ done
 
 if [ ${#files_to_check[@]} -eq 0 ]; then
   # Fallback: find all relevant files if no arguments passed
-  mapfile -t files_to_check < <(find . -type f \( -name "*.py" -o -name "*.pyx" -o -name "*.rs" -o -name "*.toml" -o -name "*.md" -o -name "*.yml" -o -name "*.yaml" -o -name "*.json" -o -name "*.sh" -o -name "Dockerfile*" \) \
+  mapfile -t files_to_check < <(find . -type f \( -name "*.py" -o -name "*.rs" -o -name "*.toml" -o -name "*.md" -o -name "*.yml" -o -name "*.yaml" -o -name "*.json" -o -name "*.sh" -o -name "Dockerfile*" \) \
     ! -path "*/target/*" ! -path "*/build/*" ! -path "*/__pycache__/*" ! -path "*/.pytest_cache/*" \
     ! -path "*/.venv/*" ! -path "*/venv/*" ! -path "*/node_modules/*" \
+    ! -path "./patches/pyo3-stub-gen/*" \
     ! -name "*.lock" ! -name "*.whl" ! -name "*.egg-info" ! -name "check_hidden_chars.sh")
 fi
 

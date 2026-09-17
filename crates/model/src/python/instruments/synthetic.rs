@@ -41,15 +41,15 @@ impl SyntheticInstrument {
         ts_event: u64,
         ts_init: u64,
     ) -> PyResult<Self> {
-        Self::new_checked(
-            symbol,
-            price_precision,
-            components,
-            formula,
-            ts_event.into(),
-            ts_init.into(),
-        )
-        .map_err(to_pyvalue_err)
+        Self::builder()
+            .symbol(symbol)
+            .price_precision(price_precision)
+            .components(components)
+            .formula(formula)
+            .ts_event(ts_event.into())
+            .ts_init(ts_init.into())
+            .build()
+            .map_err(to_pyvalue_err)
     }
 
     fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
@@ -132,6 +132,11 @@ impl SyntheticInstrument {
     }
 
     /// Calculates the price of the synthetic instrument based on component input prices provided as a map.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if formula evaluation fails or a required component price is missing from
+    /// the input map.
     #[pyo3(name = "calculate_from_map")]
     fn py_calculate_from_map(
         &mut self,

@@ -73,7 +73,7 @@ pub fn ib_contract_to_instrument_id_simplified(
                 }
             }
             SecurityType::ForexPair => Venue::from("IDEALPRO"),
-            SecurityType::Crypto => Venue::from("PAXOS"),
+            SecurityType::Crypto => derive_crypto_venue(contract),
             SecurityType::Stock => Venue::from("SMART"),
             SecurityType::Option | SecurityType::FuturesOption => {
                 if !contract.exchange.as_str().is_empty() && contract.exchange.as_str() != "SMART" {
@@ -234,7 +234,7 @@ pub fn ib_contract_to_instrument_id_raw(
 ) -> anyhow::Result<InstrumentId> {
     let venue = venue.unwrap_or_else(|| match contract.security_type {
         SecurityType::ForexPair => Venue::from("IDEALPRO"),
-        SecurityType::Crypto => Venue::from("PAXOS"),
+        SecurityType::Crypto => derive_crypto_venue(contract),
         SecurityType::Stock => Venue::from("SMART"),
         SecurityType::Option => Venue::from("SMART"),
         SecurityType::FuturesOption => Venue::from("SMART"),
@@ -357,8 +357,36 @@ pub static VENUE_MEMBERS: LazyLock<HashMap<&'static str, Vec<&'static str>>> =
         map
     });
 
+/// Returns `true` if the contract is a cryptocurrency contract.
+///
+/// Centralizes the crypto check used to gate crypto-specific request handling
+/// (e.g. the `AGGTRADES` `whatToShow` rule - see
+/// [`crate::data::convert::price_type_to_ib_what_to_show_for_security`]).
+#[must_use]
+pub fn is_crypto_contract(contract: &Contract) -> bool {
+    matches!(contract.security_type, SecurityType::Crypto)
+}
+
+/// Derives the venue for a crypto contract.
+///
+/// IB routes crypto to multiple venues; both PAXOS and ZEROHASH are live (which one
+/// applies depends on the account/region). Uses the contract's actual exchange when
+/// set (e.g. ZEROHASH or PAXOS), falling back to PAXOS when it is unspecified.
+#[must_use]
+pub fn derive_crypto_venue(contract: &Contract) -> Venue {
+    if !contract.exchange.as_str().is_empty() && contract.exchange.as_str() != "SMART" {
+        Venue::from(contract.exchange.as_str())
+    } else {
+        Venue::from("PAXOS")
+    }
+}
+
 #[must_use]
 pub fn possible_exchanges_for_venue(venue: &str) -> Vec<String> {
+    if venue == "OPRA" {
+        return vec!["SMART".to_string()];
+    }
+
     if let Some(exchanges) = VENUE_MEMBERS.get(venue) {
         return exchanges
             .iter()
@@ -371,7 +399,9 @@ pub fn possible_exchanges_for_venue(venue: &str) -> Vec<String> {
 
 /// Venue lists for different asset classes
 const VENUES_CASH: &[&str] = &["IDEALPRO"];
-const VENUES_CRYPTO: &[&str] = &["PAXOS"];
+// IB routes crypto to both PAXOS and ZEROHASH (which one applies depends on the
+// account/region); accept both.
+const VENUES_CRYPTO: &[&str] = &["PAXOS", "ZEROHASH"];
 const VENUES_OPT: &[&str] = &["SMART", "EUREX"];
 const VENUES_FUT: &[&str] = &[
     "BELFOX",
@@ -426,6 +456,27 @@ fn venue_matches(venue_str: &str, venues: &[&str]) -> bool {
         || VENUE_MEMBERS
             .get(venue_str)
             .is_some_and(|exchanges| exchanges.iter().any(|exchange| venues.contains(exchange)))
+}
+
+fn is_option_venue(venue: &str) -> bool {
+    venue == "OPRA" || venue_matches(venue, VENUES_OPT)
+}
+
+fn is_canonical_occ_option_symbol(symbol: &str) -> bool {
+    let bytes = symbol.as_bytes();
+    if bytes.len() != 21 || !symbol.is_ascii() {
+        return false;
+    }
+
+    let root = &bytes[..6];
+    let root_len = root.iter().position(|byte| *byte == b' ').unwrap_or(6);
+
+    root_len > 0
+        && root[..root_len].iter().all(u8::is_ascii_graphic)
+        && root[root_len..].iter().all(|byte| *byte == b' ')
+        && bytes[6..12].iter().all(u8::is_ascii_digit)
+        && matches!(bytes[12], b'C' | b'P')
+        && bytes[13..].iter().all(u8::is_ascii_digit)
 }
 
 /// Futures month codes mapping (F=Jan, G=Feb, H=Mar, J=Apr, K=May, M=Jun, N=Jul, Q=Aug, U=Sep, V=Oct, X=Nov, Z=Dec)
@@ -542,21 +593,25 @@ pub fn instrument_id_to_ib_contract(
     exchange: Option<&str>,
 ) -> anyhow::Result<Contract> {
     let venue_str = instrument_id.venue.to_string();
-    let derived_exchange = VENUE_MEMBERS
-        .get(venue_str.as_str())
-        .and_then(|exchanges| exchanges.first().copied())
-        .or_else(|| {
-            if venue_matches(venue_str.as_str(), VENUES_CASH)
-                || venue_matches(venue_str.as_str(), VENUES_CRYPTO)
-                || venue_matches(venue_str.as_str(), VENUES_OPT)
-                || venue_matches(venue_str.as_str(), VENUES_FUT)
-            {
-                Some(venue_str.as_str())
-            } else {
-                None
-            }
-        })
-        .unwrap_or("SMART");
+    let derived_exchange = if venue_str == "OPRA" {
+        "SMART"
+    } else {
+        VENUE_MEMBERS
+            .get(venue_str.as_str())
+            .and_then(|exchanges| exchanges.first().copied())
+            .or_else(|| {
+                if venue_matches(venue_str.as_str(), VENUES_CASH)
+                    || venue_matches(venue_str.as_str(), VENUES_CRYPTO)
+                    || venue_matches(venue_str.as_str(), VENUES_OPT)
+                    || venue_matches(venue_str.as_str(), VENUES_FUT)
+                {
+                    Some(venue_str.as_str())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or("SMART")
+    };
     let exchange_str = exchange.unwrap_or(derived_exchange);
     let symbol_str = instrument_id.symbol.as_str();
 
@@ -601,7 +656,22 @@ pub fn instrument_id_to_ib_contract(
     }
 
     // Handle Options (OPT)
-    if venue_matches(venue_str.as_str(), VENUES_OPT) {
+    if is_option_venue(venue_str.as_str()) {
+        if venue_str == "OPRA" {
+            if !is_canonical_occ_option_symbol(symbol_str) {
+                anyhow::bail!("Invalid OPRA option symbol: {symbol_str}");
+            }
+
+            return Ok(Contract {
+                contract_id: 0,
+                security_type: SecurityType::Option,
+                exchange: Exchange::from(exchange_str),
+                currency: Currency::from("USD"),
+                local_symbol: symbol_str.to_string(),
+                ..Default::default()
+            });
+        }
+
         if let Some(opt) = parse_option_symbol(symbol_str) {
             return Ok(Contract {
                 contract_id: 0,
@@ -747,9 +817,8 @@ pub fn instrument_id_to_ib_contract(
         symbol: Symbol::from(&symbol_clean),
         security_type: SecurityType::Stock,
         exchange: Exchange::from("SMART"),
-        currency: Currency::from("USD"), // Will be resolved from contract details
+        currency: Currency::from(""), // Will be resolved from contract details
         primary_exchange: Exchange::from(exchange_str),
-        local_symbol: symbol_clean,
         ..Default::default()
     })
 }
@@ -761,10 +830,16 @@ fn instrument_id_to_ib_contract_raw(
     let (local_symbol, sec_type_code) = instrument_id.symbol.as_str().rsplit_once('=')?;
 
     let venue_exchange = instrument_id.venue.as_str().replace('/', ".");
-    let exchange_str = exchange.unwrap_or(venue_exchange.as_str());
     let security_type = IbSecurityType::from_str(sec_type_code)
         .ok()
         .map(IbSecurityType::ibapi_security_type)?;
+    let default_exchange =
+        if security_type == SecurityType::Option && instrument_id.venue.as_str() == "OPRA" {
+            "SMART"
+        } else {
+            venue_exchange.as_str()
+        };
+    let exchange_str = exchange.unwrap_or(default_exchange);
 
     let contract = match security_type {
         SecurityType::Stock => Contract {
@@ -1190,7 +1265,10 @@ mod tests {
     use nautilus_model::identifiers::InstrumentId;
     use rstest::rstest;
 
-    use super::{ib_contract_to_instrument_id_simplified, instrument_id_to_ib_contract};
+    use super::{
+        exchange_to_mic_venue, ib_contract_to_instrument_id_simplified,
+        instrument_id_to_ib_contract, possible_exchanges_for_venue,
+    };
 
     #[rstest]
     fn test_ib_contract_to_instrument_id_simplified_normalizes_occ_option_root() {
@@ -1290,6 +1368,91 @@ mod tests {
     }
 
     #[rstest]
+    fn test_possible_exchanges_for_opra_routes_to_smart() {
+        assert_eq!(
+            possible_exchanges_for_venue("OPRA"),
+            vec!["SMART".to_string()]
+        );
+    }
+
+    #[rstest]
+    fn test_opra_occ_option_default_contract_routes_to_smart() {
+        let instrument_id = InstrumentId::from("SPY   240319P00511000.OPRA");
+
+        let contract = instrument_id_to_ib_contract(instrument_id, None).unwrap();
+
+        assert_eq!(contract.security_type, SecurityType::Option);
+        assert_eq!(contract.exchange.as_str(), "SMART");
+        assert!(contract.symbol.as_str().is_empty());
+        assert_eq!(contract.currency.as_str(), "USD");
+        assert_eq!(contract.local_symbol.as_str(), "SPY   240319P00511000");
+        assert!(contract.last_trade_date_or_contract_month.is_empty());
+        assert!(contract.right.is_none());
+        assert_eq!(contract.strike, 0.0);
+    }
+
+    #[rstest]
+    fn test_opra_occ_option_qualification_contract_uses_opt_smart() {
+        let instrument_id = InstrumentId::from("SPY   240319P00511000.OPRA");
+        let exchanges = possible_exchanges_for_venue(instrument_id.venue.as_str());
+
+        assert_eq!(exchanges, vec!["SMART".to_string()]);
+
+        let contract =
+            instrument_id_to_ib_contract(instrument_id, exchanges.first().map(String::as_str))
+                .unwrap();
+
+        assert_eq!(contract.security_type, SecurityType::Option);
+        assert_eq!(contract.exchange.as_str(), "SMART");
+        assert!(contract.symbol.as_str().is_empty());
+        assert_eq!(contract.currency.as_str(), "USD");
+        assert_eq!(contract.local_symbol.as_str(), "SPY   240319P00511000");
+        assert!(contract.last_trade_date_or_contract_month.is_empty());
+        assert!(contract.right.is_none());
+        assert_eq!(contract.strike, 0.0);
+    }
+
+    #[rstest]
+    fn test_opra_raw_option_default_contract_routes_to_smart() {
+        let instrument_id = InstrumentId::from("SPY   240319P00511000=OPT.OPRA");
+
+        let contract = instrument_id_to_ib_contract(instrument_id, None).unwrap();
+
+        assert_eq!(contract.security_type, SecurityType::Option);
+        assert_eq!(contract.exchange.as_str(), "SMART");
+        assert_eq!(contract.local_symbol.as_str(), "SPY   240319P00511000");
+    }
+
+    #[rstest]
+    #[case("SPY   240319P00511000.OPRA")]
+    #[case("SPY   240319P00511000=OPT.OPRA")]
+    fn test_opra_option_respects_exchange_override(#[case] value: &str) {
+        let instrument_id = InstrumentId::from(value);
+
+        let contract = instrument_id_to_ib_contract(instrument_id, Some("CBOE")).unwrap();
+
+        assert_eq!(contract.security_type, SecurityType::Option);
+        assert_eq!(contract.exchange.as_str(), "CBOE");
+    }
+
+    #[rstest]
+    #[case("AAPL.OPRA")]
+    #[case("SPY   abcdefP00511000.OPRA")]
+    #[case("P SPY 20240319 511.OPRA")]
+    fn test_invalid_opra_occ_option_returns_error(#[case] value: &str) {
+        let instrument_id = InstrumentId::from(value);
+
+        let result = instrument_id_to_ib_contract(instrument_id, None);
+
+        assert!(result.is_err());
+    }
+
+    #[rstest]
+    fn test_opra_route_does_not_create_reverse_smart_mapping() {
+        assert_eq!(exchange_to_mic_venue("SMART"), None);
+    }
+
+    #[rstest]
     fn test_instrument_id_to_ib_contract_parses_named_futures_symbol() {
         let instrument_id = InstrumentId::from("ESTX50 FESX 20240315.EUREX");
 
@@ -1367,6 +1530,86 @@ mod tests {
     }
 
     #[rstest]
+    fn test_instrument_id_to_ib_contract_parses_zerohash_crypto_symbol() {
+        // ZEROHASH is one of IB's crypto venues (alongside PAXOS).
+        let instrument_id = InstrumentId::from("BTC/USD.ZEROHASH");
+
+        let contract = instrument_id_to_ib_contract(instrument_id, None).unwrap();
+
+        assert_eq!(contract.security_type, SecurityType::Crypto);
+        assert_eq!(contract.exchange.as_str(), "ZEROHASH");
+        assert_eq!(contract.symbol.as_str(), "BTC");
+        assert_eq!(contract.currency.as_str(), "USD");
+        assert_eq!(contract.local_symbol.as_str(), "BTC.USD");
+    }
+
+    #[rstest]
+    fn test_ib_contract_to_instrument_id_simplified_derives_zerohash_crypto_venue() {
+        // Contract -> InstrumentId derives the venue from the ZEROHASH exchange.
+        let contract = Contract {
+            symbol: Symbol::from("BTC"),
+            security_type: SecurityType::Crypto,
+            exchange: Exchange::from("ZEROHASH"),
+            currency: Currency::from("USD"),
+            local_symbol: "BTC.USD".to_string(),
+            ..Default::default()
+        };
+
+        let instrument_id = ib_contract_to_instrument_id_simplified(&contract, None).unwrap();
+
+        assert_eq!(instrument_id, InstrumentId::from("BTC/USD.ZEROHASH"));
+    }
+
+    #[rstest]
+    fn test_ib_contract_to_instrument_id_simplified_falls_back_to_paxos_crypto_venue() {
+        // Contract -> InstrumentId falls back to PAXOS when no exchange is set,
+        // preserving backwards compatibility.
+        let contract = Contract {
+            symbol: Symbol::from("DOGE"),
+            security_type: SecurityType::Crypto,
+            currency: Currency::from("USD"),
+            local_symbol: "DOGE.USD".to_string(),
+            ..Default::default()
+        };
+
+        let instrument_id = ib_contract_to_instrument_id_simplified(&contract, None).unwrap();
+
+        assert_eq!(instrument_id, InstrumentId::from("DOGE/USD.PAXOS"));
+    }
+
+    #[rstest]
+    fn test_instrument_id_to_ib_contract_parses_paxos_crypto_symbol() {
+        // PAXOS remains a live IB crypto venue alongside ZEROHASH.
+        let instrument_id = InstrumentId::from("BTC/USD.PAXOS");
+
+        let contract = instrument_id_to_ib_contract(instrument_id, None).unwrap();
+
+        assert_eq!(contract.security_type, SecurityType::Crypto);
+        assert_eq!(contract.exchange.as_str(), "PAXOS");
+        assert_eq!(contract.symbol.as_str(), "BTC");
+        assert_eq!(contract.currency.as_str(), "USD");
+        assert_eq!(contract.local_symbol.as_str(), "BTC.USD");
+    }
+
+    #[rstest]
+    fn test_ib_contract_to_instrument_id_simplified_derives_paxos_crypto_venue() {
+        // A PAXOS contract derives the PAXOS venue from its exchange (not via the
+        // fallback), proving both venues are honored when explicitly set.
+        let contract = Contract {
+            symbol: Symbol::from("BTC"),
+            security_type: SecurityType::Crypto,
+            exchange: Exchange::from("PAXOS"),
+            currency: Currency::from("USD"),
+            local_symbol: "BTC.USD".to_string(),
+            ..Default::default()
+        };
+
+        let instrument_id = ib_contract_to_instrument_id_simplified(&contract, None).unwrap();
+
+        assert_eq!(instrument_id, InstrumentId::from("BTC/USD.PAXOS"));
+    }
+
+    #[rstest]
     fn test_instrument_id_to_ib_contract_uses_contfut_for_underlying() {
         let instrument_id = InstrumentId::from("ES.XCME");
 
@@ -1411,5 +1654,19 @@ mod tests {
         assert_eq!(contract.security_type, SecurityType::Future);
         assert_eq!(contract.exchange.as_str(), "CBOT");
         assert_eq!(contract.local_symbol.as_str(), "YMM6");
+    }
+
+    #[rstest]
+    fn test_instrument_id_to_ib_contract_default_stock_omits_local_symbol_and_currency() {
+        let instrument_id = InstrumentId::from("IUSA.IBIS");
+
+        let contract = instrument_id_to_ib_contract(instrument_id, Some("IBIS")).unwrap();
+
+        assert_eq!(contract.security_type, SecurityType::Stock);
+        assert_eq!(contract.symbol.as_str(), "IUSA");
+        assert_eq!(contract.exchange.as_str(), "SMART");
+        assert_eq!(contract.primary_exchange.as_str(), "IBIS");
+        assert!(contract.currency.as_str().is_empty());
+        assert!(contract.local_symbol.is_empty());
     }
 }

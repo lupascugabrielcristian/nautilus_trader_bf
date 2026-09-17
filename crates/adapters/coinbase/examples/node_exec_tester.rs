@@ -16,9 +16,11 @@
 //! Example demonstrating live execution testing with the Coinbase adapter on a
 //! spot product (`BTC-USD`).
 //!
+//! Edit the constants below to change the environment, target instrument, and order size.
+//!
 //! Run with: `cargo run --example coinbase-exec-tester --package nautilus-coinbase --features examples`
 //!
-//! Required environment variables:
+//! Required credential environment variables:
 //! - `COINBASE_API_KEY`: CDP API key name (`organizations/{org_id}/apiKeys/{key_id}`)
 //! - `COINBASE_API_SECRET`: PEM-encoded EC private key (ECDSA, not Ed25519)
 //!
@@ -28,12 +30,12 @@
 use ahash::AHashMap;
 use log::LevelFilter;
 use nautilus_coinbase::{
-    common::consts::COINBASE_CLIENT_ID,
-    config::{CoinbaseDataClientConfig, CoinbaseExecClientConfig},
+    common::{consts::COINBASE_CLIENT_ID, enums::CoinbaseEnvironment},
+    config::{CoinbaseDataClientConfig, CoinbaseExecutionClientConfig},
     factories::{CoinbaseDataClientFactory, CoinbaseExecutionClientFactory},
 };
 use nautilus_common::{enums::Environment, logging::logger::LoggerConfig};
-use nautilus_live::{config::LiveExecEngineConfig, node::LiveNode};
+use nautilus_live::{config::LiveExecutionEngineConfig, node::LiveNode};
 use nautilus_model::{
     enums::AccountType,
     identifiers::{AccountId, InstrumentId, StrategyId, TraderId},
@@ -43,6 +45,22 @@ use nautilus_testkit::testers::{ExecTester, ExecTesterConfig};
 use nautilus_trading::strategy::StrategyConfig;
 use ustr::Ustr;
 
+// WARNING: With `DRY_RUN = false`, this tester submits orders to the configured
+// environment and may use real funds. Set `DRY_RUN = true` to connect without
+// submitting orders or sending shutdown cancel/close commands.
+const DRY_RUN: bool = false;
+const COINBASE_ENVIRONMENT: CoinbaseEnvironment = CoinbaseEnvironment::Live;
+const TRADER_ID: &str = "TESTER-001";
+const ACCOUNT_ID: &str = "COINBASE-001";
+const NODE_NAME: &str = "COINBASE-EXEC-TESTER-001";
+const STRATEGY_ID: &str = "EXEC_TESTER-001";
+// Pick the product whose quote currency matches a funded wallet in the bound
+// portfolio. USD and USDC are separate accounts on Coinbase, and `POST /orders`
+// rejects with "account is not available" if the quote currency wallet does not
+// exist or is empty.
+const INSTRUMENT_ID: &str = "BTC-USDC.COINBASE";
+const ORDER_QTY: &str = "0.0001";
+
 // *** THIS IS A TEST STRATEGY WITH NO ALPHA ADVANTAGE WHATSOEVER. ***
 // *** IT IS NOT INTENDED TO BE USED TO TRADE LIVE WITH REAL MONEY. ***
 
@@ -51,23 +69,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
     let environment = Environment::Live;
-    let trader_id = TraderId::from("TESTER-001");
-    let account_id = AccountId::from("COINBASE-001");
-    let node_name = "COINBASE-EXEC-TESTER-001".to_string();
+    let coinbase_environment = COINBASE_ENVIRONMENT;
+    let trader_id = TraderId::from(TRADER_ID);
+    let account_id = AccountId::from(ACCOUNT_ID);
+    let node_name = NODE_NAME.to_string();
     let client_id = *COINBASE_CLIENT_ID;
-    // Pick the product whose quote currency matches a funded wallet in the
-    // bound portfolio. USD and USDC are separate accounts on Coinbase, and
-    // `POST /orders` rejects with "account is not available" if the quote
-    // currency wallet does not exist or is empty.
-    let instrument_id = InstrumentId::from("BTC-USDC.COINBASE");
+    let instrument_id = InstrumentId::from(INSTRUMENT_ID);
 
     let data_config = CoinbaseDataClientConfig {
+        environment: coinbase_environment,
         api_key: None,    // Will use 'COINBASE_API_KEY' env var
         api_secret: None, // Will use 'COINBASE_API_SECRET' env var
         ..Default::default()
     };
 
-    let exec_config = CoinbaseExecClientConfig {
+    let exec_config = CoinbaseExecutionClientConfig {
+        account_id,
+        environment: coinbase_environment,
         api_key: None,    // Will use 'COINBASE_API_KEY' env var
         api_secret: None, // Will use 'COINBASE_API_SECRET' env var
         // Cash dispatches the spot bootstrap and uses the /accounts endpoint;
@@ -81,13 +99,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let data_factory = CoinbaseDataClientFactory::new();
-    let exec_factory = CoinbaseExecutionClientFactory::new(trader_id, account_id);
+    let exec_factory = CoinbaseExecutionClientFactory::new();
 
     // The user-channel handler enriches missing `price` / `stop_price` /
     // `trigger_type` fields from REST on first sight, so external LIMIT and
     // STOP_LIMIT orders are safe under the default
     // `filter_unclaimed_external_orders=false`.
-    let exec_engine_config = LiveExecEngineConfig {
+    let exec_engine_config = LiveExecutionEngineConfig {
         open_check_interval_secs: Some(10.0),
         position_check_interval_secs: Some(30.0),
         ..Default::default()
@@ -113,16 +131,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_exec_client(None, Box::new(exec_factory), Box::new(exec_config))?
         .build()?;
 
-    let order_qty = Quantity::from("0.0001");
+    let order_qty = Quantity::from(ORDER_QTY);
+
     let tester_config = ExecTesterConfig::builder()
         .base(StrategyConfig {
-            strategy_id: Some(StrategyId::from("EXEC_TESTER-001")),
+            strategy_id: Some(StrategyId::from(STRATEGY_ID)),
             external_order_claims: Some(vec![instrument_id]),
             ..Default::default()
         })
         .instrument_id(instrument_id)
         .client_id(client_id)
         .order_qty(order_qty)
+        .dry_run(DRY_RUN)
         .tob_offset_ticks(500)
         .use_post_only(true)
         .enable_limit_buys(true)
@@ -133,7 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .close_positions_on_stop(true)
         .reduce_only_on_stop(false)
         .log_data(false)
-        .build();
+        .build()?;
 
     let tester = ExecTester::new(tester_config);
 

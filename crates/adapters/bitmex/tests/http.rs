@@ -33,6 +33,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
     routing::get,
 };
+use jiff::{Timestamp, civil::Date, tz::Offset};
 use nautilus_bitmex::{
     common::{
         consts::BITMEX_CLIENT_ID,
@@ -44,11 +45,13 @@ use nautilus_bitmex::{
         client::{BitmexHttpClient, BitmexRawHttpClient},
         query::{
             DeleteOrderParams, GetOrderParamsBuilder, GetPositionParamsBuilder,
-            PostCancelAllAfterParams, PostOrderParams,
+            GetTradeBucketedParamsBuilder, GetTradeParamsBuilder, PostCancelAllAfterParams,
+            PostOrderParams,
         },
     },
 };
 use nautilus_common::{
+    cache::InstrumentLookupError,
     clients::DataClient,
     live::runner::replace_data_event_sender,
     messages::{
@@ -59,14 +62,32 @@ use nautilus_common::{
 };
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
-    enums::{OrderSide, OrderType, TimeInForce},
+    data::BarType,
+    enums::{OrderSide, OrderStatus, OrderType, TimeInForce},
     identifiers::{ClientOrderId, InstrumentId},
     instruments::Instrument,
     types::Quantity,
 };
 use nautilus_network::http::HttpClient;
+use nautilus_testkit::events::drain_data_events;
 use rstest::rstest;
 use serde_json::{Value, json};
+
+fn utc_timestamp(year: i16, month: i8, day: i8, hour: i8, minute: i8, second: i8) -> Timestamp {
+    Offset::UTC
+        .to_timestamp(
+            Date::new(year, month, day)
+                .unwrap()
+                .at(hour, minute, second, 0),
+        )
+        .unwrap()
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RequiredInstrumentCachePath {
+    Bars,
+    BookSnapshot,
+}
 
 #[derive(Clone)]
 struct TestServerState {
@@ -188,6 +209,117 @@ async fn handle_get_orders(
     Json(orders).into_response()
 }
 
+async fn handle_get_order_book_l2(query: Query<HashMap<String, String>>) -> Response {
+    let symbol = query
+        .get("symbol")
+        .cloned()
+        .unwrap_or_else(|| "XBTUSD".to_string());
+
+    Json(json!([
+        {
+            "symbol": &symbol,
+            "id": 1,
+            "side": "Buy",
+            "size": 100,
+            "price": 95000.0
+        },
+        {
+            "symbol": &symbol,
+            "id": 2,
+            "side": "Sell",
+            "size": 200,
+            "price": 95001.0
+        }
+    ]))
+    .into_response()
+}
+
+async fn handle_get_funding(query: Query<HashMap<String, String>>) -> Response {
+    let symbol = query
+        .get("symbol")
+        .cloned()
+        .unwrap_or_else(|| "XBTUSD".to_string());
+    let start = query
+        .get("start")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let count = query
+        .get("count")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(500);
+    let rows = vec![
+        json!({
+            "timestamp": "2025-01-01T00:00:00.000Z",
+            "symbol": &symbol,
+            "fundingInterval": "2000-01-01T08:00:00.000Z",
+            "fundingRate": 0.0001,
+            "fundingRateDaily": 0.0003
+        }),
+        json!({
+            "timestamp": "2025-01-01T08:00:00.000Z",
+            "symbol": &symbol,
+            "fundingInterval": "2000-01-01T08:00:00.000Z",
+            "fundingRate": 0.0002,
+            "fundingRateDaily": 0.0006
+        }),
+        json!({
+            "timestamp": "2025-01-01T16:00:00.000Z",
+            "symbol": &symbol,
+            "fundingInterval": "2000-01-01T08:00:00.000Z",
+            "fundingRate": -0.0001,
+            "fundingRateDaily": -0.0003
+        }),
+    ];
+    let page: Vec<_> = rows.into_iter().skip(start).take(count).collect();
+
+    Json(page).into_response()
+}
+
+async fn handle_get_trades(query: Query<HashMap<String, String>>) -> Response {
+    let symbol = query
+        .get("symbol")
+        .cloned()
+        .unwrap_or_else(|| "XBTUSD".to_string());
+
+    Json(json!([{
+        "timestamp": "2025-01-01T00:00:00.000Z",
+        "symbol": symbol,
+        "side": "Buy",
+        "size": 100,
+        "price": 95000.0,
+        "tickDirection": "PlusTick",
+        "trdMatchID": "00000000-0000-0000-0000-000000000001",
+        "grossValue": 100000000,
+        "homeNotional": 0.001,
+        "foreignNotional": 95.0
+    }]))
+    .into_response()
+}
+
+async fn handle_get_trade_bucketed(query: Query<HashMap<String, String>>) -> Response {
+    let symbol = query
+        .get("symbol")
+        .cloned()
+        .unwrap_or_else(|| "XBTUSD".to_string());
+
+    Json(json!([{
+        "timestamp": "2025-01-01T00:00:00.000Z",
+        "symbol": symbol,
+        "open": 95000.0,
+        "high": 95100.0,
+        "low": 94900.0,
+        "close": 95050.0,
+        "trades": 10,
+        "volume": 1000,
+        "vwap": 95025.0,
+        "lastSize": 100,
+        "turnover": 1000000000,
+        "homeNotional": 0.01,
+        "foreignNotional": 950.0
+    }]))
+    .into_response()
+}
+
 async fn handle_post_order(headers: axum::http::HeaderMap, body: String) -> Response {
     if !headers.contains_key("api-key") || !headers.contains_key("api-signature") {
         return (
@@ -277,6 +409,24 @@ async fn handle_delete_order(headers: axum::http::HeaderMap, body: String) -> Re
         .into_response()
 }
 
+async fn handle_delete_all_orders(headers: axum::http::HeaderMap) -> Response {
+    if !headers.contains_key("api-key") || !headers.contains_key("api-signature") {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": { "message": "Invalid API Key.", "name": "HTTPError" }
+            })),
+        )
+            .into_response();
+    }
+
+    Json(vec![
+        load_test_data("http_cancel_all_close_race.json"),
+        load_test_data("http_cancel_all_canceled.json"),
+    ])
+    .into_response()
+}
+
 async fn handle_cancel_all_after(headers: axum::http::HeaderMap, body: String) -> Response {
     if !headers.contains_key("api-key") || !headers.contains_key("api-signature") {
         return (
@@ -308,8 +458,16 @@ fn create_test_router(state: TestServerState) -> Router {
         .route("/user/wallet", get(handle_get_wallet))
         .route("/position", get(handle_get_positions))
         .route("/order", get(handle_get_orders))
+        .route("/orderBook/L2", get(handle_get_order_book_l2))
+        .route("/funding", get(handle_get_funding))
+        .route("/trade", get(handle_get_trades))
+        .route("/trade/bucketed", get(handle_get_trade_bucketed))
         .route("/order", axum::routing::post(handle_post_order))
         .route("/order", axum::routing::delete(handle_delete_order))
+        .route(
+            "/order/all",
+            axum::routing::delete(handle_delete_all_orders),
+        )
         .route(
             "/order/cancelAllAfter",
             axum::routing::post(handle_cancel_all_after),
@@ -331,8 +489,7 @@ async fn start_test_server()
 
     // Wait for server to be ready
     let health_url = format!("http://{addr}/instrument/active");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    let http_client = HttpClient::builder().build().unwrap();
     wait_until_async(
         || {
             let url = health_url.clone();
@@ -344,18 +501,6 @@ async fn start_test_server()
     .await;
 
     Ok((addr, state))
-}
-
-async fn drain_data_events(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
-    timeout: Duration,
-) -> Vec<DataEvent> {
-    let mut events = Vec::new();
-    let deadline = tokio::time::Instant::now() + timeout;
-    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
-        events.push(event);
-    }
-    events
 }
 
 fn instrument_response(events: &[DataEvent]) -> Option<&InstrumentResponse> {
@@ -377,6 +522,50 @@ fn create_data_client(addr: SocketAddr) -> BitmexDataClient {
     };
 
     BitmexDataClient::new(*BITMEX_CLIENT_ID, config).expect("BitMEX data client")
+}
+
+#[rstest]
+#[case::bars(RequiredInstrumentCachePath::Bars)]
+#[case::book_snapshot(RequiredInstrumentCachePath::BookSnapshot)]
+#[tokio::test]
+async fn test_public_market_data_request_missing_cached_instrument_returns_lookup_error(
+    #[case] path: RequiredInstrumentCachePath,
+) {
+    let client = BitmexHttpClient::new(
+        Some("http://127.0.0.1:9".to_string()),
+        None,
+        None,
+        BitmexEnvironment::Mainnet,
+        1,
+        0,
+        1,
+        1,
+        1,
+        10,
+        30,
+        None,
+    )
+    .unwrap();
+    let instrument_id = InstrumentId::from_str("XBTUSD.BITMEX").unwrap();
+
+    let result = match path {
+        RequiredInstrumentCachePath::Bars => {
+            let bar_type = BarType::from("XBTUSD.BITMEX-1-MINUTE-LAST-EXTERNAL");
+            client
+                .request_bars(bar_type, None, None, None, false)
+                .await
+                .map(|_| ())
+        }
+        RequiredInstrumentCachePath::BookSnapshot => client
+            .request_book_snapshot(instrument_id, None)
+            .await
+            .map(|_| ()),
+    };
+
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        InstrumentLookupError::not_found(instrument_id).to_string()
+    );
 }
 
 #[rstest]
@@ -437,6 +626,121 @@ async fn test_request_instrument() {
     assert!(instrument.is_some());
     let instrument = instrument.unwrap();
     assert_eq!(instrument.id(), instrument_id);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_book_snapshot() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{addr}");
+
+    let client = BitmexHttpClient::new(
+        Some(base_url),
+        None,
+        None,
+        BitmexEnvironment::Mainnet,
+        60,
+        3,
+        1_000,
+        10_000,
+        10_000,
+        10,
+        120,
+        None,
+    )
+    .unwrap();
+
+    let instrument_id = InstrumentId::from_str("XBTUSD.BITMEX").unwrap();
+    let instrument = client
+        .request_instrument(instrument_id)
+        .await
+        .unwrap()
+        .unwrap();
+    client.cache_instrument(instrument);
+
+    let book = client
+        .request_book_snapshot(instrument_id, Some(2))
+        .await
+        .unwrap();
+
+    assert_eq!(book.bids(None).count(), 1);
+    assert_eq!(book.asks(None).count(), 1);
+    assert_eq!(book.best_bid_price().unwrap().to_string(), "95000.0");
+    assert_eq!(book.best_ask_price().unwrap().to_string(), "95001.0");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_funding_rates() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{addr}");
+
+    let client = BitmexHttpClient::new(
+        Some(base_url),
+        None,
+        None,
+        BitmexEnvironment::Mainnet,
+        60,
+        3,
+        1_000,
+        10_000,
+        10_000,
+        10,
+        120,
+        None,
+    )
+    .unwrap();
+
+    let instrument_id = InstrumentId::from_str("XBTUSD.BITMEX").unwrap();
+    let start = utc_timestamp(2025, 1, 1, 0, 0, 0);
+    let end = utc_timestamp(2025, 1, 1, 8, 0, 0);
+    let rates = client
+        .request_funding_rates(instrument_id, Some(start), Some(end), Some(3))
+        .await
+        .unwrap();
+
+    assert_eq!(rates.len(), 2);
+    assert_eq!(rates[0].instrument_id, instrument_id);
+    assert_eq!(rates[0].rate.to_string(), "0.0001");
+    assert_eq!(rates[0].interval, Some(480));
+    assert_eq!(rates[0].ts_init, rates[0].ts_event);
+    assert_eq!(rates[1].rate.to_string(), "0.0002");
+    assert_eq!(rates[1].ts_init, rates[1].ts_event);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_public_trade_endpoints_do_not_require_credentials() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{addr}");
+
+    let client =
+        BitmexRawHttpClient::new(Some(base_url), 60, 3, 1_000, 10_000, 10_000, 10, 30, None)
+            .unwrap();
+    let trades = client
+        .get_trades(
+            GetTradeParamsBuilder::default()
+                .symbol("XBTUSD")
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bins = client
+        .get_trade_bucketed(
+            GetTradeBucketedParamsBuilder::default()
+                .symbol("XBTUSD")
+                .bin_size("1m")
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(trades.len(), 1);
+    assert_eq!(trades[0].symbol.as_str(), "XBTUSD");
+    assert_eq!(bins.len(), 1);
+    assert_eq!(bins[0].symbol.as_str(), "XBTUSD");
 }
 
 #[rstest]
@@ -643,6 +947,54 @@ async fn test_cancel_order() {
     assert_eq!(result_array[0]["ordStatus"], "Canceled");
 }
 
+#[rstest]
+#[tokio::test]
+async fn test_cancel_all_orders_skips_invalid_order_rejection() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{addr}");
+    let client = BitmexHttpClient::new(
+        Some(base_url),
+        Some("test_api_key".to_string()),
+        Some("test_api_secret".to_string()),
+        BitmexEnvironment::Mainnet,
+        60,
+        3,
+        1_000,
+        10_000,
+        10_000,
+        10,
+        120,
+        None,
+    )
+    .unwrap();
+    let instrument_id = InstrumentId::from_str("XBTUSD.BITMEX").unwrap();
+    let instrument = client
+        .request_instrument(instrument_id)
+        .await
+        .unwrap()
+        .unwrap();
+    client.cache_instrument(instrument);
+
+    let reports = client.cancel_all_orders(instrument_id, None).await.unwrap();
+
+    assert_eq!(reports.len(), 1);
+    let report = &reports[0];
+    assert_eq!(
+        report.venue_order_id.as_str(),
+        "550e8400-e29b-41d4-a716-446655440003"
+    );
+    assert_eq!(
+        report.client_order_id,
+        Some(ClientOrderId::from("cancel-control"))
+    );
+    assert_eq!(report.order_side, Some(OrderSide::Buy));
+    assert_eq!(report.order_type, OrderType::Limit);
+    assert_eq!(report.time_in_force, TimeInForce::Gtc);
+    assert_eq!(report.order_status, OrderStatus::Canceled);
+    assert_eq!(report.quantity, Quantity::from("100"));
+    assert_eq!(report.filled_qty, Quantity::from("0"));
+}
+
 // Test that HTTP client correctly implements rate limiting per BitMEX API requirements.
 //
 // This test verifies that the client respects rate limits by making 6 HTTP requests and checking
@@ -756,8 +1108,7 @@ async fn test_http_network_error() {
     let base_url = "http://127.0.0.1:1".to_string();
 
     let client =
-        BitmexRawHttpClient::new(Some(base_url), 1, 3, 1_000, 10_000, 10_000, 10, 30, None)
-            .unwrap();
+        BitmexRawHttpClient::new(Some(base_url), 1, 0, 1, 1, 10_000, 10, 30, None).unwrap();
 
     let result = client.get_instruments(false).await;
 
@@ -785,8 +1136,7 @@ async fn test_http_500_internal_server_error() {
 
     // Wait for server to be ready
     let health_url = format!("http://{addr}/instrument");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    let http_client = HttpClient::builder().build().unwrap();
     wait_until_async(
         || {
             let url = health_url.clone();
@@ -799,8 +1149,7 @@ async fn test_http_500_internal_server_error() {
 
     let base_url = format!("http://{addr}");
     let client =
-        BitmexRawHttpClient::new(Some(base_url), 60, 3, 1_000, 10_000, 10_000, 10, 30, None)
-            .unwrap();
+        BitmexRawHttpClient::new(Some(base_url), 60, 0, 1, 1, 10_000, 10, 30, None).unwrap();
 
     let result = client.get_instruments(false).await;
 

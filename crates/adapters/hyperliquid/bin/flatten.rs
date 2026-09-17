@@ -19,7 +19,7 @@
 //! `Inverse` product types. Spot and HIP-4 outcome orders/positions are
 //! intentionally out of scope: spot holdings are token balances rather than
 //! derivative positions, and "flattening" them would mean dumping into a
-//! different quote asset — a real trade decision rather than cleanup. Working
+//! different quote asset - a real trade decision rather than cleanup. Working
 //! orders on those product types are left untouched and will continue to be
 //! eligible to fill after this binary exits.
 //!
@@ -48,9 +48,10 @@ use nautilus_hyperliquid::{
     http::{
         client::HyperliquidHttpClient,
         models::{
-            HyperliquidExchangeResponse, HyperliquidExecAction, HyperliquidExecCancelOrderRequest,
-            HyperliquidExecGrouping, HyperliquidExecLimitParams, HyperliquidExecOrderKind,
-            HyperliquidExecPlaceOrderRequest, HyperliquidExecTif, HyperliquidL2Book,
+            HyperliquidExchangeAction, HyperliquidExchangeCancelOrderRequest,
+            HyperliquidExchangeGrouping, HyperliquidExchangeLimitParams,
+            HyperliquidExchangeOrderKind, HyperliquidExchangePlaceOrderRequest,
+            HyperliquidExchangeResponse, HyperliquidExchangeTif, HyperliquidL2Book,
         },
     },
 };
@@ -110,8 +111,7 @@ async fn main() -> anyhow::Result<()> {
         .iter()
         .filter(|inst| {
             HyperliquidProductType::from_symbol(inst.id().symbol.as_str())
-                .ok()
-                .is_some_and(|pt| pt == HyperliquidProductType::Perp)
+                .is_ok_and(|pt| pt == HyperliquidProductType::Perp)
         })
         .map(|inst| (inst.raw_symbol().inner(), inst))
         .collect();
@@ -146,7 +146,12 @@ async fn cancel_open_orders(
     }
 
     log::info!("Cancelling {} open perp order(s)", cancels.len());
-    let action = HyperliquidExecAction::Cancel { cancels };
+    // Flatten cancels a mixed bag of order types (trigger orders can't be fast-cancelled)
+    // and the frontend open-orders parse does not track type, so omit the fast flag here.
+    let action = HyperliquidExchangeAction::Cancel {
+        cancels,
+        fast: None,
+    };
     let response = client
         .post_action_exec(&action)
         .await
@@ -172,7 +177,7 @@ async fn fetch_open_perp_cancels(
     client: &HyperliquidHttpClient,
     user: &str,
     perp_by_coin: &AHashMap<Ustr, &InstrumentAny>,
-) -> anyhow::Result<Vec<HyperliquidExecCancelOrderRequest>> {
+) -> anyhow::Result<Vec<HyperliquidExchangeCancelOrderRequest>> {
     let raw = client.info_frontend_open_orders(user).await?;
     parse_perp_cancels(&raw, perp_by_coin, |symbol| client.get_asset_index(symbol))
 }
@@ -182,7 +187,7 @@ fn parse_perp_cancels<F>(
     raw: &serde_json::Value,
     perp_by_coin: &AHashMap<Ustr, &InstrumentAny>,
     mut asset_index: F,
-) -> anyhow::Result<Vec<HyperliquidExecCancelOrderRequest>>
+) -> anyhow::Result<Vec<HyperliquidExchangeCancelOrderRequest>>
 where
     F: FnMut(&str) -> Option<u32>,
 {
@@ -210,7 +215,7 @@ where
         let asset = asset_index(instrument.id().symbol.as_str()).ok_or_else(|| {
             anyhow::anyhow!("Asset index unresolved for perp coin {coin_str}; cannot cancel")
         })?;
-        cancels.push(HyperliquidExecCancelOrderRequest { asset, oid });
+        cancels.push(HyperliquidExchangeCancelOrderRequest { asset, oid });
     }
     Ok(cancels)
 }
@@ -315,23 +320,23 @@ async fn close_position(
         if is_buy { "BUY" } else { "SELL" },
     );
 
-    let order = HyperliquidExecPlaceOrderRequest {
+    let order = HyperliquidExchangePlaceOrderRequest {
         asset,
         is_buy,
         price,
         size: close_qty.normalize(),
         reduce_only: true,
-        kind: HyperliquidExecOrderKind::Limit {
-            limit: HyperliquidExecLimitParams {
-                tif: HyperliquidExecTif::Ioc,
+        kind: HyperliquidExchangeOrderKind::Limit {
+            limit: HyperliquidExchangeLimitParams {
+                tif: HyperliquidExchangeTif::Ioc,
             },
         },
         cloid: None,
     };
 
-    let action = HyperliquidExecAction::Order {
+    let action = HyperliquidExchangeAction::Order {
         orders: vec![order],
-        grouping: HyperliquidExecGrouping::Na,
+        grouping: HyperliquidExchangeGrouping::Na,
         builder: None,
     };
     let response = client.post_action_exec(&action).await?;
@@ -346,7 +351,7 @@ fn top_of_book_reference(book: &HyperliquidL2Book, is_buy: bool) -> Option<Decim
     // levels[0] = bids, levels[1] = asks; close-BUY (cover short) targets asks
     let side = usize::from(is_buy);
     let level = book.levels.get(side).and_then(|v| v.first())?;
-    Decimal::from_str(&level.px).ok()
+    Some(level.px)
 }
 
 fn check_response(context: &str, response: &HyperliquidExchangeResponse) -> anyhow::Result<()> {
@@ -398,33 +403,26 @@ mod tests {
     use super::*;
 
     fn btc_perp() -> InstrumentAny {
-        InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
-            InstrumentId::new(Symbol::new("BTC-USD-PERP"), *HYPERLIQUID_VENUE),
-            Symbol::new("BTC"),
-            Currency::from("BTC"),
-            Currency::from("USDC"),
-            Currency::from("USDC"),
-            false,
-            2,
-            3,
-            Price::from("0.01"),
-            Quantity::from("0.001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        ))
+        InstrumentAny::CryptoPerpetual(
+            CryptoPerpetual::builder()
+                .instrument_id(InstrumentId::new(
+                    Symbol::new("BTC-USD-PERP"),
+                    *HYPERLIQUID_VENUE,
+                ))
+                .raw_symbol(Symbol::new("BTC"))
+                .base_currency(Currency::from("BTC"))
+                .quote_currency(Currency::from("USDC"))
+                .settlement_currency(Currency::from("USDC"))
+                .is_inverse(false)
+                .price_precision(2)
+                .size_precision(3)
+                .price_increment(Price::from("0.01"))
+                .size_increment(Quantity::from("0.001"))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
     }
 
     fn book_with(bids: &[(&str, &str)], asks: &[(&str, &str)]) -> HyperliquidL2Book {
@@ -432,8 +430,8 @@ mod tests {
             entries
                 .iter()
                 .map(|(px, sz)| HyperliquidLevel {
-                    px: (*px).to_string(),
-                    sz: (*sz).to_string(),
+                    px: Decimal::from_str(px).unwrap(),
+                    sz: Decimal::from_str(sz).unwrap(),
                 })
                 .collect()
         };

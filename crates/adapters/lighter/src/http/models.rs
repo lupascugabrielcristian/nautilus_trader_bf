@@ -24,11 +24,12 @@ use nautilus_core::serialization::{
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize, de};
 use ustr::Ustr;
+use zeroize::ZeroizeOnDrop;
 
 use crate::common::enums::{
     LighterCandleResolution, LighterFundingResolution, LighterMarketStatus, LighterOrderKind,
     LighterOrderSide, LighterOrderStatus, LighterOrderTimeInForce, LighterPositionMarginMode,
-    LighterProductType, LighterTradeType, LighterTriggerStatus,
+    LighterProductType, LighterTradeType, LighterTriggerStatus, LighterTxStatus,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -50,15 +51,32 @@ pub struct LighterNextNonce {
     pub nonce: i64,
 }
 
+/// Response payload of `GET /api/v1/tx`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LighterTx {
+    pub code: i32,
+    pub message: Option<String>,
+    pub hash: String,
+    #[serde(rename = "type")]
+    pub tx_type: u8,
+    pub info: String,
+    pub event_info: String,
+    pub status: LighterTxStatus,
+    pub account_index: i64,
+    pub nonce: i64,
+    pub api_key_index: u8,
+}
+
 /// One account row from `GET /api/v1/account`.
 ///
 /// Models only the fields the adapter consumes; the venue response carries
 /// many more, which are ignored on deserialization.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, ZeroizeOnDrop)]
 pub struct LighterAccountDetail {
     pub account_index: u64,
     pub account_type: u8,
     pub status: i32,
+    pub l1_address: String,
 }
 
 /// Response payload of `GET /api/v1/account`.
@@ -67,6 +85,7 @@ pub struct LighterAccountsResponse {
     pub code: i32,
     pub message: Option<String>,
     pub total: i64,
+    #[serde(default, deserialize_with = "deserialize_null_vec")]
     pub accounts: Vec<LighterAccountDetail>,
 }
 
@@ -74,7 +93,7 @@ pub struct LighterAccountsResponse {
 ///
 /// Lighter restricts maker-only keys to the 0ms speed-bump lane (PostOnly
 /// creates, modifies on ALO orders, cancel / cancel-all). Any tx kind outside
-/// that allowlist — for example `ApproveIntegrator` (tx_type 45) — is rejected
+/// that allowlist - for example `ApproveIntegrator` (tx_type 45) - is rejected
 /// with venue code `62007`. The adapter pre-flights this endpoint before
 /// submitting the integrator auto-approval so it can skip the doomed tx with
 /// a clear log line instead of swallowing the misleading 62007.
@@ -159,6 +178,7 @@ pub struct LighterSendTxResponse {
 pub struct LighterSendTxBatchResponse {
     pub code: i32,
     pub message: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_null_vec")]
     pub tx_hash: Vec<String>,
     pub predicted_execution_time_ms: i64,
     pub volume_quota_remaining: Option<i64>,
@@ -576,6 +596,41 @@ mod tests {
         assert_eq!(account.account_index, 123_456);
         assert_eq!(account.account_type, 0);
         assert_eq!(account.status, 1);
+        assert_eq!(
+            account.l1_address,
+            "0x0000000000000000000000000000000000000000"
+        );
+    }
+
+    #[rstest]
+    fn test_account_response_allows_missing_or_null_accounts() {
+        let missing = serde_json::json!({"code": 200, "total": 0});
+        let null = serde_json::json!({"code": 200, "total": 0, "accounts": null});
+
+        let missing: LighterAccountsResponse = serde_json::from_value(missing).unwrap();
+        let null: LighterAccountsResponse = serde_json::from_value(null).unwrap();
+
+        assert!(missing.accounts.is_empty());
+        assert!(null.accounts.is_empty());
+    }
+
+    #[rstest]
+    fn test_send_tx_batch_response_allows_missing_or_null_tx_hash() {
+        let missing = serde_json::json!({
+            "code": 200,
+            "predicted_execution_time_ms": 1_751_465_475,
+        });
+        let null = serde_json::json!({
+            "code": 200,
+            "tx_hash": null,
+            "predicted_execution_time_ms": 1_751_465_475,
+        });
+
+        let missing: LighterSendTxBatchResponse = serde_json::from_value(missing).unwrap();
+        let null: LighterSendTxBatchResponse = serde_json::from_value(null).unwrap();
+
+        assert!(missing.tx_hash.is_empty());
+        assert!(null.tx_hash.is_empty());
     }
 
     #[rstest]
@@ -659,6 +714,41 @@ mod tests {
         assert_eq!(candles.code, 200);
         assert_eq!(candles.resolution, LighterCandleResolution::OneMinute);
         assert!(candles.candles.is_empty());
+    }
+
+    #[rstest]
+    #[case("o")]
+    #[case("h")]
+    #[case("l")]
+    #[case("c")]
+    fn test_candle_missing_or_null_ohlc_deserializes_as_zero(#[case] field: &str) {
+        let base = serde_json::json!({
+            "t": 1_700_000_000_000_i64,
+            "o": "1",
+            "h": "1",
+            "l": "1",
+            "c": "1",
+            "v": "1",
+            "V": "1",
+            "i": 1,
+        });
+        let mut missing = base.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        let mut null = base;
+        null[field] = serde_json::Value::Null;
+
+        let missing: LighterCandle = serde_json::from_value(missing).unwrap();
+        let null: LighterCandle = serde_json::from_value(null).unwrap();
+        let value_for = |candle: &LighterCandle| match field {
+            "o" => candle.open,
+            "h" => candle.high,
+            "l" => candle.low,
+            "c" => candle.close,
+            _ => unreachable!(),
+        };
+
+        assert_eq!(value_for(&missing), Decimal::ZERO);
+        assert_eq!(value_for(&null), Decimal::ZERO);
     }
 
     #[rstest]

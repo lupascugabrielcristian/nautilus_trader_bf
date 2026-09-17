@@ -15,13 +15,11 @@
 
 //! Provides a `Cache` database backing.
 
-// Under development
-#![allow(dead_code)]
-#![allow(unused_variables)]
+use std::fmt::Debug;
 
 use ahash::AHashMap;
 use bytes::Bytes;
-use nautilus_core::UnixNanos;
+use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     accounts::AccountAny,
     data::{
@@ -30,8 +28,8 @@ use nautilus_model::{
     },
     events::{OrderEventAny, OrderSnapshot, position::snapshot::PositionSnapshot},
     identifiers::{
-        AccountId, ClientId, ClientOrderId, ComponentId, InstrumentId, PositionId, StrategyId,
-        VenueOrderId,
+        AccountId, ActorId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId,
+        TraderId, VenueOrderId,
     },
     instruments::{InstrumentAny, SyntheticInstrument},
     orderbook::OrderBook,
@@ -41,6 +39,7 @@ use nautilus_model::{
 };
 use ustr::Ustr;
 
+use super::config::CacheConfig;
 use crate::signal::Signal;
 
 #[derive(Debug, Default)]
@@ -53,6 +52,25 @@ pub struct CacheMap {
     pub positions: AHashMap<PositionId, Position>,
     pub greeks: AHashMap<InstrumentId, GreeksData>,
     pub yield_curves: AHashMap<String, YieldCurveData>,
+}
+
+/// Factory for constructing cache database adapters at runtime.
+///
+/// Implementations own the concrete database configuration and return the transport-neutral
+/// [`CacheDatabaseAdapter`] surface used by the cache.
+#[async_trait::async_trait]
+pub trait CacheDatabaseFactory: Debug + Send + Sync {
+    /// Creates a cache database adapter for the given cache runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if adapter construction or connection setup fails.
+    async fn create(
+        &self,
+        trader_id: TraderId,
+        instance_id: UUID4,
+        config: CacheConfig,
+    ) -> anyhow::Result<Box<dyn CacheDatabaseAdapter>>;
 }
 
 #[async_trait::async_trait]
@@ -208,12 +226,12 @@ pub trait CacheDatabaseAdapter {
     /// Returns an error if loading a single position fails.
     async fn load_position(&self, position_id: &PositionId) -> anyhow::Result<Option<Position>>;
 
-    /// Loads actor state by component ID.
+    /// Loads actor state by actor ID.
     ///
     /// # Errors
     ///
     /// Returns an error if loading actor state fails.
-    fn load_actor(&self, component_id: &ComponentId) -> anyhow::Result<AHashMap<String, Bytes>>;
+    fn load_actor(&self, actor_id: &ActorId) -> anyhow::Result<AHashMap<String, Bytes>>;
 
     /// Loads strategy state by strategy ID.
     ///
@@ -404,7 +422,7 @@ pub trait CacheDatabaseAdapter {
     /// # Errors
     ///
     /// Returns an error if adding greeks data fails.
-    fn add_greeks(&self, greeks: &GreeksData) -> anyhow::Result<()> {
+    fn add_greeks(&self, _greeks: &GreeksData) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -413,7 +431,7 @@ pub trait CacheDatabaseAdapter {
     /// # Errors
     ///
     /// Returns an error if adding yield curve data fails.
-    fn add_yield_curve(&self, yield_curve: &YieldCurveData) -> anyhow::Result<()> {
+    fn add_yield_curve(&self, _yield_curve: &YieldCurveData) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -422,7 +440,7 @@ pub trait CacheDatabaseAdapter {
     /// # Errors
     ///
     /// Returns an error if deleting actor state fails.
-    fn delete_actor(&self, component_id: &ComponentId) -> anyhow::Result<()>;
+    fn delete_actor(&self, actor_id: &ActorId) -> anyhow::Result<()>;
 
     /// Deletes strategy state from the cache.
     ///
@@ -474,6 +492,19 @@ pub trait CacheDatabaseAdapter {
         position_id: PositionId,
     ) -> anyhow::Result<()>;
 
+    /// Indexes order-client mappings as one batch operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if batch order-client indexing is unsupported or cannot be enqueued.
+    fn index_order_clients(&self, claims: &[(ClientOrderId, ClientId)]) -> anyhow::Result<()> {
+        if claims.is_empty() {
+            return Ok(());
+        }
+
+        anyhow::bail!("Batch order-client indexing is not supported by this cache database")
+    }
+
     /// Updates actor state in the cache.
     ///
     /// # Errors
@@ -481,7 +512,7 @@ pub trait CacheDatabaseAdapter {
     /// Returns an error if updating actor state fails.
     fn update_actor(
         &self,
-        component_id: &ComponentId,
+        actor_id: &ActorId,
         state: &AHashMap<String, Bytes>,
     ) -> anyhow::Result<()>;
 

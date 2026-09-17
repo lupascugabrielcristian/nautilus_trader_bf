@@ -21,7 +21,7 @@
 //! and the next two upcoming periods across BTC, ETH, SOL, and XRP.
 //!
 //! Because [`MarketSlugFilter`] accepts a closure, the slug list is
-//! re-evaluated on each `load_all()` call — so a long-running process can
+//! re-evaluated on each `load_all()` call - so a long-running process can
 //! call `load_all()` periodically and always get the latest time window
 //! without rebuilding the filter.
 //!
@@ -83,10 +83,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for instrument in instruments {
         let id = Instrument::id(instrument);
         let expiration = Instrument::expiration_ns(instrument).map_or("N/A".to_string(), |ns| {
-            let secs = (ns.as_u64() / 1_000_000_000) as i64;
-            chrono::DateTime::from_timestamp(secs, 0).map_or("N/A".to_string(), |dt| {
-                dt.format("%Y-%m-%d %H:%M UTC").to_string()
-            })
+            ns.to_datetime_utc()
+                .strftime("%Y-%m-%d %H:%M UTC")
+                .to_string()
         });
 
         if let InstrumentAny::BinaryOption(opt) = instrument {

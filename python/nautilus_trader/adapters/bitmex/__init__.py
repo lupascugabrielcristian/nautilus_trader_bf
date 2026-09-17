@@ -12,12 +12,26 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
+"""
+Integration adapter for the BitMEX exchange.
+"""
 
 from __future__ import annotations
 
 from nautilus_trader._fixup import fixup_module_names
 from nautilus_trader._libnautilus.bitmex import *  # noqa: F403 (undefined-local-with-import-star)
 
+
+__all__ = [
+    "BITMEX",
+    "BITMEX_CLIENT_ID",
+    "BITMEX_VENUE",
+    "BitmexDataClientConfig",
+    "BitmexDataClientFactory",
+    "BitmexEnvironment",
+    "BitmexExecutionClientConfig",
+    "BitmexExecutionClientFactory",
+]
 
 fixup_module_names(globals(), __name__)
 del fixup_module_names

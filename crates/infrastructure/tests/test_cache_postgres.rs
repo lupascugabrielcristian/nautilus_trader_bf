@@ -26,9 +26,14 @@ pub fn get_cache(cache_database: Option<Box<dyn CacheDatabaseAdapter>>) -> Cache
 mod serial_tests {
     use std::time::Duration;
 
+    use ahash::AHashMap;
+    use bytes::Bytes;
     use nautilus_common::{cache::database::CacheDatabaseAdapter, testing::wait_until_async};
     use nautilus_core::UUID4;
-    use nautilus_infrastructure::sql::{cache::get_pg_cache_database, queries::DatabaseQueries};
+    use nautilus_infrastructure::sql::{
+        cache::{PostgresCacheDatabase, get_pg_cache_database},
+        queries::DatabaseQueries,
+    };
     use nautilus_model::{
         accounts::AccountAny,
         enums::{CurrencyType, OrderSide, OrderType},
@@ -37,8 +42,8 @@ mod serial_tests {
             order::spec::{OrderCancelRejectedSpec, OrderModifyRejectedSpec},
         },
         identifiers::{
-            AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId,
-            TraderId, VenueOrderId,
+            AccountId, ActorId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId,
+            TradeId, TraderId, VenueOrderId,
         },
         instruments::{
             Instrument, InstrumentAny,
@@ -52,10 +57,22 @@ mod serial_tests {
 
     use crate::get_cache;
 
+    async fn get_test_pg_cache_database() -> anyhow::Result<PostgresCacheDatabase> {
+        match tokio::time::timeout(Duration::from_secs(2), get_pg_cache_database()).await {
+            Ok(result) => result.map_err(|e| {
+                anyhow::anyhow!("A running PostgreSQL service is required for this test: {e}")
+            }),
+            Err(e) => Err(anyhow::anyhow!(
+                "A running PostgreSQL service is required for this test: connection timed out: \
+                 {e}"
+            )),
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_cache_instruments() {
-        let mut database = get_pg_cache_database().await.unwrap();
-        let mut cache = get_cache(Some(Box::new(get_pg_cache_database().await.unwrap())));
+        let mut database = get_test_pg_cache_database().await.unwrap();
+        let mut cache = get_cache(Some(Box::new(get_test_pg_cache_database().await.unwrap())));
 
         let eth = Currency::new("ETH", 2, 0, "ETH", CurrencyType::Crypto);
         let usdt = Currency::new("USDT", 2, 0, "USDT", CurrencyType::Crypto);
@@ -91,8 +108,8 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_cache_orders() {
-        let mut database = get_pg_cache_database().await.unwrap();
-        let mut cache = get_cache(Some(Box::new(get_pg_cache_database().await.unwrap())));
+        let mut database = get_test_pg_cache_database().await.unwrap();
+        let mut cache = get_cache(Some(Box::new(get_test_pg_cache_database().await.unwrap())));
 
         let instrument = currency_pair_ethusdt();
         let market_order = OrderTestBuilder::new(OrderType::Market)
@@ -100,6 +117,7 @@ mod serial_tests {
             .side(OrderSide::Buy)
             .quantity(Quantity::from("1.0"))
             .client_order_id(ClientOrderId::new("O-19700101-0000-001-001-1"))
+            .tags(vec![Ustr::from("tag-1"), Ustr::from("tag-2")])
             .build();
 
         // Add foreign key dependencies: instrument and currencies
@@ -140,8 +158,8 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_restart_recovery_restores_order_indexes() {
-        let mut database = get_pg_cache_database().await.unwrap();
-        let mut cache = get_cache(Some(Box::new(get_pg_cache_database().await.unwrap())));
+        let mut database = get_test_pg_cache_database().await.unwrap();
+        let mut cache = get_cache(Some(Box::new(get_test_pg_cache_database().await.unwrap())));
 
         let instrument = currency_pair_ethusdt();
         let client_id = ClientId::new("TEST");
@@ -213,8 +231,8 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_restart_recovery_restores_positions() {
-        let mut database = get_pg_cache_database().await.unwrap();
-        let mut cache = get_cache(Some(Box::new(get_pg_cache_database().await.unwrap())));
+        let mut database = get_test_pg_cache_database().await.unwrap();
+        let mut cache = get_cache(Some(Box::new(get_test_pg_cache_database().await.unwrap())));
 
         let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
         database
@@ -299,8 +317,8 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_cache_accounts() {
-        let mut database = get_pg_cache_database().await.unwrap();
-        let mut cache = get_cache(Some(Box::new(get_pg_cache_database().await.unwrap())));
+        let mut database = get_test_pg_cache_database().await.unwrap();
+        let mut cache = get_cache(Some(Box::new(get_test_pg_cache_database().await.unwrap())));
 
         let account = AccountAny::default();
         let last_event = account.last_event().unwrap();
@@ -332,6 +350,104 @@ mod serial_tests {
         database.close().unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_all_and_unsupported_loads_return_results() {
+        let mut database = get_test_pg_cache_database().await.unwrap();
+        database.flush().unwrap();
+
+        let loaded = database.load_all().await.unwrap();
+        let synthetic_result = database
+            .load_synthetic(&InstrumentId::from("SYNTHETIC.SYNTH"))
+            .await;
+        let actor_result = database.load_actor(&ActorId::from("ACTOR-001"));
+        let strategy_result = database.load_strategy(&StrategyId::from("STRATEGY-001"));
+        let state = AHashMap::from([("state".to_string(), Bytes::from_static(b"value"))]);
+        let actor_update_result = database.update_actor(&ActorId::from("ACTOR-001"), &state);
+        let strategy_update_result =
+            database.update_strategy(&StrategyId::from("STRATEGY-001"), &state);
+
+        assert!(loaded.synthetics.is_empty());
+        assert!(synthetic_result.is_err());
+        assert_eq!(
+            actor_result.unwrap_err().to_string(),
+            "load_actor not implemented for PostgreSQL cache adapter: ACTOR-001"
+        );
+        assert_eq!(
+            strategy_result.unwrap_err().to_string(),
+            "load_strategy not implemented for PostgreSQL cache adapter: STRATEGY-001"
+        );
+        assert_eq!(
+            actor_update_result.unwrap_err().to_string(),
+            "update_actor not implemented for PostgreSQL cache adapter: ACTOR-001"
+        );
+        assert_eq!(
+            strategy_update_result.unwrap_err().to_string(),
+            "update_strategy not implemented for PostgreSQL cache adapter: STRATEGY-001"
+        );
+
+        database.close().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_all_registers_persisted_currencies_before_instruments() {
+        let mut database = get_test_pg_cache_database().await.unwrap();
+        database.flush().unwrap();
+
+        let currency = Currency::new(
+            "DBTEST",
+            7,
+            0,
+            "Database test currency",
+            CurrencyType::Crypto,
+        );
+        let mut currency_pair = currency_pair_ethusdt();
+        currency_pair.base_currency = currency;
+        let instrument = InstrumentAny::CurrencyPair(currency_pair);
+
+        assert_eq!(Currency::try_from_str(currency.code.as_str()), None);
+
+        database.add_currency(&currency).unwrap();
+        database.add_currency(&instrument.quote_currency()).unwrap();
+        database.add_instrument(&instrument).unwrap();
+        database.close().unwrap();
+
+        let mut database = get_test_pg_cache_database().await.unwrap();
+        let loaded = database.load_all().await.unwrap();
+
+        let registered_currency = Currency::try_from_str(currency.code.as_str()).unwrap();
+        let loaded_currency = *loaded.currencies.get(&currency.code).unwrap();
+        let loaded_instrument = loaded.instruments.get(&instrument.id()).unwrap();
+        let loaded_base_currency = loaded_instrument.base_currency().unwrap();
+
+        for actual in [registered_currency, loaded_currency, loaded_base_currency] {
+            assert_eq!(actual.code, currency.code);
+            assert_eq!(actual.precision, currency.precision);
+            assert_eq!(actual.iso4217, currency.iso4217);
+            assert_eq!(actual.name, currency.name);
+            assert_eq!(actual.currency_type, currency.currency_type);
+        }
+
+        assert_eq!(
+            serde_json::to_string(loaded_instrument).unwrap(),
+            serde_json::to_string(&instrument).unwrap()
+        );
+
+        database.flush().unwrap();
+        database.close().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_failed_async_position_load_returns_error() {
+        let mut database = get_test_pg_cache_database().await.unwrap();
+        database.pool.close().await;
+
+        let result = database.load_positions().await;
+
+        assert!(result.is_err());
+
+        database.close().unwrap();
+    }
+
     // Test inserting and loading OrderCancelRejected events from PostgreSQL.
     //
     // This test verifies that order cancel rejection events can be persisted to and
@@ -347,7 +463,7 @@ mod serial_tests {
     #[ignore = "Waiting on PostgreSQL schema completion - needs FK constraints"]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_order_cancel_rejected_insert_and_load() {
-        let db = get_pg_cache_database().await.expect("connect db");
+        let db = get_test_pg_cache_database().await.expect("connect db");
         let pool = &db.pool;
 
         let client_id_str = UUID4::new().to_string();
@@ -403,7 +519,7 @@ mod serial_tests {
     #[ignore = "Waiting on PostgreSQL schema completion - needs FK constraints"]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_order_modify_rejected_insert_and_load() {
-        let db = get_pg_cache_database().await.expect("connect db");
+        let db = get_test_pg_cache_database().await.expect("connect db");
         let pool = &db.pool;
 
         let client_id_str = UUID4::new().to_string();
@@ -449,7 +565,7 @@ mod serial_tests {
     /// When `buffer_interval` is exposed via config, this test validates the zero-interval path.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_buffer_flushes_immediately() {
-        let mut database = get_pg_cache_database().await.unwrap();
+        let mut database = get_test_pg_cache_database().await.unwrap();
 
         let eth = Currency::new("ETH", 2, 0, "ETH", CurrencyType::Crypto);
         let eth_key = Ustr::from("ETH");
@@ -479,7 +595,7 @@ mod serial_tests {
     /// With `buffer_interval=0` the buffer is typically empty, but this validates the code path.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_buffer_drains_on_close() {
-        let mut database = get_pg_cache_database().await.unwrap();
+        let mut database = get_test_pg_cache_database().await.unwrap();
 
         let usdt = Currency::new("USDT", 2, 0, "USDT", CurrencyType::Crypto);
         let usdt_key = Ustr::from("USDT");
@@ -488,7 +604,7 @@ mod serial_tests {
         database.close().unwrap();
 
         // Reconnect to verify data was persisted
-        let mut database = get_pg_cache_database().await.unwrap();
+        let mut database = get_test_pg_cache_database().await.unwrap();
         let currencies = database.load_currencies().await.unwrap();
 
         assert!(

@@ -25,6 +25,17 @@
 //! - **Private channels** (subaccounts) only require the wallet address in the subscription message.
 //! - No signature or API key is needed for WebSocket connections themselves.
 //!
+//! # Connection pool
+//!
+//! The Indexer caps each WebSocket connection at 32 subscriptions per channel
+//! (`v4_trades`, `v4_candles`, `v4_orderbook`, `v4_markets`). To scale past that
+//! limit the client maintains a small pool of connection slots and routes each
+//! new subscription to the first slot with capacity, lazily spawning additional
+//! connections up to `max_ws_connections`. The shape mirrors
+//! `BinanceFuturesWebSocketClient` (including its `connect_lock` race fix),
+//! adapted so capacity is tracked per channel kind rather than as a single flat
+//! stream count.
+//!
 //! # References
 //!
 //! <https://docs.dydx.trade/developers/indexer/websockets>
@@ -44,18 +55,28 @@ pub static DYDX_WS_SUBSCRIPTION_QUOTA: LazyLock<Quota> = LazyLock::new(|| {
     Quota::per_second(NonZeroU32::new(2).expect("non-zero")).expect("valid constant")
 });
 
+/// Default maximum number of WebSocket connections in the Indexer pool.
+pub const DEFAULT_MAX_WS_CONNECTIONS: usize = 8;
+
+/// Default per-connection subscription limit for sharded channels.
+pub const DEFAULT_PER_CHANNEL_SUBSCRIPTION_LIMIT: usize = 32;
+
 use std::{
     num::NonZeroU32,
     sync::{
-        Arc, LazyLock,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Duration,
 };
 
+use ahash::{AHashMap, AHashSet};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use nautilus_common::live::get_runtime;
+use nautilus_live::{
+    SocketControl, SocketControlFactory,
+    task::{TaskJoinOutcome, TaskSlot, finish_task},
+};
 use nautilus_model::{
     data::BarType,
     identifiers::{AccountId, InstrumentId},
@@ -83,6 +104,30 @@ use crate::{
     execution::encoder::ClientOrderIdEncoder,
 };
 
+/// Identifies a dYdX channel for per-channel capacity accounting in the pool.
+#[derive(Copy, Clone, Debug)]
+#[repr(u8)]
+enum ChannelKind {
+    Trades = 0,
+    Candles = 1,
+    Orderbook = 2,
+    Markets = 3,
+}
+
+const CHANNEL_KIND_COUNT: usize = 4;
+
+/// Per-connection state inside the pool.
+#[derive(Debug)]
+struct ConnectionSlot {
+    cmd_tx: tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
+    topics: AHashMap<String, u32>,
+    channel_counts: [u16; CHANNEL_KIND_COUNT],
+    subscriptions_state: SubscriptionState,
+    handler_task: TaskSlot<()>,
+    connection_mode: Arc<AtomicU8>,
+    socket_control: Option<SocketControl>,
+}
+
 /// WebSocket client for dYdX v4 market data and account streams.
 ///
 /// # Authentication
@@ -99,42 +144,35 @@ use crate::{
 ///
 /// # Architecture
 ///
-/// This client follows a two-layer architecture:
-/// - **Outer client** (this struct): Orchestrates connection and maintains Python-accessible state
-/// - **Inner handler**: Owns WebSocketClient exclusively and processes messages in a dedicated task
-///
-/// Communication uses lock-free channels:
-/// - Commands flow from client → handler via `cmd_tx`
-/// - Parsed events flow from handler → client via `out_rx`
+/// The client owns a small pool of connection slots. Each slot has its own
+/// `WebSocketClient`, [`FeedHandler`] task, command channel, and
+/// [`SubscriptionState`]. All slots write parsed events into a single shared
+/// output channel so callers see one merged stream.
 #[derive(Debug)]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.dydx", from_py_object)
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.dydx")
-)]
 pub struct DydxWebSocketClient {
     url: String,
     credential: Option<Arc<DydxCredential>>,
     requires_auth: bool,
     auth_tracker: AuthTracker,
-    subscriptions: SubscriptionState,
+    slots: Arc<ConnectionSlots>,
+    admission: Arc<Mutex<PoolAdmission>>,
+    connect_lock: Arc<tokio::sync::Mutex<()>>,
     connection_mode: Arc<ArcSwap<AtomicU8>>,
     signal: Arc<AtomicBool>,
     instrument_cache: Arc<InstrumentCache>,
     account_id: Option<AccountId>,
     heartbeat: Option<u64>,
-    cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
-    out_rx: Option<tokio::sync::mpsc::UnboundedReceiver<DydxWsOutputMessage>>,
-    handler_task: Option<Arc<tokio::task::JoinHandle<()>>>,
+    out_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<DydxWsOutputMessage>>>>,
+    out_rx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<DydxWsOutputMessage>>>>,
     encoder: Arc<ClientOrderIdEncoder>,
     bar_types: Arc<DashMap<String, BarType>>,
     bars_timestamp_on_close: Arc<AtomicBool>,
     ws_dispatch_state: Arc<DydxWsDispatchState>,
     transport_backend: TransportBackend,
     proxy_url: Option<String>,
+    max_ws_connections: usize,
+    per_channel_limit: usize,
+    socket_factory: Option<SocketControlFactory>,
 }
 
 impl Clone for DydxWebSocketClient {
@@ -144,21 +182,25 @@ impl Clone for DydxWebSocketClient {
             credential: self.credential.clone(),
             requires_auth: self.requires_auth,
             auth_tracker: self.auth_tracker.clone(),
-            subscriptions: self.subscriptions.clone(),
+            slots: self.slots.clone(),
+            admission: self.admission.clone(),
+            connect_lock: self.connect_lock.clone(),
             connection_mode: self.connection_mode.clone(),
             signal: self.signal.clone(),
             instrument_cache: self.instrument_cache.clone(),
             account_id: self.account_id,
             heartbeat: self.heartbeat,
-            cmd_tx: self.cmd_tx.clone(),
-            out_rx: None,       // Cannot clone receiver - only one owner allowed
-            handler_task: None, // Cannot clone task handle
+            out_tx: self.out_tx.clone(),
+            out_rx: self.out_rx.clone(),
             encoder: self.encoder.clone(),
             bar_types: self.bar_types.clone(),
             bars_timestamp_on_close: self.bars_timestamp_on_close.clone(),
             ws_dispatch_state: self.ws_dispatch_state.clone(),
             transport_backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
+            max_ws_connections: self.max_ws_connections,
+            per_channel_limit: self.per_channel_limit,
+            socket_factory: self.socket_factory.clone(),
         }
     }
 }
@@ -190,32 +232,40 @@ impl DydxWebSocketClient {
         transport_backend: TransportBackend,
         proxy_url: Option<String>,
     ) -> Self {
-        // Create dummy command channel (will be replaced on connect)
-        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-
-        Self {
+        Self::new_public_with_cache_and_pool(
             url,
-            credential: None,
-            requires_auth: false,
-            auth_tracker: AuthTracker::new(),
-            subscriptions: SubscriptionState::new(DYDX_WS_TOPIC_DELIMITER),
-            connection_mode: Arc::new(ArcSwap::from_pointee(AtomicU8::new(
-                ConnectionMode::Closed as u8,
-            ))),
-            signal: Arc::new(AtomicBool::new(false)),
             instrument_cache,
-            account_id: None,
             heartbeat,
-            cmd_tx: Arc::new(tokio::sync::RwLock::new(cmd_tx)),
-            out_rx: None,
-            handler_task: None,
-            encoder: Arc::new(ClientOrderIdEncoder::new()),
-            bar_types: Arc::new(DashMap::new()),
-            bars_timestamp_on_close: Arc::new(AtomicBool::new(true)),
-            ws_dispatch_state: Arc::new(DydxWsDispatchState::default()),
             transport_backend,
             proxy_url,
-        }
+            DEFAULT_MAX_WS_CONNECTIONS,
+            DEFAULT_PER_CHANNEL_SUBSCRIPTION_LIMIT,
+        )
+    }
+
+    /// Creates a new public WebSocket client with full pool configuration.
+    #[must_use]
+    pub fn new_public_with_cache_and_pool(
+        url: String,
+        instrument_cache: Arc<InstrumentCache>,
+        heartbeat: Option<u64>,
+        transport_backend: TransportBackend,
+        proxy_url: Option<String>,
+        max_ws_connections: usize,
+        per_channel_limit: usize,
+    ) -> Self {
+        Self::new_inner(
+            url,
+            None,
+            false,
+            instrument_cache,
+            None,
+            heartbeat,
+            transport_backend,
+            proxy_url,
+            max_ws_connections,
+            per_channel_limit,
+        )
     }
 
     /// Creates a new private WebSocket client for account updates.
@@ -254,32 +304,99 @@ impl DydxWebSocketClient {
         transport_backend: TransportBackend,
         proxy_url: Option<String>,
     ) -> Self {
-        // Create dummy command channel (will be replaced on connect)
-        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
+        Self::new_inner(
+            url,
+            Some(Arc::new(credential)),
+            true,
+            instrument_cache,
+            Some(account_id),
+            heartbeat,
+            transport_backend,
+            proxy_url,
+            DEFAULT_MAX_WS_CONNECTIONS,
+            DEFAULT_PER_CHANNEL_SUBSCRIPTION_LIMIT,
+        )
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner(
+        url: String,
+        credential: Option<Arc<DydxCredential>>,
+        requires_auth: bool,
+        instrument_cache: Arc<InstrumentCache>,
+        account_id: Option<AccountId>,
+        heartbeat: Option<u64>,
+        transport_backend: TransportBackend,
+        proxy_url: Option<String>,
+        max_ws_connections: usize,
+        per_channel_limit: usize,
+    ) -> Self {
         Self {
             url,
-            credential: Some(Arc::new(credential)),
-            requires_auth: true,
+            credential,
+            requires_auth,
             auth_tracker: AuthTracker::new(),
-            subscriptions: SubscriptionState::new(DYDX_WS_TOPIC_DELIMITER),
+            slots: Arc::new(ConnectionSlots::new()),
+            admission: Arc::new(Mutex::new(PoolAdmission {
+                generation: 0,
+                closed: false,
+            })),
+            connect_lock: Arc::new(tokio::sync::Mutex::new(())),
             connection_mode: Arc::new(ArcSwap::from_pointee(AtomicU8::new(
                 ConnectionMode::Closed as u8,
             ))),
             signal: Arc::new(AtomicBool::new(false)),
             instrument_cache,
-            account_id: Some(account_id),
+            account_id,
             heartbeat,
-            cmd_tx: Arc::new(tokio::sync::RwLock::new(cmd_tx)),
-            out_rx: None,
-            handler_task: None,
+            out_tx: Arc::new(Mutex::new(None)),
+            out_rx: Arc::new(Mutex::new(None)),
             encoder: Arc::new(ClientOrderIdEncoder::new()),
             bar_types: Arc::new(DashMap::new()),
             bars_timestamp_on_close: Arc::new(AtomicBool::new(true)),
             ws_dispatch_state: Arc::new(DydxWsDispatchState::default()),
             transport_backend,
             proxy_url,
+            max_ws_connections: max_ws_connections.max(1),
+            per_channel_limit: per_channel_limit.max(1),
+            socket_factory: None,
         }
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        let mut admission = self.admission.lock().expect("admission lock poisoned");
+        admission.generation = admission.generation.wrapping_add(1);
+        admission.closed = true;
+        self.signal.store(true, Ordering::Release);
+
+        for slot in self.slots.lock().expect("slots lock poisoned").iter() {
+            let _ = slot.cmd_tx.send(HandlerCommand::Disconnect);
+        }
+    }
+
+    fn open_generation(&self) -> u64 {
+        let mut admission = self.admission.lock().expect("admission lock poisoned");
+        admission.generation = admission.generation.wrapping_add(1);
+        admission.closed = false;
+        admission.generation
+    }
+
+    fn admission_generation(&self) -> DydxWsResult<u64> {
+        let admission = self.admission.lock().expect("admission lock poisoned");
+        if admission.closed {
+            Err(DydxWsError::Transport(
+                "WebSocket connection pool is closed".to_string(),
+            ))
+        } else {
+            Ok(admission.generation)
+        }
+    }
+
+    /// Configures socket state reporting and reconnect control for each pool slot.
+    #[must_use]
+    pub fn with_socket_factory(mut self, factory: SocketControlFactory) -> Self {
+        self.socket_factory = Some(factory);
+        self
     }
 
     /// Returns the credential associated with this client, if any.
@@ -288,15 +405,15 @@ impl DydxWebSocketClient {
         self.credential.as_ref()
     }
 
-    /// Returns `true` when the client is connected.
+    /// Returns `true` when any connection in the pool is connected.
     #[must_use]
+    #[expect(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
     pub fn is_connected(&self) -> bool {
-        let mode = self.connection_mode.load();
-        let mode_u8 = mode.load(Ordering::Relaxed);
-        matches!(
-            mode_u8,
-            x if x == ConnectionMode::Active as u8 || x == ConnectionMode::Reconnect as u8
-        )
+        let slots = self.slots.lock().expect("slots lock poisoned");
+        slots.iter().any(|s| {
+            let mode = s.connection_mode.load(Ordering::Relaxed);
+            mode == ConnectionMode::Active as u8 || mode == ConnectionMode::Reconnect as u8
+        })
     }
 
     /// Returns the URL of this WebSocket client.
@@ -307,10 +424,30 @@ impl DydxWebSocketClient {
 
     /// Returns a clone of the connection mode atomic reference.
     ///
-    /// This is primarily used for Python bindings that need to monitor connection state.
+    /// With sharding, the returned atomic tracks the **primary** slot (slot 0)
+    /// only; use [`Self::is_connected`] for a pool-wide check.
     #[must_use]
     pub fn connection_mode_atomic(&self) -> Arc<ArcSwap<AtomicU8>> {
         self.connection_mode.clone()
+    }
+
+    /// Returns the current number of active slots in the pool.
+    #[must_use]
+    #[expect(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
+    pub fn pool_size(&self) -> usize {
+        self.slots.lock().expect("slots lock poisoned").len()
+    }
+
+    /// Returns the configured maximum number of pool connections.
+    #[must_use]
+    pub const fn max_ws_connections(&self) -> usize {
+        self.max_ws_connections
+    }
+
+    /// Returns the configured per-channel subscription limit.
+    #[must_use]
+    pub const fn per_channel_limit(&self) -> usize {
+        self.per_channel_limit
     }
 
     /// Sets the account ID for account message parsing.
@@ -417,10 +554,11 @@ impl DydxWebSocketClient {
 
     /// Takes ownership of the inbound message receiver.
     /// Returns None if the receiver has already been taken or not connected.
+    #[expect(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
     pub fn take_receiver(
         &mut self,
     ) -> Option<tokio::sync::mpsc::UnboundedReceiver<DydxWsOutputMessage>> {
-        self.out_rx.take()
+        self.out_rx.lock().expect("out_rx lock poisoned").take()
     }
 
     /// Returns a stream of venue-specific WebSocket messages.
@@ -429,12 +567,14 @@ impl DydxWebSocketClient {
     ///
     /// # Panics
     ///
-    /// Panics if the receiver has already been taken.
+    /// Panics if the receiver has already been taken or the receiver mutex is poisoned.
     pub fn stream(
         &mut self,
     ) -> impl futures_util::Stream<Item = DydxWsOutputMessage> + Send + 'static {
         let mut rx = self
             .out_rx
+            .lock()
+            .expect("out_rx lock poisoned")
             .take()
             .expect("Message stream receiver already taken or not connected");
 
@@ -445,155 +585,264 @@ impl DydxWebSocketClient {
         }
     }
 
-    /// Connects the websocket client in handler mode with automatic reconnection.
+    /// Connects the websocket client and opens the primary pool slot.
     ///
-    /// Spawns a background handler task that owns the WebSocketClient and processes
-    /// raw messages into venue-specific [`DydxWsOutputMessage`] values.
+    /// Additional slots are spawned lazily by `subscribe_*` methods once the
+    /// per-channel limit is reached on every existing slot.
     ///
     /// # Errors
     ///
     /// Returns an error if the connection cannot be established.
+    #[expect(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
     pub async fn connect(&mut self) -> DydxWsResult<()> {
-        if self.is_connected() {
+        let connect_lock = Arc::clone(&self.connect_lock);
+        let _connect_guard = connect_lock.lock().await;
+
+        let already_connected = {
+            let admission = self.admission.lock().expect("admission lock poisoned");
+            !admission.closed && self.is_connected()
+        };
+
+        if already_connected {
             return Ok(());
         }
 
-        // Reset stop signal from any previous disconnect
+        if !self.slots.lock().expect("slots lock poisoned").is_empty() {
+            self.disconnect_connections().await?;
+        }
+
+        let generation = self.open_generation();
         self.signal.store(false, Ordering::Release);
 
+        let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<DydxWsOutputMessage>();
+        {
+            let mut guard = self.out_tx.lock().expect("out_tx lock poisoned");
+            *guard = Some(out_tx);
+        }
+        {
+            let mut guard = self.out_rx.lock().expect("out_rx lock poisoned");
+            *guard = Some(out_rx);
+        }
+
+        let slot = match self.create_connection(0).await {
+            Ok(slot) => slot,
+            Err(e) => {
+                self.begin_shutdown();
+                *self.out_tx.lock().expect("out_tx lock poisoned") = None;
+                *self.out_rx.lock().expect("out_rx lock poisoned") = None;
+                return Err(e);
+            }
+        };
+        let admission = self.admission.lock().expect("admission lock poisoned");
+        let mut slots = self.slots.lock().expect("slots lock poisoned");
+
+        if admission.closed || admission.generation != generation {
+            let _ = slot.cmd_tx.send(HandlerCommand::Disconnect);
+            slots.push(slot);
+            return Err(DydxWsError::Transport(
+                "WebSocket connection was canceled by shutdown".to_string(),
+            ));
+        }
+        self.connection_mode.store(slot.connection_mode.clone());
+        slots.push(slot);
+        drop(slots);
+        drop(admission);
+
+        log::debug!("Connected dYdX WebSocket pool: {}", self.url);
+        Ok(())
+    }
+
+    /// Disconnects all websocket connections in the pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying clients cannot be accessed.
+    pub async fn disconnect(&mut self) -> DydxWsResult<()> {
+        self.begin_shutdown();
+        let connect_lock = Arc::clone(&self.connect_lock);
+        let _connect_guard = connect_lock.lock().await;
+        self.disconnect_connections().await
+    }
+
+    async fn disconnect_connections(&self) -> DydxWsResult<()> {
+        self.begin_shutdown();
+
+        let mut slots = ConnectionSlotBatch::take(&self.slots);
+
+        for slot in &mut slots.slots {
+            if let Some(control) = &slot.socket_control {
+                control.deregister();
+            }
+            let _ = slot.cmd_tx.send(HandlerCommand::Disconnect);
+
+            if let Some(outcome) = finish_task(
+                &mut slot.handler_task,
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+            )
+            .await
+            {
+                match outcome {
+                    TaskJoinOutcome::Completed(()) => log::debug!("Handler task completed"),
+                    TaskJoinOutcome::Aborted => {}
+                    TaskJoinOutcome::Failed(error) => {
+                        self.slots
+                            .push_shutdown_error(format!("handler task failed: {error}"));
+                    }
+                    TaskJoinOutcome::Incomplete => {
+                        self.slots.push_shutdown_error(
+                            "handler task did not stop after abort".to_string(),
+                        );
+                    }
+                }
+            }
+        }
+
+        slots.slots.retain(|slot| slot.handler_task.is_some());
+        let has_incomplete_tasks = !slots.slots.is_empty();
+
+        if !has_incomplete_tasks {
+            self.connection_mode
+                .store(Arc::new(AtomicU8::new(ConnectionMode::Closed as u8)));
+            *self.out_tx.lock().expect("out_tx lock poisoned") = None;
+            *self.out_rx.lock().expect("out_rx lock poisoned") = None;
+        }
+
+        let join_errors = self.slots.take_shutdown_errors();
+        if !join_errors.is_empty() {
+            return Err(DydxWsError::Transport(join_errors.join("; ")));
+        }
+
+        self.connection_mode
+            .store(Arc::new(AtomicU8::new(ConnectionMode::Closed as u8)));
+
+        log::debug!("Disconnected dYdX WebSocket pool");
+        Ok(())
+    }
+
+    /// Sends a command directly to the primary slot (slot 0).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no slot exists or the handler task has terminated.
+    #[expect(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
+    pub fn send_command(&self, cmd: HandlerCommand) -> DydxWsResult<()> {
+        let admission = self.admission.lock().expect("admission lock poisoned");
+        if admission.closed {
+            return Err(DydxWsError::Transport(
+                "WebSocket connection pool is closed".to_string(),
+            ));
+        }
+        let slots = self.slots.lock().expect("slots lock poisoned");
+        let slot = slots
+            .first()
+            .ok_or_else(|| DydxWsError::Transport("No pool slots available".to_string()))?;
+        slot.cmd_tx.send(cmd).map_err(|e| {
+            DydxWsError::Transport(format!("Failed to send command to slot 0: {e}"))
+        })?;
+        Ok(())
+    }
+
+    async fn create_connection(&self, slot_index: usize) -> DydxWsResult<ConnectionSlot> {
         let (message_handler, raw_rx) = channel_message_handler();
 
         let cfg = WebSocketConfig {
             url: self.url.clone(),
             headers: vec![],
-            heartbeat: self.heartbeat,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(15_000),
+            heartbeat_interval_secs: self.heartbeat,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(15_000),
             reconnect_delay_initial_ms: Some(250),
             reconnect_delay_max_ms: Some(5_000),
             reconnect_backoff_factor: Some(2.0),
             reconnect_jitter_ms: Some(200),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
         };
 
-        let client = WebSocketClient::connect(
-            cfg,
-            Some(message_handler),
-            None,
-            None,
-            vec![],
-            Some(*DYDX_WS_SUBSCRIPTION_QUOTA),
-        )
-        .await
-        .map_err(|e| DydxWsError::Transport(e.to_string()))?;
+        let socket_control = self.socket_factory.as_ref().map(|factory| {
+            let kind = if self.requires_auth { "user" } else { "data" };
+            let endpoint = format!("dydx-{kind}-streams");
+            if slot_index == 0 {
+                factory.control(endpoint)
+            } else {
+                factory.control(format!("{endpoint}-{slot_index}"))
+            }
+        });
+        let client = WebSocketClient::builder()
+            .config(cfg)
+            .message_handler(message_handler)
+            .default_quota(*DYDX_WS_SUBSCRIPTION_QUOTA)
+            .maybe_state_sink(
+                socket_control
+                    .as_ref()
+                    .map(nautilus_live::SocketControl::sink),
+            )
+            .connect()
+            .await
+            .map_err(|e| DydxWsError::Transport(e.to_string()))?;
 
-        // Update connection state atomically
-        self.connection_mode.store(client.connection_mode_atomic());
+        let connection_mode = client.connection_mode_atomic();
+        let reconnect_handle = client.reconnect_handle();
+        let subscriptions_state = SubscriptionState::new(DYDX_WS_TOPIC_DELIMITER);
 
-        // Create fresh channels for this connection
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<DydxWsOutputMessage>();
 
-        // Update the shared cmd_tx so all clones see the new sender
-        {
-            let mut guard = self.cmd_tx.write().await;
-            *guard = cmd_tx;
-        }
-        self.out_rx = Some(out_rx);
+        let out_tx = self
+            .out_tx
+            .lock()
+            .expect("out_tx lock poisoned")
+            .clone()
+            .ok_or_else(|| DydxWsError::Transport("Output channel not initialized".to_string()))?;
 
-        // Spawn handler task
         let signal = self.signal.clone();
-        let subscriptions = self.subscriptions.clone();
+        let subscriptions = subscriptions_state.clone();
 
-        let handler_task = get_runtime().spawn(async move {
+        let mut handler_task = TaskSlot::new();
+        if let Err(e) = handler_task.spawn(async move {
             let mut handler =
                 FeedHandler::new(cmd_rx, out_tx, raw_rx, client, signal, subscriptions);
             handler.run().await;
-        });
-
-        self.handler_task = Some(Arc::new(handler_task));
-        log::info!("Connected dYdX WebSocket: {}", self.url);
-        Ok(())
-    }
-
-    /// Disconnects the websocket client gracefully.
-    ///
-    /// Sends a disconnect command to the handler, sets the stop signal, then
-    /// awaits the handler task with a timeout before aborting.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the underlying client cannot be accessed.
-    pub async fn disconnect(&mut self) -> DydxWsResult<()> {
-        // 1. Send disconnect command so the handler can close the WS connection
-        if let Err(e) = self.cmd_tx.read().await.send(HandlerCommand::Disconnect) {
-            log::debug!("Failed to send disconnect command: {e}");
-        }
-
-        // 2. Set stop signal with Release ordering
-        self.signal.store(true, Ordering::Release);
-
-        // 3. Await handler task with timeout, abort if stuck
-        if let Some(task_handle) = self.handler_task.take() {
-            match Arc::try_unwrap(task_handle) {
-                Ok(handle) => {
-                    let abort_handle = handle.abort_handle();
-                    match tokio::time::timeout(Duration::from_secs(2), handle).await {
-                        Ok(Ok(())) => log::debug!("Handler task completed"),
-                        Ok(Err(e)) => log::error!("Handler task error: {e:?}"),
-                        Err(_) => {
-                            log::warn!("Timeout waiting for handler task, aborting");
-                            abort_handle.abort();
-                        }
-                    }
-                }
-                Err(arc_handle) => {
-                    log::debug!("Cannot unwrap task handle, aborting");
-                    arc_handle.abort();
-                }
-            }
-        }
-
-        // Reset connection mode to Closed
-        self.connection_mode
-            .store(Arc::new(AtomicU8::new(ConnectionMode::Closed as u8)));
-
-        self.out_rx = None;
-
-        log::debug!("Disconnected dYdX WebSocket");
-        Ok(())
-    }
-
-    async fn send_text_inner(&self, text: &str) -> DydxWsResult<()> {
-        self.cmd_tx
-            .read()
+        }) {
+            let shutdown_error = match finish_task(
+                &mut handler_task,
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(2),
+            )
             .await
-            .send(HandlerCommand::SendText(text.to_string()))
-            .map_err(|e| {
-                DydxWsError::Transport(format!("Failed to send command to handler: {e}"))
-            })?;
-        Ok(())
-    }
-
-    /// Sends a command to the handler.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the handler task has terminated.
-    pub fn send_command(&self, cmd: HandlerCommand) -> DydxWsResult<()> {
-        if let Ok(guard) = self.cmd_tx.try_read() {
-            guard.send(cmd).map_err(|e| {
-                DydxWsError::Transport(format!("Failed to send command to handler: {e}"))
-            })?;
-        } else {
-            return Err(DydxWsError::Transport(
-                "Failed to acquire lock on command channel".to_string(),
-            ));
+            {
+                Some(TaskJoinOutcome::Failed(error)) => {
+                    Some(format!("handler task failed: {error}"))
+                }
+                Some(TaskJoinOutcome::Incomplete) => {
+                    Some("handler task did not stop after abort".to_string())
+                }
+                None | Some(TaskJoinOutcome::Completed(()) | TaskJoinOutcome::Aborted) => None,
+            };
+            return Err(DydxWsError::Transport(match shutdown_error {
+                Some(shutdown_error) => format!(
+                    "Failed to start handler task: {e}; startup rollback failed: {shutdown_error}"
+                ),
+                None => format!("Failed to start handler task: {e}"),
+            }));
         }
-        Ok(())
+
+        if let Some(control) = &socket_control {
+            control.register(move || reconnect_handle.request_reconnect());
+        }
+
+        Ok(ConnectionSlot {
+            cmd_tx,
+            topics: AHashMap::new(),
+            channel_counts: [0; CHANNEL_KIND_COUNT],
+            subscriptions_state,
+            handler_task,
+            connection_mode,
+            socket_control,
+        })
     }
 
     fn ticker_from_instrument_id(instrument_id: &InstrumentId) -> String {
@@ -611,48 +860,154 @@ impl DydxWebSocketClient {
         }
     }
 
-    async fn send_and_track_subscribe(
+    async fn subscribe_topic(
         &self,
-        sub: DydxSubscription,
-        topic: &str,
+        channel: ChannelKind,
+        topic: String,
+        sub_msg: DydxSubscription,
     ) -> DydxWsResult<()> {
-        self.subscriptions.mark_subscribe(topic);
+        let _connect_guard = self.connect_lock.lock().await;
+        let generation = self.admission_generation()?;
 
-        if let Ok(cmd_tx) = self.cmd_tx.try_read() {
-            let _ = cmd_tx.send(HandlerCommand::RegisterSubscription {
-                topic: topic.to_string(),
-                subscription: sub.clone(),
+        {
+            let admission = self.admission.lock().expect("admission lock poisoned");
+            if admission.closed || admission.generation != generation {
+                return Err(DydxWsError::Transport(
+                    "WebSocket connection pool is closed".to_string(),
+                ));
+            }
+            let mut slots = self.slots.lock().expect("slots lock poisoned");
+            if let Some(slot) = slots.iter_mut().find(|s| s.topics.contains_key(&topic)) {
+                *slot.topics.get_mut(&topic).expect("topic refcount present") += 1;
+                return Ok(());
+            }
+        }
+
+        let target_idx = loop {
+            {
+                let admission = self.admission.lock().expect("admission lock poisoned");
+                if admission.closed || admission.generation != generation {
+                    return Err(DydxWsError::Transport(
+                        "WebSocket connection pool is closed".to_string(),
+                    ));
+                }
+                let slots = self.slots.lock().expect("slots lock poisoned");
+                if let Some(idx) = slots.iter().position(|s| {
+                    (s.channel_counts[channel as usize] as usize) < self.per_channel_limit
+                }) {
+                    break idx;
+                }
+
+                if slots.len() >= self.max_ws_connections {
+                    return Err(DydxWsError::Subscription(format!(
+                        "Pool exhausted: {} connections x {} {:?} subscriptions",
+                        self.max_ws_connections, self.per_channel_limit, channel,
+                    )));
+                }
+            }
+
+            let slot_index = self.slots.lock().expect("slots lock poisoned").len();
+            let new_slot = self.create_connection(slot_index).await?;
+            let new_idx = {
+                let admission = self.admission.lock().expect("admission lock poisoned");
+                let mut slots = self.slots.lock().expect("slots lock poisoned");
+
+                if admission.closed || admission.generation != generation {
+                    let _ = new_slot.cmd_tx.send(HandlerCommand::Disconnect);
+                    slots.push(new_slot);
+                    return Err(DydxWsError::Transport(
+                        "WebSocket connection was canceled by shutdown".to_string(),
+                    ));
+                }
+                slots.push(new_slot);
+                slots.len() - 1
+            };
+            log::debug!(
+                "dYdX pool slot {new_idx} connected: url={}, channel={:?}",
+                self.url,
+                channel,
+            );
+        };
+
+        let admission = self.admission.lock().expect("admission lock poisoned");
+        if admission.closed || admission.generation != generation {
+            return Err(DydxWsError::Transport(
+                "WebSocket connection pool is closed".to_string(),
+            ));
+        }
+        let mut slots = self.slots.lock().expect("slots lock poisoned");
+        let slot = &mut slots[target_idx];
+
+        slot.subscriptions_state.mark_subscribe(&topic);
+        slot.cmd_tx
+            .send(HandlerCommand::RegisterSubscription {
+                topic: topic.clone(),
+                subscription: sub_msg.clone(),
+            })
+            .map_err(|e| {
+                slot.subscriptions_state.mark_failure(&topic);
+                DydxWsError::Transport(format!("Slot {target_idx} unavailable: {e}"))
+            })?;
+
+        let payload = serde_json::to_string(&sub_msg)?;
+        if let Err(e) = slot.cmd_tx.send(HandlerCommand::SendText(payload)) {
+            slot.subscriptions_state.mark_failure(&topic);
+            let _ = slot.cmd_tx.send(HandlerCommand::UnregisterSubscription {
+                topic: topic.clone(),
             });
+            return Err(DydxWsError::Transport(format!(
+                "Slot {target_idx} send failed: {e}"
+            )));
         }
 
-        let payload = serde_json::to_string(&sub)?;
-        if let Err(e) = self.send_text_inner(&payload).await {
-            self.subscriptions.mark_failure(topic);
-            self.subscriptions.remove_reference(topic);
-            return Err(e);
-        }
+        slot.topics.insert(topic, 1);
+        slot.channel_counts[channel as usize] =
+            slot.channel_counts[channel as usize].saturating_add(1);
+
         Ok(())
     }
 
-    async fn send_and_track_unsubscribe(
+    async fn unsubscribe_topic(
         &self,
-        sub: DydxSubscription,
-        topic: &str,
+        channel: ChannelKind,
+        topic: String,
+        unsub_msg: DydxSubscription,
     ) -> DydxWsResult<()> {
-        self.subscriptions.mark_unsubscribe(topic);
+        let _connect_guard = self.connect_lock.lock().await;
+        let _generation = self.admission_generation()?;
+        let admission = self.admission.lock().expect("admission lock poisoned");
+        if admission.closed {
+            return Err(DydxWsError::Transport(
+                "WebSocket connection pool is closed".to_string(),
+            ));
+        }
+        let mut slots = self.slots.lock().expect("slots lock poisoned");
+        let Some(slot_idx) = slots.iter().position(|s| s.topics.contains_key(&topic)) else {
+            return Ok(());
+        };
 
-        let payload = serde_json::to_string(&sub)?;
-        if let Err(e) = self.send_text_inner(&payload).await {
-            self.subscriptions.add_reference(topic);
-            self.subscriptions.mark_subscribe(topic);
-            return Err(e);
+        let slot = &mut slots[slot_idx];
+        let refcount = slot.topics.get_mut(&topic).expect("topic present");
+        if *refcount > 1 {
+            *refcount -= 1;
+            return Ok(());
         }
 
-        if let Ok(cmd_tx) = self.cmd_tx.try_read() {
-            let _ = cmd_tx.send(HandlerCommand::UnregisterSubscription {
-                topic: topic.to_string(),
-            });
+        slot.subscriptions_state.mark_unsubscribe(&topic);
+        let payload = serde_json::to_string(&unsub_msg)?;
+        if let Err(e) = slot.cmd_tx.send(HandlerCommand::SendText(payload)) {
+            slot.subscriptions_state.mark_subscribe(&topic);
+            return Err(DydxWsError::Transport(format!(
+                "Slot {slot_idx} send failed: {e}"
+            )));
         }
+        let _ = slot.cmd_tx.send(HandlerCommand::UnregisterSubscription {
+            topic: topic.clone(),
+        });
+
+        slot.topics.remove(&topic);
+        slot.channel_counts[channel as usize] =
+            slot.channel_counts[channel as usize].saturating_sub(1);
 
         Ok(())
     }
@@ -669,17 +1024,12 @@ impl DydxWebSocketClient {
     pub async fn subscribe_trades(&self, instrument_id: InstrumentId) -> DydxWsResult<()> {
         let ticker = Self::ticker_from_instrument_id(&instrument_id);
         let topic = Self::topic(DydxWsChannel::Trades, Some(&ticker));
-        if !self.subscriptions.add_reference(&topic) {
-            return Ok(());
-        }
-
         let sub = DydxSubscription {
             op: DydxWsOperation::Subscribe,
             channel: DydxWsChannel::Trades,
             id: Some(ticker),
         };
-
-        self.send_and_track_subscribe(sub, &topic).await
+        self.subscribe_topic(ChannelKind::Trades, topic, sub).await
     }
 
     /// Unsubscribes from public trade updates for a specific instrument.
@@ -690,17 +1040,13 @@ impl DydxWebSocketClient {
     pub async fn unsubscribe_trades(&self, instrument_id: InstrumentId) -> DydxWsResult<()> {
         let ticker = Self::ticker_from_instrument_id(&instrument_id);
         let topic = Self::topic(DydxWsChannel::Trades, Some(&ticker));
-        if !self.subscriptions.remove_reference(&topic) {
-            return Ok(());
-        }
-
         let sub = DydxSubscription {
             op: DydxWsOperation::Unsubscribe,
             channel: DydxWsChannel::Trades,
             id: Some(ticker),
         };
-
-        self.send_and_track_unsubscribe(sub, &topic).await
+        self.unsubscribe_topic(ChannelKind::Trades, topic, sub)
+            .await
     }
 
     /// Subscribes to orderbook updates for a specific instrument.
@@ -715,17 +1061,13 @@ impl DydxWebSocketClient {
     pub async fn subscribe_orderbook(&self, instrument_id: InstrumentId) -> DydxWsResult<()> {
         let ticker = Self::ticker_from_instrument_id(&instrument_id);
         let topic = Self::topic(DydxWsChannel::Orderbook, Some(&ticker));
-        if !self.subscriptions.add_reference(&topic) {
-            return Ok(());
-        }
-
         let sub = DydxSubscription {
             op: DydxWsOperation::Subscribe,
             channel: DydxWsChannel::Orderbook,
             id: Some(ticker),
         };
-
-        self.send_and_track_subscribe(sub, &topic).await
+        self.subscribe_topic(ChannelKind::Orderbook, topic, sub)
+            .await
     }
 
     /// Unsubscribes from orderbook updates for a specific instrument.
@@ -736,17 +1078,13 @@ impl DydxWebSocketClient {
     pub async fn unsubscribe_orderbook(&self, instrument_id: InstrumentId) -> DydxWsResult<()> {
         let ticker = Self::ticker_from_instrument_id(&instrument_id);
         let topic = Self::topic(DydxWsChannel::Orderbook, Some(&ticker));
-        if !self.subscriptions.remove_reference(&topic) {
-            return Ok(());
-        }
-
         let sub = DydxSubscription {
             op: DydxWsOperation::Unsubscribe,
             channel: DydxWsChannel::Orderbook,
             id: Some(ticker),
         };
-
-        self.send_and_track_unsubscribe(sub, &topic).await
+        self.unsubscribe_topic(ChannelKind::Orderbook, topic, sub)
+            .await
     }
 
     /// Subscribes to candle/kline updates for a specific instrument.
@@ -766,17 +1104,12 @@ impl DydxWebSocketClient {
         let ticker = Self::ticker_from_instrument_id(&instrument_id);
         let id = format!("{ticker}/{resolution}");
         let topic = Self::topic(DydxWsChannel::Candles, Some(&id));
-        if !self.subscriptions.add_reference(&topic) {
-            return Ok(());
-        }
-
         let sub = DydxSubscription {
             op: DydxWsOperation::Subscribe,
             channel: DydxWsChannel::Candles,
             id: Some(id),
         };
-
-        self.send_and_track_subscribe(sub, &topic).await
+        self.subscribe_topic(ChannelKind::Candles, topic, sub).await
     }
 
     /// Unsubscribes from candle/kline updates for a specific instrument.
@@ -792,17 +1125,13 @@ impl DydxWebSocketClient {
         let ticker = Self::ticker_from_instrument_id(&instrument_id);
         let id = format!("{ticker}/{resolution}");
         let topic = Self::topic(DydxWsChannel::Candles, Some(&id));
-        if !self.subscriptions.remove_reference(&topic) {
-            return Ok(());
-        }
-
         let sub = DydxSubscription {
             op: DydxWsOperation::Unsubscribe,
             channel: DydxWsChannel::Candles,
             id: Some(id),
         };
-
-        self.send_and_track_unsubscribe(sub, &topic).await
+        self.unsubscribe_topic(ChannelKind::Candles, topic, sub)
+            .await
     }
 
     /// Subscribes to market updates for all instruments.
@@ -816,17 +1145,12 @@ impl DydxWebSocketClient {
     /// <https://docs.dydx.trade/developers/indexer/websockets#markets-channel>
     pub async fn subscribe_markets(&self) -> DydxWsResult<()> {
         let topic = Self::topic(DydxWsChannel::Markets, None);
-        if !self.subscriptions.add_reference(&topic) {
-            return Ok(());
-        }
-
         let sub = DydxSubscription {
             op: DydxWsOperation::Subscribe,
             channel: DydxWsChannel::Markets,
             id: None,
         };
-
-        self.send_and_track_subscribe(sub, &topic).await
+        self.subscribe_topic(ChannelKind::Markets, topic, sub).await
     }
 
     /// Unsubscribes from market updates.
@@ -836,23 +1160,22 @@ impl DydxWebSocketClient {
     /// Returns an error if the unsubscription request fails.
     pub async fn unsubscribe_markets(&self) -> DydxWsResult<()> {
         let topic = Self::topic(DydxWsChannel::Markets, None);
-        if !self.subscriptions.remove_reference(&topic) {
-            return Ok(());
-        }
-
         let sub = DydxSubscription {
             op: DydxWsOperation::Unsubscribe,
             channel: DydxWsChannel::Markets,
             id: None,
         };
-
-        self.send_and_track_unsubscribe(sub, &topic).await
+        self.unsubscribe_topic(ChannelKind::Markets, topic, sub)
+            .await
     }
 
     /// Subscribes to subaccount updates (orders, fills, positions, balances).
     ///
     /// This requires authentication and will only work for private WebSocket clients
-    /// created with [`Self::new_private`].
+    /// created with [`Self::new_private`]. Subaccount streams stay pinned to the
+    /// primary slot: the Indexer caps them at 256 per connection, which is well
+    /// above realistic per-process usage and keeps related fill/position events
+    /// on a single in-order stream.
     ///
     /// # Errors
     ///
@@ -874,17 +1197,12 @@ impl DydxWebSocketClient {
         }
         let id = format!("{address}/{subaccount_number}");
         let topic = Self::topic(DydxWsChannel::Subaccounts, Some(&id));
-        if !self.subscriptions.add_reference(&topic) {
-            return Ok(());
-        }
-
         let sub = DydxSubscription {
             op: DydxWsOperation::Subscribe,
             channel: DydxWsChannel::Subaccounts,
             id: Some(id),
         };
-
-        self.send_and_track_subscribe(sub, &topic).await
+        self.subscribe_pinned(topic, sub).await
     }
 
     /// Unsubscribes from subaccount updates.
@@ -899,17 +1217,12 @@ impl DydxWebSocketClient {
     ) -> DydxWsResult<()> {
         let id = format!("{address}/{subaccount_number}");
         let topic = Self::topic(DydxWsChannel::Subaccounts, Some(&id));
-        if !self.subscriptions.remove_reference(&topic) {
-            return Ok(());
-        }
-
         let sub = DydxSubscription {
             op: DydxWsOperation::Unsubscribe,
             channel: DydxWsChannel::Subaccounts,
             id: Some(id),
         };
-
-        self.send_and_track_unsubscribe(sub, &topic).await
+        self.unsubscribe_pinned(topic, sub).await
     }
 
     /// Subscribes to block height updates.
@@ -923,17 +1236,12 @@ impl DydxWebSocketClient {
     /// <https://docs.dydx.trade/developers/indexer/websockets#block-height-channel>
     pub async fn subscribe_block_height(&self) -> DydxWsResult<()> {
         let topic = Self::topic(DydxWsChannel::BlockHeight, None);
-        if !self.subscriptions.add_reference(&topic) {
-            return Ok(());
-        }
-
         let sub = DydxSubscription {
             op: DydxWsOperation::Subscribe,
             channel: DydxWsChannel::BlockHeight,
             id: None,
         };
-
-        self.send_and_track_subscribe(sub, &topic).await
+        self.subscribe_pinned(topic, sub).await
     }
 
     /// Unsubscribes from block height updates.
@@ -943,16 +1251,300 @@ impl DydxWebSocketClient {
     /// Returns an error if the unsubscription request fails.
     pub async fn unsubscribe_block_height(&self) -> DydxWsResult<()> {
         let topic = Self::topic(DydxWsChannel::BlockHeight, None);
-        if !self.subscriptions.remove_reference(&topic) {
-            return Ok(());
-        }
-
         let sub = DydxSubscription {
             op: DydxWsOperation::Unsubscribe,
             channel: DydxWsChannel::BlockHeight,
             id: None,
         };
+        self.unsubscribe_pinned(topic, sub).await
+    }
 
-        self.send_and_track_unsubscribe(sub, &topic).await
+    async fn subscribe_pinned(&self, topic: String, sub_msg: DydxSubscription) -> DydxWsResult<()> {
+        let _connect_guard = self.connect_lock.lock().await;
+        let generation = self.admission_generation()?;
+
+        {
+            let admission = self.admission.lock().expect("admission lock poisoned");
+            if admission.closed || admission.generation != generation {
+                return Err(DydxWsError::Transport(
+                    "WebSocket connection pool is closed".to_string(),
+                ));
+            }
+            let mut slots = self.slots.lock().expect("slots lock poisoned");
+            if let Some(slot) = slots.iter_mut().find(|s| s.topics.contains_key(&topic)) {
+                *slot.topics.get_mut(&topic).expect("topic refcount present") += 1;
+                return Ok(());
+            }
+        }
+
+        if self.slots.lock().expect("slots lock poisoned").is_empty() {
+            let new_slot = self.create_connection(0).await?;
+            let admission = self.admission.lock().expect("admission lock poisoned");
+            let mut slots = self.slots.lock().expect("slots lock poisoned");
+
+            if admission.closed || admission.generation != generation {
+                let _ = new_slot.cmd_tx.send(HandlerCommand::Disconnect);
+                slots.push(new_slot);
+                return Err(DydxWsError::Transport(
+                    "WebSocket connection was canceled by shutdown".to_string(),
+                ));
+            }
+            self.connection_mode.store(new_slot.connection_mode.clone());
+            slots.push(new_slot);
+        }
+
+        let admission = self.admission.lock().expect("admission lock poisoned");
+        if admission.closed || admission.generation != generation {
+            return Err(DydxWsError::Transport(
+                "WebSocket connection pool is closed".to_string(),
+            ));
+        }
+        let mut slots = self.slots.lock().expect("slots lock poisoned");
+        let slot = slots.first_mut().expect("primary slot exists");
+        slot.subscriptions_state.mark_subscribe(&topic);
+        slot.cmd_tx
+            .send(HandlerCommand::RegisterSubscription {
+                topic: topic.clone(),
+                subscription: sub_msg.clone(),
+            })
+            .map_err(|e| {
+                slot.subscriptions_state.mark_failure(&topic);
+                DydxWsError::Transport(format!("Primary slot unavailable: {e}"))
+            })?;
+        let payload = serde_json::to_string(&sub_msg)?;
+        if let Err(e) = slot.cmd_tx.send(HandlerCommand::SendText(payload)) {
+            slot.subscriptions_state.mark_failure(&topic);
+            let _ = slot.cmd_tx.send(HandlerCommand::UnregisterSubscription {
+                topic: topic.clone(),
+            });
+            return Err(DydxWsError::Transport(format!(
+                "Primary slot send failed: {e}"
+            )));
+        }
+        slot.topics.insert(topic, 1);
+        Ok(())
+    }
+
+    async fn unsubscribe_pinned(
+        &self,
+        topic: String,
+        unsub_msg: DydxSubscription,
+    ) -> DydxWsResult<()> {
+        let _connect_guard = self.connect_lock.lock().await;
+        let _generation = self.admission_generation()?;
+        let admission = self.admission.lock().expect("admission lock poisoned");
+        if admission.closed {
+            return Err(DydxWsError::Transport(
+                "WebSocket connection pool is closed".to_string(),
+            ));
+        }
+        let mut slots = self.slots.lock().expect("slots lock poisoned");
+        let Some(slot) = slots.first_mut() else {
+            return Ok(());
+        };
+        let Some(refcount) = slot.topics.get_mut(&topic) else {
+            return Ok(());
+        };
+
+        if *refcount > 1 {
+            *refcount -= 1;
+            return Ok(());
+        }
+        slot.subscriptions_state.mark_unsubscribe(&topic);
+        let payload = serde_json::to_string(&unsub_msg)?;
+        if let Err(e) = slot.cmd_tx.send(HandlerCommand::SendText(payload)) {
+            slot.subscriptions_state.mark_subscribe(&topic);
+            return Err(DydxWsError::Transport(format!(
+                "Primary slot send failed: {e}"
+            )));
+        }
+        let _ = slot.cmd_tx.send(HandlerCommand::UnregisterSubscription {
+            topic: topic.clone(),
+        });
+        slot.topics.remove(&topic);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct ConnectionSlots {
+    slots: Mutex<Vec<ConnectionSlot>>,
+    shutdown_errors: Mutex<Vec<String>>,
+}
+
+impl ConnectionSlots {
+    fn new() -> Self {
+        Self {
+            slots: Mutex::new(Vec::new()),
+            shutdown_errors: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn push_shutdown_error(&self, error: String) {
+        self.shutdown_errors
+            .lock()
+            .expect("shutdown errors lock poisoned")
+            .push(error);
+    }
+
+    fn take_shutdown_errors(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .shutdown_errors
+                .lock()
+                .expect("shutdown errors lock poisoned"),
+        )
+    }
+}
+
+impl std::ops::Deref for ConnectionSlots {
+    type Target = Mutex<Vec<ConnectionSlot>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.slots
+    }
+}
+
+impl Drop for ConnectionSlots {
+    fn drop(&mut self) {
+        for slot in self.slots.get_mut().expect("slots lock poisoned").iter() {
+            if let Some(handle) = slot.handler_task.as_ref() {
+                handle.abort();
+            }
+
+            if let Some(control) = &slot.socket_control {
+                control.deregister();
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PoolAdmission {
+    generation: u64,
+    closed: bool,
+}
+
+struct ConnectionSlotBatch<'a> {
+    owner: &'a Mutex<Vec<ConnectionSlot>>,
+    slots: Vec<ConnectionSlot>,
+}
+
+impl<'a> ConnectionSlotBatch<'a> {
+    fn take(owner: &'a Mutex<Vec<ConnectionSlot>>) -> Self {
+        let slots = std::mem::take(&mut *owner.lock().expect("slots lock poisoned"));
+        Self { owner, slots }
+    }
+}
+
+impl Drop for ConnectionSlotBatch<'_> {
+    fn drop(&mut self) {
+        self.owner
+            .lock()
+            .expect("slots lock poisoned")
+            .extend(self.slots.drain(..));
+    }
+}
+
+// Scopes per-slot reconnect cleanup of in-progress bars to the candle topics
+// owned by the reconnecting connection, so one slot's reconnect does not
+// discard bars still aggregating on other healthy connections.
+pub(crate) fn candle_ids_from_topics(topics: &[String]) -> AHashSet<String> {
+    let prefix = format!(
+        "{}{}",
+        DydxWsChannel::Candles.as_ref(),
+        DYDX_WS_TOPIC_DELIMITER
+    );
+    topics
+        .iter()
+        .filter_map(|topic| topic.strip_prefix(&prefix).map(ToString::to_string))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_candle_ids_from_topics_extracts_only_candle_ids() {
+        let topics = vec![
+            "v4_candles:BTC-USD/1MIN".to_string(),
+            "v4_trades:BTC-USD".to_string(),
+            "v4_orderbook:ETH-USD".to_string(),
+            "v4_candles:ETH-USD/5MINS".to_string(),
+        ];
+
+        let ids = candle_ids_from_topics(&topics);
+
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("BTC-USD/1MIN"));
+        assert!(ids.contains("ETH-USD/5MINS"));
+        assert!(!ids.contains("BTC-USD"));
+    }
+
+    #[tokio::test]
+    async fn test_drop_clone_does_not_stop_connection_pool() {
+        let client = DydxWebSocketClient::new_public("wss://test".to_string(), None, None);
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        client
+            .slots
+            .lock()
+            .expect("slots lock poisoned")
+            .push(ConnectionSlot {
+                cmd_tx,
+                topics: AHashMap::new(),
+                channel_counts: [0; CHANNEL_KIND_COUNT],
+                subscriptions_state: SubscriptionState::new(DYDX_WS_TOPIC_DELIMITER),
+                handler_task: TaskSlot::from_handle(tokio::spawn(std::future::pending())),
+                connection_mode: Arc::new(AtomicU8::new(ConnectionMode::Active as u8)),
+                socket_control: None,
+            });
+        let clone = client.clone();
+
+        drop(clone);
+
+        let slots = client.slots.lock().expect("slots lock poisoned");
+        assert_eq!(slots.len(), 1);
+        assert!(
+            !slots[0]
+                .handler_task
+                .as_ref()
+                .expect("handler task")
+                .is_finished()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_disconnect_retains_connection_slot() {
+        let mut client = DydxWebSocketClient::new_public("wss://test".to_string(), None, None);
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        client
+            .slots
+            .lock()
+            .expect("slots lock poisoned")
+            .push(ConnectionSlot {
+                cmd_tx,
+                topics: AHashMap::new(),
+                channel_counts: [0; CHANNEL_KIND_COUNT],
+                subscriptions_state: SubscriptionState::new(DYDX_WS_TOPIC_DELIMITER),
+                handler_task: TaskSlot::from_handle(tokio::spawn(std::future::pending())),
+                connection_mode: Arc::new(AtomicU8::new(ConnectionMode::Active as u8)),
+                socket_control: None,
+            });
+
+        {
+            let disconnect = client.disconnect();
+            tokio::pin!(disconnect);
+            tokio::select! {
+                result = &mut disconnect => panic!("disconnect completed unexpectedly: {result:?}"),
+                command = cmd_rx.recv() => assert!(command.is_some()),
+            }
+        }
+
+        let slots = client.slots.lock().expect("slots lock poisoned");
+        assert_eq!(slots.len(), 1);
+        assert!(slots[0].handler_task.is_some());
     }
 }

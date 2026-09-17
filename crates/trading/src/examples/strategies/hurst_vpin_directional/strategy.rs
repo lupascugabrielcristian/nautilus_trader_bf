@@ -26,7 +26,7 @@ use nautilus_model::{
         OrderCanceled, OrderDenied, OrderExpired, OrderFilled, OrderRejected, PositionClosed,
         PositionOpened,
     },
-    identifiers::{ClientOrderId, PositionId, StrategyId},
+    identifiers::{ClientOrderId, PositionId},
     orders::{Order, OrderCore},
     types::Quantity,
 };
@@ -242,10 +242,12 @@ impl HurstVpinDirectional {
     }
 
     fn submit_entry(&mut self, side: OrderSide) -> anyhow::Result<()> {
-        let order = self.core.order_factory().market(
-            self.config.instrument_id,
+        let instrument_id = self.config.instrument_id;
+        let trade_size = self.config.trade_size;
+        let order = self.order().market(
+            instrument_id,
             side,
-            self.config.trade_size,
+            trade_size,
             Some(TimeInForce::Ioc),
             None, // reduce_only
             None, // quote_quantity
@@ -260,7 +262,7 @@ impl HurstVpinDirectional {
 
     fn submit_close(&mut self) -> anyhow::Result<()> {
         let instrument_id = self.config.instrument_id;
-        let strategy_id = StrategyId::from(self.actor_id.inner().as_str());
+        let strategy_id = self.strategy_id().expect("Strategy must be registered");
 
         let positions: Vec<(PositionId, Quantity, PositionSide)> = self
             .cache()
@@ -276,8 +278,10 @@ impl HurstVpinDirectional {
         self.exit_cooldown = true;
 
         for (position_id, quantity, side) in positions {
-            let closing_side = OrderCore::closing_side(side);
-            let close_order = self.core.order_factory().market(
+            let Some(closing_side) = OrderCore::closing_side(side) else {
+                continue;
+            };
+            let close_order = self.order().market(
                 instrument_id,
                 closing_side,
                 quantity,
@@ -298,7 +302,7 @@ impl HurstVpinDirectional {
 
     fn has_open_position(&self) -> bool {
         let instrument_id = self.config.instrument_id;
-        let strategy_id = StrategyId::from(self.actor_id.inner().as_str());
+        let strategy_id = self.strategy_id().expect("Strategy must be registered");
         !self
             .cache()
             .positions_open(None, Some(&instrument_id), Some(&strategy_id), None, None)
@@ -343,6 +347,28 @@ nautilus_strategy!(HurstVpinDirectional, {
             self.clear_latch_for(event.client_order_id);
         }
     }
+
+    fn on_order_filled(&mut self, event: &OrderFilled) {
+        if event.instrument_id != self.config.instrument_id {
+            return;
+        }
+
+        let closed = self
+            .cache()
+            .order(&event.client_order_id)
+            .is_some_and(|o| o.is_closed());
+
+        if closed {
+            self.clear_latch_for(event.client_order_id);
+        }
+    }
+
+    fn on_order_canceled(&mut self, event: &OrderCanceled) {
+        if event.instrument_id != self.config.instrument_id {
+            return;
+        }
+        self.clear_latch_for(event.client_order_id);
+    }
 });
 
 impl Debug for HurstVpinDirectional {
@@ -367,9 +393,7 @@ impl DataActor for HurstVpinDirectional {
         }
         {
             let cache = self.cache();
-            if cache.instrument(&instrument_id).is_none() {
-                anyhow::bail!("Instrument {instrument_id} not found in cache");
-            }
+            cache.try_instrument(&instrument_id)?;
         }
 
         self.subscribe_bars(self.config.bar_type, None, None);
@@ -380,8 +404,8 @@ impl DataActor for HurstVpinDirectional {
 
     fn on_stop(&mut self) -> anyhow::Result<()> {
         let instrument_id = self.config.instrument_id;
-        self.cancel_all_orders(instrument_id, None, None, None)?;
-        self.close_all_positions(instrument_id, None, None, None, None, None, None)?;
+        self.cancel_all_orders(instrument_id, None, None, true, None)?;
+        self.close_all_positions(instrument_id, None, None, None, None, None, None, None)?;
         self.unsubscribe_bars(self.config.bar_type, None, None);
         self.unsubscribe_quotes(instrument_id, None, None);
         self.unsubscribe_trades(instrument_id, None, None);
@@ -391,8 +415,8 @@ impl DataActor for HurstVpinDirectional {
     fn on_trade(&mut self, tick: &TradeTick) -> anyhow::Result<()> {
         let size = tick.size.as_f64();
         match tick.aggressor_side {
-            AggressorSide::Buyer => self.bucket_buy_volume += size,
-            AggressorSide::Seller => self.bucket_sell_volume += size,
+            AggressorSide::Buy => self.bucket_buy_volume += size,
+            AggressorSide::Sell => self.bucket_sell_volume += size,
             _ => {}
         }
         Ok(())
@@ -453,7 +477,7 @@ impl DataActor for HurstVpinDirectional {
             return Ok(());
         }
 
-        let strategy_id = StrategyId::from(self.actor_id.inner().as_str());
+        let strategy_id = self.strategy_id().expect("Strategy must be registered");
         let has_working = {
             let cache = self.cache();
             !cache
@@ -481,29 +505,6 @@ impl DataActor for HurstVpinDirectional {
         }
 
         self.try_open_position()
-    }
-
-    fn on_order_filled(&mut self, event: &OrderFilled) -> anyhow::Result<()> {
-        if event.instrument_id != self.config.instrument_id {
-            return Ok(());
-        }
-
-        let closed = self
-            .cache()
-            .order(&event.client_order_id)
-            .is_some_and(|o| o.is_closed());
-        if closed {
-            self.clear_latch_for(event.client_order_id);
-        }
-        Ok(())
-    }
-
-    fn on_order_canceled(&mut self, event: &OrderCanceled) -> anyhow::Result<()> {
-        if event.instrument_id != self.config.instrument_id {
-            return Ok(());
-        }
-        self.clear_latch_for(event.client_order_id);
-        Ok(())
     }
 
     fn on_reset(&mut self) -> anyhow::Result<()> {

@@ -75,19 +75,19 @@ position back down is the only exit path.
 
 ## Configuration
 
-| Parameter               | Type                 | Default    | Description                                                                          |
-|-------------------------|----------------------|------------|--------------------------------------------------------------------------------------|
-| `instrument_id`         | `InstrumentId`       | *required* | Target instrument the strategy quotes on.                                            |
-| `signal_instrument_id`  | `InstrumentId`       | *required* | Signal instrument (typically a synthetic) whose mid drives the signal residual.      |
-| `max_position`          | `Quantity`           | *required* | Hard cap on net exposure (long or short).                                            |
-| `trade_size`            | `Option<Quantity>`   | `None`     | Size per quote. When `None`, resolves from the instrument's `min_quantity`.          |
-| `half_spread_bps`       | `u32`                | `5`        | Half the desired quoted spread, in basis points of the anchor.                       |
-| `inventory_skew_factor` | `f64`                | `0.0`      | Price units per unit of net position. Both sides shift down by this times position.  |
-| `signal_skew_factor`    | `f64`                | `0.0`      | Price units per unit of normalized signal residual. Both sides shift up.             |
-| `signal_baseline`       | `Option<f64>`        | `None`     | Baseline price for the signal residual. When `None`, captured from the first signal. |
-| `requote_threshold_bps` | `u32`                | `5`        | Minimum anchor or signal-residual price-impact move in bps before re-quoting.        |
-| `expire_time_secs`      | `Option<u64>`        | `None`     | Order expiry in seconds. When set, orders use GTD time-in-force.                     |
-| `on_cancel_resubmit`    | `bool`               | `false`    | Resubmit on the next quote after an external cancel.                                 |
+| Parameter               | Type               | Default    | Description                                                                          |
+| ----------------------- | ------------------ | ---------- | ------------------------------------------------------------------------------------ |
+| `instrument_id`         | `InstrumentId`     | *required* | Target instrument the strategy quotes on.                                            |
+| `signal_instrument_id`  | `InstrumentId`     | *required* | Signal instrument (typically a synthetic) whose mid drives the signal residual.      |
+| `max_position`          | `Quantity`         | *required* | Hard cap on net exposure (long or short).                                            |
+| `trade_size`            | `Option<Quantity>` | `None`     | Size per quote. When `None`, resolves from the instrument's `min_quantity`.          |
+| `half_spread_bps`       | `u32`              | `5`        | Half the desired quoted spread, in basis points of the anchor.                       |
+| `inventory_skew_factor` | `f64`              | `0.0`      | Price units per unit of net position. Both sides shift down by this times position.  |
+| `signal_skew_factor`    | `f64`              | `0.0`      | Price units per unit of normalized signal residual. Both sides shift up.             |
+| `signal_baseline`       | `Option<f64>`      | `None`     | Baseline price for the signal residual. When `None`, captured from the first signal. |
+| `requote_threshold_bps` | `u32`              | `5`        | Minimum anchor or signal-residual price-impact move in bps before re-quoting.        |
+| `expire_time_secs`      | `Option<u64>`      | `None`     | Order expiry in seconds. When set, orders use GTD time-in-force.                     |
+| `on_cancel_resubmit`    | `bool`             | `false`    | Resubmit on the next quote after an external cancel.                                 |
 
 ### Tuning guidelines
 
@@ -116,16 +116,16 @@ use nautilus_trading::examples::strategies::{
     CompositeMarketMaker, CompositeMarketMakerConfig,
 };
 
-let config = CompositeMarketMakerConfig::new(
-    InstrumentId::from("OCPI-H100-PERP.AX"),
-    InstrumentId::from("SEMI-COMPOSITE.SYNTH"),
-    Quantity::from("100"),
-)
-.with_trade_size(Quantity::from("100"))
-.with_half_spread_bps(25)
-.with_inventory_skew_factor(0.0005)
-.with_signal_skew_factor(0.5)
-.with_requote_threshold_bps(10);
+let config = CompositeMarketMakerConfig::builder()
+    .instrument_id(InstrumentId::from("OCPI-H100-PERP.AX"))
+    .signal_instrument_id(InstrumentId::from("SEMI-COMPOSITE.SYNTH"))
+    .max_position(Quantity::from("100"))
+    .trade_size(Quantity::from("100"))
+    .half_spread_bps(25)
+    .inventory_skew_factor(0.0005)
+    .signal_skew_factor(0.5)
+    .requote_threshold_bps(10)
+    .build();
 
 let strategy = CompositeMarketMaker::new(config);
 node.add_strategy(strategy)?;
@@ -133,11 +133,11 @@ node.add_strategy(strategy)?;
 
 ## Python usage (v2)
 
-Pass the config to `add_native_strategy` on a `LiveNode` or `BacktestEngine`.
+Pass the config to `add_builtin_strategy` on a `LiveNode` or `BacktestEngine`.
 Python provides the configuration; the strategy runs entirely in Rust.
 
 ```python
-from nautilus_trader.core.nautilus_pyo3.trading import CompositeMarketMakerConfig
+from nautilus_trader.trading import CompositeMarketMakerConfig
 
 config = CompositeMarketMakerConfig(
     instrument_id=InstrumentId.from_str("OCPI-H100-PERP.AX"),
@@ -150,5 +150,5 @@ config = CompositeMarketMakerConfig(
     requote_threshold_bps=10,
 )
 
-node.add_native_strategy("CompositeMarketMaker", config)
+node.add_builtin_strategy("CompositeMarketMaker", config)
 ```

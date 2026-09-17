@@ -23,7 +23,10 @@
 //! - Parsing helpers
 //! - Test fixtures
 
+pub mod auth;
 pub mod consts;
 pub mod credential;
 pub mod enums;
 pub mod parse;
+
+pub(crate) mod retry;

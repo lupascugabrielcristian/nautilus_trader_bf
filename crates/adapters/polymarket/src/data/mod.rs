@@ -17,12 +17,15 @@
 
 mod auto_load;
 mod dispatch;
+mod effective_deltas;
 mod instruments;
 mod lifecycle;
 mod requests;
+mod runtime;
 mod subscriptions;
 
 use std::{
+    future::Future,
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
@@ -33,15 +36,17 @@ use std::{
 use ahash::AHashSet;
 use dashmap::DashMap;
 use nautilus_common::{
+    cache::InstrumentLookupError,
     clients::DataClient,
-    live::{get_runtime, runner::get_data_event_sender},
+    live::runner::get_data_event_sender,
     messages::{
         DataEvent,
         data::{
             RequestBookSnapshot, RequestCustomData, RequestInstrument, RequestInstruments,
-            RequestTrades, SubscribeBookDeltas, SubscribeCustomData, SubscribeInstruments,
-            SubscribeQuotes, SubscribeTrades, UnsubscribeBookDeltas, UnsubscribeCustomData,
-            UnsubscribeQuotes, UnsubscribeTrades,
+            RequestTrades, SubscribeBookDeltas, SubscribeBookDepth10, SubscribeCustomData,
+            SubscribeInstrument, SubscribeInstrumentClose, SubscribeInstrumentStatus,
+            SubscribeInstruments, SubscribeQuotes, SubscribeTrades, UnsubscribeBookDeltas,
+            UnsubscribeCustomData, UnsubscribeInstrument, UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
     msgbus::TypedHandler,
@@ -49,6 +54,10 @@ use nautilus_common::{
 use nautilus_core::{
     AtomicMap, AtomicSet,
     time::{AtomicTime, get_atomic_clock_realtime},
+};
+use nautilus_live::{
+    SocketControl, SocketControlFactory,
+    task::{TaskGroup, TaskSpawner},
 };
 use nautilus_model::{
     data::QuoteTick,
@@ -58,7 +67,7 @@ use nautilus_model::{
     instruments::InstrumentAny,
     orderbook::OrderBook,
 };
-use tokio::task::JoinHandle;
+use nautilus_network::websocket::proxy::ProxyUrl;
 use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
@@ -68,7 +77,8 @@ use self::{
         request_book_snapshot, request_data, request_instrument, request_instruments,
         request_trades,
     },
-    subscriptions::{resolve_token_id_from, sync_ws_subscription_async},
+    runtime::is_instrument_expired_and_not_reported_open,
+    subscriptions::{resolve_token_id_from, sync_ws_subscription_with_terminal_async},
 };
 use crate::{
     common::consts::POLYMARKET_VENUE,
@@ -81,7 +91,7 @@ use crate::{
     providers::PolymarketInstrumentProvider,
     resolve::ResolveWatchEntry,
     rtds::{PolymarketRtdsFeed, is_supported_rtds_data_type},
-    websocket::client::PolymarketWebSocketClient,
+    websocket::{RTDS_STREAMS_ENDPOINT, pool::PolymarketMarketConnectionPool},
 };
 
 const NEW_MARKET_FETCH_MAX_CONCURRENCY_CAP: usize = 64;
@@ -107,10 +117,10 @@ pub struct PolymarketDataClient {
     provider: PolymarketInstrumentProvider,
     clob_public_client: PolymarketClobPublicClient,
     data_api_client: PolymarketDataApiHttpClient,
-    ws_client: PolymarketWebSocketClient,
+    ws_client: PolymarketMarketConnectionPool,
     is_connected: AtomicBool,
     cancellation_token: CancellationToken,
-    tasks: Vec<JoinHandle<()>>,
+    tasks: TaskGroup,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     token_meta: Arc<DashMap<Ustr, TokenMeta>>,
@@ -128,22 +138,51 @@ pub struct PolymarketDataClient {
     ws_sub_mutex: Arc<tokio::sync::Mutex<()>>,
     pending_auto_loads: Arc<StdMutex<AHashSet<InstrumentId>>>,
     auto_load_scheduled: Arc<AtomicBool>,
+    closed_condition_ids: Arc<StdMutex<AHashSet<String>>>,
     position_event_handler: Option<TypedHandler<PositionEvent>>,
     rtds_feed: PolymarketRtdsFeed,
+    rtds_socket_control: Option<SocketControl>,
+    proxy_url: Option<ProxyUrl>,
+    reset_pending: bool,
+    shutdown_errors: Vec<String>,
 }
 
 impl PolymarketDataClient {
     /// Creates a new [`PolymarketDataClient`].
     pub fn new(
         client_id: ClientId,
+        config: PolymarketDataClientConfig,
+        gamma_client: PolymarketGammaHttpClient,
+        clob_public_client: PolymarketClobPublicClient,
+        data_api_client: PolymarketDataApiHttpClient,
+        ws_client: PolymarketMarketConnectionPool,
+    ) -> Self {
+        Self::new_with_proxy(
+            client_id,
+            config,
+            gamma_client,
+            clob_public_client,
+            data_api_client,
+            ws_client,
+            None,
+        )
+    }
+
+    /// Creates a new data client with an optional validated proxy URL.
+    pub fn new_with_proxy(
+        client_id: ClientId,
         mut config: PolymarketDataClientConfig,
         gamma_client: PolymarketGammaHttpClient,
         clob_public_client: PolymarketClobPublicClient,
         data_api_client: PolymarketDataApiHttpClient,
-        ws_client: PolymarketWebSocketClient,
+        ws_client: PolymarketMarketConnectionPool,
+        proxy_url: Option<ProxyUrl>,
     ) -> Self {
         let clock = get_atomic_clock_realtime();
         let data_sender = get_data_event_sender();
+        let socket_factory = SocketControlFactory::new(client_id, Some(*POLYMARKET_VENUE));
+        let ws_client = ws_client.with_socket_factory(socket_factory.clone());
+        let rtds_socket_control = Some(socket_factory.control(RTDS_STREAMS_ENDPOINT));
         let provider =
             PolymarketInstrumentProvider::new(gamma_client, config.instrument_config.clone());
         let configured_fetch_max_concurrency = config.new_market_fetch_max_concurrency;
@@ -164,6 +203,8 @@ impl PolymarketDataClient {
         let rtds_url = config.rtds_url();
         let rtds_transport_backend = config.transport_backend;
         let rtds_data_sender = data_sender.clone();
+        let tasks = TaskGroup::new();
+        let cancellation_token = tasks.cancellation_token();
 
         Self {
             clock,
@@ -174,8 +215,8 @@ impl PolymarketDataClient {
             data_api_client,
             ws_client,
             is_connected: AtomicBool::new(false),
-            cancellation_token: CancellationToken::new(),
-            tasks: Vec::new(),
+            cancellation_token,
+            tasks,
             data_sender,
             instruments: Arc::new(AtomicMap::new()),
             token_meta: Arc::new(DashMap::new()),
@@ -195,13 +236,20 @@ impl PolymarketDataClient {
             ws_sub_mutex: Arc::new(tokio::sync::Mutex::new(())),
             pending_auto_loads: Arc::new(StdMutex::new(AHashSet::new())),
             auto_load_scheduled: Arc::new(AtomicBool::new(false)),
+            closed_condition_ids: Arc::new(StdMutex::new(AHashSet::new())),
             position_event_handler: None,
-            rtds_feed: PolymarketRtdsFeed::new(
+            rtds_feed: PolymarketRtdsFeed::new_with_proxy_and_socket_control(
                 rtds_url,
                 rtds_transport_backend,
                 clock,
                 rtds_data_sender,
+                proxy_url.clone(),
+                rtds_socket_control.clone(),
             ),
+            rtds_socket_control,
+            proxy_url,
+            reset_pending: false,
+            shutdown_errors: Vec::new(),
         }
     }
 
@@ -223,6 +271,26 @@ impl PolymarketDataClient {
         &self.provider
     }
 
+    #[cfg(test)]
+    pub(crate) fn clob_public_client(&self) -> &PolymarketClobPublicClient {
+        &self.clob_public_client
+    }
+
+    #[cfg(test)]
+    pub(crate) fn data_api_client(&self) -> &PolymarketDataApiHttpClient {
+        &self.data_api_client
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ws_client(&self) -> &PolymarketMarketConnectionPool {
+        &self.ws_client
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rtds_feed(&self) -> &PolymarketRtdsFeed {
+        &self.rtds_feed
+    }
+
     /// Adds an instrument filter on the underlying provider.
     pub fn add_instrument_filter(&mut self, filter: Arc<dyn InstrumentFilter>) {
         self.provider.add_filter(filter);
@@ -238,6 +306,87 @@ impl PolymarketDataClient {
         resolve_token_id_from(&self.instruments, instrument_id)
     }
 
+    fn ensure_live_subscription_allowed(&self, instrument_id: InstrumentId) -> anyhow::Result<()> {
+        let now_ns = self.clock.get_time_ns();
+        let loaded = self.instruments.load();
+        let Some(instrument) = loaded.get(&instrument_id) else {
+            return Ok(());
+        };
+
+        if is_instrument_expired_and_not_reported_open(instrument, now_ns) {
+            anyhow::bail!(
+                "Instrument {instrument_id} is expired and no longer available for live subscription"
+            );
+        }
+
+        Ok(())
+    }
+
+    fn ensure_market_data_request_allowed(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> anyhow::Result<InstrumentAny> {
+        let loaded = self.instruments.load();
+        let instrument = loaded
+            .get(&instrument_id)
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?
+            .clone();
+
+        if is_instrument_expired_and_not_reported_open(&instrument, self.clock.get_time_ns()) {
+            anyhow::bail!(
+                "Instrument {instrument_id} is expired and no longer available for market data requests"
+            );
+        }
+
+        Ok(instrument)
+    }
+
+    fn add_live_subscription_intent(
+        &self,
+        instrument_id: InstrumentId,
+        subscriptions: &Arc<AtomicSet<InstrumentId>>,
+    ) -> bool {
+        self.add_live_subscription_intent_with_state(instrument_id, subscriptions, || {})
+    }
+
+    fn add_delta_subscription_intent(&self, instrument_id: InstrumentId) -> bool {
+        self.add_live_subscription_intent_with_state(instrument_id, &self.active_delta_subs, || {
+            if self.config.compute_effective_deltas {
+                self.order_books
+                    .entry(instrument_id)
+                    .or_insert_with(|| OrderBook::new(instrument_id, BookType::L2_MBP));
+            }
+        })
+    }
+
+    fn add_live_subscription_intent_with_state(
+        &self,
+        instrument_id: InstrumentId,
+        subscriptions: &Arc<AtomicSet<InstrumentId>>,
+        initialize_state: impl FnOnce(),
+    ) -> bool {
+        let Ok(condition_id) = crate::providers::extract_condition_id(&instrument_id) else {
+            subscriptions.insert(instrument_id);
+            initialize_state();
+            return true;
+        };
+        let closed = self
+            .closed_condition_ids
+            .lock()
+            .expect("closed_condition_ids mutex poisoned");
+
+        if closed.contains(&condition_id) {
+            log::debug!(
+                "Ignoring live subscription for terminally closed Polymarket condition {condition_id}"
+            );
+            return false;
+        }
+
+        subscriptions.insert(instrument_id);
+        initialize_state();
+        true
+    }
+
     // Spawns an async task that reconciles the WS subscription for
     // `instrument_id`. The task holds `ws_sub_mutex` across the wire send so
     // concurrent subscribe/unsubscribe calls deliver commands to the WS handler
@@ -250,20 +399,24 @@ impl PolymarketDataClient {
         let active_quote_subs = self.active_quote_subs.clone();
         let active_delta_subs = self.active_delta_subs.clone();
         let active_trade_subs = self.active_trade_subs.clone();
+        let closed_condition_ids = self.closed_condition_ids.clone();
         let ws_open_tokens = self.ws_open_tokens.clone();
         let ws_sub_mutex = self.ws_sub_mutex.clone();
-        let ws = self.ws_client.clone_subscription_handle();
+        let ws = self.ws_client.handle();
 
-        get_runtime().spawn(sync_ws_subscription_async(
+        if let Err(e) = self.tasks.spawn(sync_ws_subscription_with_terminal_async(
             instrument_id,
             token_id_str,
             active_quote_subs,
             active_delta_subs,
             active_trade_subs,
+            closed_condition_ids,
             ws_open_tokens,
             ws_sub_mutex,
             ws,
-        ));
+        )) {
+            log::debug!("Skipping Polymarket data task after shutdown began: {e}");
+        }
     }
 }
 
@@ -340,6 +493,23 @@ impl DataClient for PolymarketDataClient {
         Ok(())
     }
 
+    fn subscribe_instrument(&mut self, cmd: SubscribeInstrument) -> anyhow::Result<()> {
+        log::debug!(
+            "Subscribed to instrument definition updates for {}; shared instrument sources remain active",
+            cmd.instrument_id
+        );
+
+        Ok(())
+    }
+
+    fn unsubscribe_instrument(&mut self, cmd: &UnsubscribeInstrument) -> anyhow::Result<()> {
+        log::debug!(
+            "Unsubscribed from instrument {}; shared instrument sources remain active",
+            cmd.instrument_id
+        );
+        Ok(())
+    }
+
     fn subscribe(&mut self, cmd: SubscribeCustomData) -> anyhow::Result<()> {
         if !is_supported_rtds_data_type(&cmd.data_type) {
             log::debug!(
@@ -353,20 +523,17 @@ impl DataClient for PolymarketDataClient {
             "Tracking Polymarket RTDS custom data subscription: {}",
             cmd.data_type
         );
-        let Some(wire) = self.rtds_feed.track_subscribe(cmd.data_type)? else {
+        let changed = self.rtds_feed.track_subscribe(cmd.data_type)?;
+        if !changed {
             return Ok(());
-        };
+        }
 
         if !self.is_connected() {
             return Ok(());
         }
 
-        let feed = self.rtds_feed.clone();
-        get_runtime().spawn(async move {
-            if let Err(e) = feed.subscribe_live(wire).await {
-                log::error!("Failed to subscribe RTDS custom data: {e}");
-            }
-        });
+        self.rtds_feed
+            .request_reconcile(crate::rtds::ReconcileReason::DesiredChanged);
 
         Ok(())
     }
@@ -380,6 +547,7 @@ impl DataClient for PolymarketDataClient {
         }
 
         let instrument_id = cmd.instrument_id;
+        self.ensure_live_subscription_allowed(instrument_id)?;
         let cached = self.instruments.load().contains_key(&instrument_id);
 
         if !cached && !self.config.auto_load_missing_instruments {
@@ -389,10 +557,9 @@ impl DataClient for PolymarketDataClient {
         }
 
         // Mark intent before routing so unsubscribe can race-safely clear it.
-        self.active_delta_subs.insert(instrument_id);
-        self.order_books
-            .entry(instrument_id)
-            .or_insert_with(|| OrderBook::new(instrument_id, BookType::L2_MBP));
+        if !self.add_delta_subscription_intent(instrument_id) {
+            return Ok(());
+        }
 
         if !cached {
             self.queue_pending_load(instrument_id);
@@ -400,12 +567,18 @@ impl DataClient for PolymarketDataClient {
         }
 
         self.sync_ws_subscription(instrument_id);
-        log::debug!("Subscribed to book deltas for {instrument_id}");
         Ok(())
+    }
+
+    fn subscribe_book_depth10(&mut self, _cmd: SubscribeBookDepth10) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Polymarket does not support OrderBookDepth10 subscriptions; use managed L2_MBP order book deltas"
+        )
     }
 
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
+        self.ensure_live_subscription_allowed(instrument_id)?;
         let cached = self.instruments.load().contains_key(&instrument_id);
 
         if !cached && !self.config.auto_load_missing_instruments {
@@ -414,7 +587,9 @@ impl DataClient for PolymarketDataClient {
             );
         }
 
-        self.active_quote_subs.insert(instrument_id);
+        if !self.add_live_subscription_intent(instrument_id, &self.active_quote_subs) {
+            return Ok(());
+        }
 
         if !cached {
             self.queue_pending_load(instrument_id);
@@ -422,12 +597,12 @@ impl DataClient for PolymarketDataClient {
         }
 
         self.sync_ws_subscription(instrument_id);
-        log::debug!("Subscribed to quotes for {instrument_id}");
         Ok(())
     }
 
     fn subscribe_trades(&mut self, cmd: SubscribeTrades) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
+        self.ensure_live_subscription_allowed(instrument_id)?;
         let cached = self.instruments.load().contains_key(&instrument_id);
 
         if !cached && !self.config.auto_load_missing_instruments {
@@ -436,7 +611,9 @@ impl DataClient for PolymarketDataClient {
             );
         }
 
-        self.active_trade_subs.insert(instrument_id);
+        if !self.add_live_subscription_intent(instrument_id, &self.active_trade_subs) {
+            return Ok(());
+        }
 
         if !cached {
             self.queue_pending_load(instrument_id);
@@ -444,8 +621,22 @@ impl DataClient for PolymarketDataClient {
         }
 
         self.sync_ws_subscription(instrument_id);
-        log::debug!("Subscribed to trades for {instrument_id}");
         Ok(())
+    }
+
+    fn subscribe_instrument_status(
+        &mut self,
+        _cmd: SubscribeInstrumentStatus,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Polymarket does not support generic instrument status subscriptions; resolution status is owned by position tracking"
+        )
+    }
+
+    fn subscribe_instrument_close(&mut self, _cmd: SubscribeInstrumentClose) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Polymarket does not support generic instrument close subscriptions; resolution close is owned by position tracking"
+        )
     }
 
     fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
@@ -454,9 +645,8 @@ impl DataClient for PolymarketDataClient {
         self.pending_snapshot_after_tick_change
             .remove(&instrument_id);
         self.drop_pending_if_unwanted(instrument_id);
-        self.drop_local_book_state_if_unwanted(instrument_id);
+        self.drop_local_data_state_if_unwanted(instrument_id);
         self.sync_ws_subscription(instrument_id);
-        log::debug!("Unsubscribed from book deltas for {instrument_id}");
         Ok(())
     }
 
@@ -464,9 +654,8 @@ impl DataClient for PolymarketDataClient {
         let instrument_id = cmd.instrument_id;
         self.active_quote_subs.remove(&instrument_id);
         self.drop_pending_if_unwanted(instrument_id);
-        self.drop_local_book_state_if_unwanted(instrument_id);
+        self.drop_local_data_state_if_unwanted(instrument_id);
         self.sync_ws_subscription(instrument_id);
-        log::debug!("Unsubscribed from quotes for {instrument_id}");
         Ok(())
     }
 
@@ -475,7 +664,6 @@ impl DataClient for PolymarketDataClient {
         self.active_trade_subs.remove(&instrument_id);
         self.drop_pending_if_unwanted(instrument_id);
         self.sync_ws_subscription(instrument_id);
-        log::debug!("Unsubscribed from trades for {instrument_id}");
         Ok(())
     }
 
@@ -492,21 +680,27 @@ impl DataClient for PolymarketDataClient {
             "Tracking Polymarket RTDS custom data unsubscription: {}",
             cmd.data_type
         );
-        let Some(wire) = self.rtds_feed.track_unsubscribe(&cmd.data_type)? else {
+        let changed = self.rtds_feed.track_unsubscribe(&cmd.data_type)?;
+        if !changed {
             return Ok(());
-        };
+        }
 
         if !self.is_connected() {
             return Ok(());
         }
 
-        let feed = self.rtds_feed.clone();
-        get_runtime().spawn(async move {
-            if let Err(e) = feed.unsubscribe_live(wire).await {
-                log::error!("Failed to unsubscribe RTDS custom data: {e}");
-            }
-        });
+        self.rtds_feed
+            .request_reconcile(crate::rtds::ReconcileReason::DesiredChanged);
 
         Ok(())
+    }
+}
+
+pub(super) fn spawn_task<F>(tasks: &TaskSpawner, future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    if let Err(e) = tasks.spawn(future) {
+        log::debug!("Skipping Polymarket data task after shutdown began: {e}");
     }
 }

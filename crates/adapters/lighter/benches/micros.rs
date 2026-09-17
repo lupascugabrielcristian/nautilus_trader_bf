@@ -23,7 +23,9 @@
 //! the gain landed in the layer it was supposed to.
 //!
 //! Same canonical surface every adapter should ship; pair this with
-//! `data.rs`, `exec.rs`, and `signing_sign_verify.rs`.
+//! `data.rs`, `exec.rs`, and `signing_sign_verify.rs`. The signing rows here
+//! exist only to sit next to decode and JSON render; quote
+//! `signing_sign_verify.rs` when publishing a signing number.
 
 mod common;
 
@@ -245,7 +247,7 @@ fn bench_mulgen_ct(c: &mut Criterion) {
     group.finish();
 }
 
-// Only the `sign_tx` portion (hash + Schnorr sign) — pairs with the
+// Only the `sign_tx` portion (hash + Schnorr sign) - pairs with the
 // `exec_pipeline/submit_limit` bench which adds the wire JSON render on top.
 fn bench_sign_tx_create_order(c: &mut Criterion) {
     let sk = fixed_sk();

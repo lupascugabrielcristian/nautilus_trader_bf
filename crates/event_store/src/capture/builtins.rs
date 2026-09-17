@@ -28,9 +28,9 @@
 //! tag so forensics scans see entries identical to the bare-type capture path.
 //!
 //! The payload serialization format is MessagePack via `rmp-serde`. The on-disk envelope
-//! codec stays bincode (positional, non-self-describing); MessagePack inside the payload
-//! handles the upstream Nautilus types that carry `#[serde(tag = "type")]` internal
-//! tagging, which a non-self-describing format like bincode cannot round-trip.
+//! uses the positional codec; MessagePack inside the payload handles the upstream Nautilus
+//! types that carry `#[serde(tag = "type")]` internal tagging, which a non-self-describing
+//! format cannot round-trip.
 
 use std::collections::HashSet;
 
@@ -43,8 +43,8 @@ use nautilus_common::{
             InstrumentResponse, InstrumentsResponse, QuotesResponse, TradesResponse,
         },
         execution::{
-            BatchCancelOrders, CancelAllOrders, CancelOrder, ExecutionReport, ModifyOrder,
-            QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
+            BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ExecutionReport,
+            ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
         },
     },
     timer::TimeEvent,
@@ -54,7 +54,7 @@ use nautilus_model::{
     data::DataType,
     events::{
         AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied,
-        OrderEmulated, OrderEventAny, OrderExpired, OrderFilled, OrderInitialized,
+        OrderEmulated, OrderEventAny, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
         OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased,
         OrderSubmitted, OrderTriggered, OrderUpdated, PositionAdjusted, PositionChanged,
         PositionClosed, PositionEvent, PositionOpened,
@@ -81,6 +81,8 @@ pub const PAYLOAD_TYPE_SUBMIT_ORDER: &str = "SubmitOrder";
 pub const PAYLOAD_TYPE_SUBMIT_ORDER_LIST: &str = "SubmitOrderList";
 /// The canonical `payload_type` tag for [`ModifyOrder`].
 pub const PAYLOAD_TYPE_MODIFY_ORDER: &str = "ModifyOrder";
+/// The canonical `payload_type` tag for [`BatchModifyOrders`].
+pub const PAYLOAD_TYPE_BATCH_MODIFY_ORDERS: &str = "BatchModifyOrders";
 /// The canonical `payload_type` tag for [`CancelOrder`].
 pub const PAYLOAD_TYPE_CANCEL_ORDER: &str = "CancelOrder";
 /// The canonical `payload_type` tag for [`CancelAllOrders`].
@@ -124,6 +126,8 @@ pub const PAYLOAD_TYPE_ORDER_CANCEL_REJECTED: &str = "OrderCancelRejected";
 pub const PAYLOAD_TYPE_ORDER_UPDATED: &str = "OrderUpdated";
 /// The canonical `payload_type` tag for [`OrderFilled`].
 pub const PAYLOAD_TYPE_ORDER_FILLED: &str = "OrderFilled";
+/// The canonical `payload_type` tag for [`OrderFillVoided`].
+pub const PAYLOAD_TYPE_ORDER_FILL_VOIDED: &str = "OrderFillVoided";
 /// The canonical `payload_type` tag for [`OrderStatusReport`].
 pub const PAYLOAD_TYPE_ORDER_STATUS_REPORT: &str = "OrderStatusReport";
 /// The canonical `payload_type` tag for [`FillReport`].
@@ -207,6 +211,7 @@ pub(crate) const DEFAULT_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
     PAYLOAD_TYPE_SUBMIT_ORDER,
     PAYLOAD_TYPE_SUBMIT_ORDER_LIST,
     PAYLOAD_TYPE_MODIFY_ORDER,
+    PAYLOAD_TYPE_BATCH_MODIFY_ORDERS,
     PAYLOAD_TYPE_CANCEL_ORDER,
     PAYLOAD_TYPE_CANCEL_ALL_ORDERS,
     PAYLOAD_TYPE_BATCH_CANCEL_ORDERS,
@@ -228,6 +233,7 @@ pub(crate) const DEFAULT_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
     PAYLOAD_TYPE_ORDER_CANCEL_REJECTED,
     PAYLOAD_TYPE_ORDER_UPDATED,
     PAYLOAD_TYPE_ORDER_FILLED,
+    PAYLOAD_TYPE_ORDER_FILL_VOIDED,
     PAYLOAD_TYPE_ORDER_STATUS_REPORT,
     PAYLOAD_TYPE_FILL_REPORT,
     PAYLOAD_TYPE_ORDER_WITH_FILLS,
@@ -349,6 +355,7 @@ fn register_default_headers(registry: &mut EncoderRegistry) {
     registry.register_headers::<SubmitOrder, _>(extract_submit_order_headers);
     registry.register_headers::<SubmitOrderList, _>(extract_submit_order_list_headers);
     registry.register_headers::<ModifyOrder, _>(extract_modify_order_headers);
+    registry.register_headers::<BatchModifyOrders, _>(extract_batch_modify_orders_headers);
     registry.register_headers::<CancelOrder, _>(extract_cancel_order_headers);
     registry.register_headers::<CancelAllOrders, _>(extract_cancel_all_orders_headers);
     registry.register_headers::<BatchCancelOrders, _>(extract_batch_cancel_orders_headers);
@@ -361,8 +368,9 @@ fn register_default_headers(registry: &mut EncoderRegistry) {
 
 /// Attaches identity extractors for the types production dispatch pushes through more
 /// than one tap-visible boundary (portfolio endpoint send plus strategy topic publish,
-/// command hops through risk to execution, account states on both dispatch paths), so
-/// the adapter captures each logical message exactly once. The venue report types
+/// command hops through risk to execution, account states on both dispatch paths, data
+/// commands through the queue endpoint and the drained execute endpoint), so the
+/// adapter captures each logical message exactly once. The venue report types
 /// deliberately carry no extractor: the raw `reconciliation.raw.*` publish and the
 /// engine-bound dispatch are distinct capture boundaries.
 fn register_default_identities(registry: &mut EncoderRegistry) {
@@ -371,6 +379,23 @@ fn register_default_identities(registry: &mut EncoderRegistry) {
     registry.register_identity::<TradingCommand, _>(|c| Some(extract_trading_command_identity(c)));
     registry.register_identity::<OrderEventAny, _>(|e| Some(extract_order_event_any_identity(e)));
     registry.register_identity::<AccountState, _>(|state| Some(state.event_id));
+    registry.register_identity::<DataCommand, _>(extract_data_command_identity);
+}
+
+fn extract_data_command_identity(command: &DataCommand) -> Option<UUID4> {
+    match command {
+        DataCommand::Request(cmd) => Some(*cmd.request_id()),
+        DataCommand::Subscribe(cmd) => Some(cmd.command_id()),
+        DataCommand::Unsubscribe(cmd) => Some(cmd.command_id()),
+        #[cfg(feature = "defi")]
+        DataCommand::DefiRequest(cmd) => Some(*cmd.request_id()),
+        #[cfg(feature = "defi")]
+        DataCommand::DefiSubscribe(cmd) => Some(cmd.command_id()),
+        #[cfg(feature = "defi")]
+        DataCommand::DefiUnsubscribe(cmd) => Some(cmd.command_id()),
+        // `DataCommand` is `#[non_exhaustive]`; future variants capture per dispatch
+        _ => None,
+    }
 }
 
 fn extract_trading_command_identity(command: &TradingCommand) -> UUID4 {
@@ -378,9 +403,10 @@ fn extract_trading_command_identity(command: &TradingCommand) -> UUID4 {
         TradingCommand::SubmitOrder(c) => c.command_id,
         TradingCommand::SubmitOrderList(c) => c.command_id,
         TradingCommand::ModifyOrder(c) => c.command_id,
+        TradingCommand::ModifyOrders(c) => c.command_id,
         TradingCommand::CancelOrder(c) => c.command_id,
+        TradingCommand::CancelOrders(c) => c.command_id,
         TradingCommand::CancelAllOrders(c) => c.command_id,
-        TradingCommand::BatchCancelOrders(c) => c.command_id,
         TradingCommand::QueryOrder(c) => c.command_id,
         TradingCommand::QueryAccount(c) => c.command_id,
     }
@@ -404,6 +430,7 @@ fn extract_order_event_any_identity(event: &OrderEventAny) -> UUID4 {
         OrderEventAny::CancelRejected(e) => e.event_id,
         OrderEventAny::Updated(e) => e.event_id,
         OrderEventAny::Filled(e) => e.event_id,
+        OrderEventAny::FillVoided(e) => e.event_id,
     }
 }
 
@@ -423,6 +450,10 @@ fn extract_submit_order_list_headers(cmd: &SubmitOrderList) -> Headers {
 }
 
 fn extract_modify_order_headers(cmd: &ModifyOrder) -> Headers {
+    headers_from_fields(cmd.correlation_id, cmd.causation_id)
+}
+
+fn extract_batch_modify_orders_headers(cmd: &BatchModifyOrders) -> Headers {
     headers_from_fields(cmd.correlation_id, cmd.causation_id)
 }
 
@@ -454,9 +485,10 @@ fn extract_trading_command_headers(command: &TradingCommand) -> Headers {
         TradingCommand::SubmitOrder(cmd) => extract_submit_order_headers(cmd),
         TradingCommand::SubmitOrderList(cmd) => extract_submit_order_list_headers(cmd),
         TradingCommand::ModifyOrder(cmd) => extract_modify_order_headers(cmd),
+        TradingCommand::ModifyOrders(cmd) => extract_batch_modify_orders_headers(cmd),
         TradingCommand::CancelOrder(cmd) => extract_cancel_order_headers(cmd),
+        TradingCommand::CancelOrders(cmd) => extract_batch_cancel_orders_headers(cmd),
         TradingCommand::CancelAllOrders(cmd) => extract_cancel_all_orders_headers(cmd),
-        TradingCommand::BatchCancelOrders(cmd) => extract_batch_cancel_orders_headers(cmd),
         TradingCommand::QueryOrder(cmd) => extract_query_order_headers(cmd),
         TradingCommand::QueryAccount(cmd) => extract_query_account_headers(cmd),
     }
@@ -550,9 +582,10 @@ pub fn encode_trading_command(command: &TradingCommand) -> Result<EncodedPayload
         }
         TradingCommand::SubmitOrderList(cmd) => encode_submit_order_list(cmd),
         TradingCommand::ModifyOrder(cmd) => encode_modify_order(cmd),
+        TradingCommand::ModifyOrders(cmd) => encode_batch_modify_orders(cmd),
         TradingCommand::CancelOrder(cmd) => encode_cancel_order(cmd),
+        TradingCommand::CancelOrders(cmd) => encode_batch_cancel_orders(cmd),
         TradingCommand::CancelAllOrders(cmd) => encode_cancel_all_orders(cmd),
-        TradingCommand::BatchCancelOrders(cmd) => encode_batch_cancel_orders(cmd),
         TradingCommand::QueryOrder(cmd) => encode_query_order(cmd),
         TradingCommand::QueryAccount(cmd) => encode_query_account(cmd),
     }
@@ -586,6 +619,7 @@ pub fn encode_order_event_any(event: &OrderEventAny) -> Result<EncodedPayload, E
         OrderEventAny::CancelRejected(e) => encode_order_cancel_rejected(e),
         OrderEventAny::Updated(e) => encode_order_updated(e),
         OrderEventAny::Filled(e) => Ok(retag(encode_order_filled(e)?, PAYLOAD_TYPE_ORDER_FILLED)),
+        OrderEventAny::FillVoided(e) => encode_order_fill_voided(e),
     }
 }
 
@@ -904,6 +938,26 @@ fn encode_modify_order(cmd: &ModifyOrder) -> Result<EncodedPayload, EncodeError>
     )
 }
 
+fn encode_batch_modify_orders(cmd: &BatchModifyOrders) -> Result<EncodedPayload, EncodeError> {
+    let payload = encode_serde(cmd)?;
+    let mut index_keys = Vec::with_capacity(cmd.modifies.len() * 2);
+    for c in &cmd.modifies {
+        index_keys.push(IndexKey::new(
+            IndexKind::ClientOrderId,
+            c.client_order_id.to_string(),
+        ));
+
+        if let Some(venue) = c.venue_order_id {
+            index_keys.push(IndexKey::new(IndexKind::VenueOrderId, venue.to_string()));
+        }
+    }
+    Ok(EncodedPayload::with_payload_type(
+        payload_type(PAYLOAD_TYPE_BATCH_MODIFY_ORDERS),
+        payload,
+        index_keys,
+    ))
+}
+
 fn encode_cancel_order(cmd: &CancelOrder) -> Result<EncodedPayload, EncodeError> {
     encode_with_order_ids(
         cmd,
@@ -1092,6 +1146,15 @@ fn encode_order_updated(e: &OrderUpdated) -> Result<EncodedPayload, EncodeError>
         PAYLOAD_TYPE_ORDER_UPDATED,
         e.client_order_id.to_string(),
         e.venue_order_id.map(|v| v.to_string()),
+    )
+}
+
+fn encode_order_fill_voided(e: &OrderFillVoided) -> Result<EncodedPayload, EncodeError> {
+    encode_with_order_ids(
+        e,
+        PAYLOAD_TYPE_ORDER_FILL_VOIDED,
+        e.client_order_id.to_string(),
+        Some(e.venue_order_id.to_string()),
     )
 }
 
@@ -1466,11 +1529,13 @@ mod tests {
         data::{Bar, BarType, stubs::stub_depth10},
         enums::{
             AccountType, BookType, LiquiditySide, OrderSide, OrderStatus, OrderType,
-            PositionAdjustmentType, PositionSide, PositionSideSpecified, TimeInForce,
+            PositionAdjustmentType, PositionSide, TimeInForce,
         },
         events::{
             PositionAdjusted, PositionChanged, PositionClosed, PositionOpened,
-            order::spec::{OrderFilledSpec, OrderInitializedSpec, OrderSubmittedSpec},
+            order::spec::{
+                OrderFillVoidedSpec, OrderFilledSpec, OrderInitializedSpec, OrderSubmittedSpec,
+            },
         },
         identifiers::{
             AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, PositionId, StrategyId,
@@ -1554,7 +1619,7 @@ mod tests {
             instrument_id(),
             Some(client_order_id()),
             venue_order_id(),
-            OrderSide::Buy,
+            OrderSide::Buy.into(),
             OrderType::Market,
             TimeInForce::Gtc,
             OrderStatus::Filled,
@@ -1694,6 +1759,57 @@ mod tests {
     }
 
     #[rstest]
+    fn default_registry_data_command_identity_dedupes_dispatch_hops() {
+        // Production pushes every queued data command through two tapped sends
+        // (queue, then drained execute); the identity must key both hops to the
+        // same command.
+        let registry = default_registry();
+
+        let request = make_request_command();
+        let expected_request = *request.request_id();
+        let subscribe = make_subscribe_command();
+        let expected_subscribe = subscribe.command_id();
+        let unsubscribe = make_unsubscribe_command();
+        let expected_unsubscribe = unsubscribe.command_id();
+
+        let cases = [
+            (DataCommand::Request(request), expected_request),
+            (DataCommand::Subscribe(subscribe), expected_subscribe),
+            (DataCommand::Unsubscribe(unsubscribe), expected_unsubscribe),
+        ];
+
+        for (command, expected) in cases {
+            assert_eq!(registry.identity_for_any(&command), Some(expected));
+        }
+    }
+
+    #[cfg(feature = "defi")]
+    #[rstest]
+    fn default_registry_defi_data_command_identity_dedupes_dispatch_hops() {
+        let registry = default_registry();
+
+        let request = make_defi_request_command();
+        let expected_request = *request.request_id();
+        let subscribe = make_defi_subscribe_command();
+        let expected_subscribe = subscribe.command_id();
+        let unsubscribe = make_defi_unsubscribe_command();
+        let expected_unsubscribe = unsubscribe.command_id();
+
+        let cases = [
+            (DataCommand::DefiRequest(request), expected_request),
+            (DataCommand::DefiSubscribe(subscribe), expected_subscribe),
+            (
+                DataCommand::DefiUnsubscribe(unsubscribe),
+                expected_unsubscribe,
+            ),
+        ];
+
+        for (command, expected) in cases {
+            assert_eq!(registry.identity_for_any(&command), Some(expected));
+        }
+    }
+
+    #[rstest]
     fn order_filled_payload_round_trips_through_msgpack() {
         let event = make_order_filled();
         let encoded = encode_order_filled(&event).expect("encode");
@@ -1766,13 +1882,27 @@ mod tests {
         )
     }
 
+    fn make_batch_modify_orders(modifies: Vec<ModifyOrder>) -> BatchModifyOrders {
+        BatchModifyOrders::new(
+            trader_id(),
+            Some(ClientId::from("BINANCE")),
+            strategy_id(),
+            instrument_id(),
+            modifies,
+            UUID4::new(),
+            UnixNanos::from(7),
+            None,
+            None, // correlation_id
+        )
+    }
+
     fn make_cancel_all_orders() -> CancelAllOrders {
         CancelAllOrders::new(
             trader_id(),
             Some(ClientId::from("BINANCE")),
             strategy_id(),
             instrument_id(),
-            OrderSide::Buy,
+            Some(OrderSide::Buy),
             UUID4::new(),
             UnixNanos::from(7),
             None,
@@ -1958,6 +2088,15 @@ mod tests {
         OrderEventAny::Filled(make_order_filled())
     }
 
+    fn ev_fill_voided() -> OrderEventAny {
+        OrderEventAny::FillVoided(
+            OrderFillVoidedSpec::builder()
+                .client_order_id(client_order_id())
+                .venue_order_id(venue_order_id())
+                .build(),
+        )
+    }
+
     #[rstest]
     fn trading_command_envelope_stamps_inner_submit_order_payload_type() {
         // TradingCommand reaches the bus tap as the wrapper TypeId; the dispatcher must
@@ -2078,20 +2217,27 @@ mod tests {
         PAYLOAD_TYPE_MODIFY_ORDER,
         2
     )]
+    #[case::batch_modify_orders(
+        TradingCommand::ModifyOrders(make_batch_modify_orders(vec![
+            make_modify_order(Some(venue_order_id())),
+        ])),
+        PAYLOAD_TYPE_BATCH_MODIFY_ORDERS,
+        2,
+    )]
     #[case::cancel_order(
         TradingCommand::CancelOrder(make_cancel_order()),
         PAYLOAD_TYPE_CANCEL_ORDER,
         2
     )]
+    #[case::batch_cancel_orders(
+        TradingCommand::CancelOrders(make_batch_cancel_orders(vec![make_cancel_order()])),
+        PAYLOAD_TYPE_BATCH_CANCEL_ORDERS,
+        2,
+    )]
     #[case::cancel_all_orders(
         TradingCommand::CancelAllOrders(make_cancel_all_orders()),
         PAYLOAD_TYPE_CANCEL_ALL_ORDERS,
         0
-    )]
-    #[case::batch_cancel_orders(
-        TradingCommand::BatchCancelOrders(make_batch_cancel_orders(vec![make_cancel_order()])),
-        PAYLOAD_TYPE_BATCH_CANCEL_ORDERS,
-        2,
     )]
     #[case::query_order(
         TradingCommand::QueryOrder(make_query_order(Some(venue_order_id()))),
@@ -2120,7 +2266,7 @@ mod tests {
     }
 
     // Walks every OrderEventAny variant. Builds each variant from `Default::default()`
-    // (gated by the `stubs` feature on `nautilus-model`) with the test client_order_id
+    // (gated by the `test-support` feature on `nautilus-model`) with the test client_order_id
     // patched in, so the assertion can verify the index value alongside the tag.
     #[rstest]
     #[case::initialized(ev_initialized(), PAYLOAD_TYPE_ORDER_INITIALIZED, false)]
@@ -2163,6 +2309,7 @@ mod tests {
     )]
     #[case::updated(ev_updated(Some(venue_order_id())), PAYLOAD_TYPE_ORDER_UPDATED, true)]
     #[case::filled(ev_filled(), PAYLOAD_TYPE_ORDER_FILLED, true)]
+    #[case::fill_voided(ev_fill_voided(), PAYLOAD_TYPE_ORDER_FILL_VOIDED, true)]
     fn order_event_any_envelope_stamps_inner_tag_for_every_variant(
         #[case] event: OrderEventAny,
         #[case] expected_tag: &str,
@@ -2206,6 +2353,13 @@ mod tests {
         2
     )]
     #[case::modify_order_none(TradingCommand::ModifyOrder(make_modify_order(None)), 1)]
+    #[case::batch_modify_orders(
+        TradingCommand::ModifyOrders(make_batch_modify_orders(vec![
+            make_modify_order(Some(venue_order_id())),
+            make_modify_order(None),
+        ])),
+        3,
+    )]
     #[case::query_order_some(
         TradingCommand::QueryOrder(make_query_order(Some(venue_order_id()))),
         2
@@ -2249,12 +2403,42 @@ mod tests {
         without_venue.client_order_id = ClientOrderId::from("O-NOVENUE");
         let batch = make_batch_cancel_orders(vec![with_venue.clone(), without_venue.clone()]);
 
-        let encoded =
-            encode_trading_command(&TradingCommand::BatchCancelOrders(batch)).expect("encode");
+        let encoded = encode_trading_command(&TradingCommand::CancelOrders(batch)).expect("encode");
 
         assert_eq!(
             encoded.payload_type.expect("override").as_str(),
             PAYLOAD_TYPE_BATCH_CANCEL_ORDERS,
+        );
+        assert_eq!(encoded.index_keys.len(), 3);
+        assert_eq!(encoded.index_keys[0].kind, IndexKind::ClientOrderId);
+        assert_eq!(
+            encoded.index_keys[0].key,
+            with_venue.client_order_id.to_string(),
+        );
+        assert_eq!(encoded.index_keys[1].kind, IndexKind::VenueOrderId);
+        assert_eq!(
+            encoded.index_keys[1].key,
+            with_venue.venue_order_id.expect("set").to_string(),
+        );
+        assert_eq!(encoded.index_keys[2].kind, IndexKind::ClientOrderId);
+        assert_eq!(
+            encoded.index_keys[2].key,
+            without_venue.client_order_id.to_string(),
+        );
+    }
+
+    #[rstest]
+    fn batch_modify_orders_envelope_indexes_each_child_with_optional_venue() {
+        let with_venue = make_modify_order(Some(venue_order_id()));
+        let mut without_venue = make_modify_order(None);
+        without_venue.client_order_id = ClientOrderId::from("O-NOVENUE");
+        let batch = make_batch_modify_orders(vec![with_venue.clone(), without_venue.clone()]);
+
+        let encoded = encode_trading_command(&TradingCommand::ModifyOrders(batch)).expect("encode");
+
+        assert_eq!(
+            encoded.payload_type.expect("override").as_str(),
+            PAYLOAD_TYPE_BATCH_MODIFY_ORDERS,
         );
         assert_eq!(encoded.index_keys.len(), 3);
         assert_eq!(encoded.index_keys[0].kind, IndexKind::ClientOrderId);
@@ -2322,7 +2506,7 @@ mod tests {
         PositionStatusReport::new(
             AccountId::from("BINANCE-001"),
             instrument_id(),
-            PositionSideSpecified::Long,
+            PositionSide::Long,
             Quantity::from("1"),
             UnixNanos::from(50),
             UnixNanos::from(51),
@@ -2624,6 +2808,7 @@ mod tests {
             last_px: Price::from("100.00"),
             currency: Currency::USDT(),
             avg_px_open: 100.0,
+            realized_pnl: Some(Money::new(-0.1, Currency::USDT())),
             event_id: UUID4::new(),
             ts_event: UnixNanos::from(70),
             ts_init: UnixNanos::from(71),
@@ -3663,6 +3848,7 @@ mod tests {
     #[case::submit_order(trading_command_submit_order)]
     #[case::submit_order_list(trading_command_submit_order_list)]
     #[case::modify_order(trading_command_modify_order)]
+    #[case::batch_modify_orders(trading_command_batch_modify_orders)]
     #[case::cancel_order(trading_command_cancel_order)]
     #[case::cancel_all_orders(trading_command_cancel_all_orders)]
     #[case::batch_cancel_orders(trading_command_batch_cancel_orders)]
@@ -3712,6 +3898,15 @@ mod tests {
         (TradingCommand::ModifyOrder(cmd), corr, caus)
     }
 
+    fn trading_command_batch_modify_orders() -> (TradingCommand, UUID4, UUID4) {
+        let corr = UUID4::new();
+        let caus = UUID4::new();
+        let mut cmd = make_batch_modify_orders(vec![make_modify_order(Some(venue_order_id()))]);
+        cmd.correlation_id = Some(corr);
+        cmd.causation_id = Some(caus);
+        (TradingCommand::ModifyOrders(cmd), corr, caus)
+    }
+
     fn trading_command_cancel_order() -> (TradingCommand, UUID4, UUID4) {
         let corr = UUID4::new();
         let caus = UUID4::new();
@@ -3721,6 +3916,15 @@ mod tests {
         (TradingCommand::CancelOrder(cmd), corr, caus)
     }
 
+    fn trading_command_batch_cancel_orders() -> (TradingCommand, UUID4, UUID4) {
+        let corr = UUID4::new();
+        let caus = UUID4::new();
+        let mut cmd = make_batch_cancel_orders(vec![make_cancel_order()]);
+        cmd.correlation_id = Some(corr);
+        cmd.causation_id = Some(caus);
+        (TradingCommand::CancelOrders(cmd), corr, caus)
+    }
+
     fn trading_command_cancel_all_orders() -> (TradingCommand, UUID4, UUID4) {
         let corr = UUID4::new();
         let caus = UUID4::new();
@@ -3728,15 +3932,6 @@ mod tests {
         cmd.correlation_id = Some(corr);
         cmd.causation_id = Some(caus);
         (TradingCommand::CancelAllOrders(cmd), corr, caus)
-    }
-
-    fn trading_command_batch_cancel_orders() -> (TradingCommand, UUID4, UUID4) {
-        let corr = UUID4::new();
-        let caus = UUID4::new();
-        let mut cmd = make_batch_cancel_orders(vec![make_cancel_order()]);
-        cmd.correlation_id = Some(corr);
-        cmd.causation_id = Some(caus);
-        (TradingCommand::BatchCancelOrders(cmd), corr, caus)
     }
 
     fn trading_command_query_order() -> (TradingCommand, UUID4, UUID4) {

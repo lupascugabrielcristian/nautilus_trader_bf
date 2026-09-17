@@ -12,10 +12,24 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
+"""
+Integration adapter for the OKX exchange.
+"""
 
 from nautilus_trader._fixup import fixup_module_names
 from nautilus_trader._libnautilus.okx import *  # noqa: F403 (undefined-local-with-import-star)
 
+
+__all__ = [
+    "OKX",
+    "OKX_CLIENT_ID",
+    "OKX_VENUE",
+    "OKXDataClientConfig",
+    "OKXDataClientFactory",
+    "OKXEnvironment",
+    "OKXExecutionClientConfig",
+    "OKXExecutionClientFactory",
+]
 
 fixup_module_names(globals(), __name__)
 del fixup_module_names

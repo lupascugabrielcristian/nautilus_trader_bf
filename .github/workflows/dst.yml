@@ -2,12 +2,14 @@ name: dst
 
 # Deterministic simulation testing (DST) smoke gate.
 #
-# Builds the in-scope crates under `--cfg madsim --features simulation` and
-# runs the test subset known to work under simulation (all of nautilus-common
-# plus the cross-crate seam pinning tests in nautilus-network and
-# nautilus-core). Triggered on pushes to nightly and test-ci and on manual
-# dispatch. PRs, master pushes, and develop pushes do not gate on this
-# workflow. See docs/concepts/dst.md for the contract and scope.
+# Runs pinned stable Clippy on the in-scope crates under
+# `--cfg madsim --features simulation`, then builds the same crate scope and
+# runs the test subset known to work under simulation (all of nautilus-common,
+# nautilus-network, and nautilus-execution; the focused nautilus-live startup
+# reconciliation regression; and the nautilus-core seam pinning tests).
+# Triggered on pushes to nightly and on manual dispatch. PRs, master pushes,
+# and develop pushes do not gate on this workflow. See docs/concepts/dst.md
+# for the contract and scope.
 
 permissions:
   contents: read
@@ -42,14 +44,16 @@ jobs:
       #   MADSIM_TEST_SEED=<n> MADSIM_TEST_NUM=5 make cargo-test-sim
       MADSIM_TEST_NUM: "5"
     steps:
-      - uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
+      # https://github.com/step-security/harden-runner
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
         with:
           egress-policy: ${{ env.EGRESS_POLICY }}
           allowed-endpoints: >-
             ${{ vars.COMMON_ALLOWED_ENDPOINTS }} ${{ vars.CI_ALLOWED_ENDPOINTS }}
 
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        # https://github.com/actions/checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -59,6 +63,9 @@ jobs:
           python-version: "3.13"
           free-disk-space: "true"
           rust-cache-enabled: "false"
+
+      - name: Run DST simulation Clippy
+        run: make check-code-sim
 
       - name: Run DST simulation smoke tests
         run: |-

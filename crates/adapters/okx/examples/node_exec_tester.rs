@@ -15,10 +15,17 @@
 
 //! Example demonstrating live execution testing with the OKX adapter.
 //!
+//! Edit the constants below to change the environment, target instrument, and order size.
+//!
 //! Run with: `cargo run --example okx-exec-tester --package nautilus-okx --features examples`
+//!
+//! Required credential environment variables:
+//! - `OKX_API_KEY`
+//! - `OKX_API_SECRET`
+//! - `OKX_API_PASSPHRASE`
 
 use nautilus_common::enums::Environment;
-use nautilus_live::{config::LiveExecEngineConfig, node::LiveNode};
+use nautilus_live::{config::LiveExecutionEngineConfig, node::LiveNode};
 use nautilus_model::{
     identifiers::{AccountId, InstrumentId, StrategyId, TraderId},
     types::Quantity,
@@ -28,46 +35,58 @@ use nautilus_okx::{
         consts::OKX_CLIENT_ID,
         enums::{OKXEnvironment, OKXInstrumentType},
     },
-    config::{OKXDataClientConfig, OKXExecClientConfig},
+    config::{OKXDataClientConfig, OKXExecutionClientConfig},
     factories::{OKXDataClientFactory, OKXExecutionClientFactory},
 };
 use nautilus_testkit::testers::{ExecTester, ExecTesterConfig};
 use nautilus_trading::strategy::StrategyConfig;
 
+// WARNING: With `DRY_RUN = false`, this tester submits orders to the configured
+// environment and may use real funds. Set `DRY_RUN = true` to connect without
+// submitting orders or sending shutdown cancel/close commands.
+const DRY_RUN: bool = false;
+const OKX_ENVIRONMENT: OKXEnvironment = OKXEnvironment::Live;
+const TRADER_ID: &str = "TESTER-001";
+const ACCOUNT_ID: &str = "OKX-001";
+const NODE_NAME: &str = "OKX-EXEC-TESTER-001";
+const STRATEGY_ID: &str = "EXEC_TESTER-001";
+const INSTRUMENT_ID: &str = "ETH-USDT-SWAP.OKX";
+const ORDER_QTY: &str = "0.01";
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
+    let okx_environment = OKX_ENVIRONMENT;
     let environment = Environment::Live;
-    let trader_id = TraderId::from("TESTER-001");
-    let account_id = AccountId::from("OKX-001");
-    let node_name = "OKX-EXEC-TESTER-001".to_string();
+    let trader_id = TraderId::from(TRADER_ID);
+    let account_id = AccountId::from(ACCOUNT_ID);
+    let node_name = NODE_NAME.to_string();
     let client_id = *OKX_CLIENT_ID;
-    let instrument_id = InstrumentId::from("ETH-USDT-SWAP.OKX");
+    let instrument_id = InstrumentId::from(INSTRUMENT_ID);
 
     let data_config = OKXDataClientConfig {
         api_key: None,        // Will use 'OKX_API_KEY' env var
         api_secret: None,     // Will use 'OKX_API_SECRET' env var
         api_passphrase: None, // Will use 'OKX_API_PASSPHRASE' env var
         instrument_types: vec![OKXInstrumentType::Spot, OKXInstrumentType::Swap],
-        environment: OKXEnvironment::Live,
+        environment: okx_environment,
         ..Default::default()
     };
 
-    let exec_config = OKXExecClientConfig {
-        trader_id,
+    let exec_config = OKXExecutionClientConfig {
         account_id,
         api_key: None,        // Will use 'OKX_API_KEY' env var
         api_secret: None,     // Will use 'OKX_API_SECRET' env var
         api_passphrase: None, // Will use 'OKX_API_PASSPHRASE' env var
         instrument_types: vec![OKXInstrumentType::Spot, OKXInstrumentType::Swap],
-        environment: OKXEnvironment::Live,
+        environment: okx_environment,
         ..Default::default()
     };
 
     let data_factory = OKXDataClientFactory::new();
     let exec_factory = OKXExecutionClientFactory::new();
-    let exec_engine_config = LiveExecEngineConfig {
+    let exec_engine_config = LiveExecutionEngineConfig {
         open_check_interval_secs: Some(10.0),
         position_check_interval_secs: Some(30.0),
         ..Default::default()
@@ -82,11 +101,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_delay_post_stop_secs(5)
         .build()?;
 
-    let order_qty = Quantity::from("0.01");
+    let order_qty = Quantity::from(ORDER_QTY);
 
     let tester_config = ExecTesterConfig::builder()
         .base(StrategyConfig {
-            strategy_id: Some(StrategyId::from("EXEC_TESTER-001")),
+            strategy_id: Some(StrategyId::from(STRATEGY_ID)),
             external_order_claims: Some(vec![instrument_id]),
             // OKX doesn't allow hyphens in client order IDs
             use_hyphens_in_client_order_ids: false,
@@ -95,6 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .instrument_id(instrument_id)
         .client_id(client_id)
         .order_qty(order_qty)
+        .dry_run(DRY_RUN)
         .open_position_on_start_qty(order_qty.as_decimal())
         .log_data(false)
         // .enable_limit_buys(false)
@@ -104,7 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // .trailing_offset(Decimal::from(100))
         // .trailing_offset_type(TrailingOffsetType::BasisPoints)
         // .stop_offset_ticks(50)
-        .build();
+        .build()?;
 
     let tester = ExecTester::new(tester_config);
 

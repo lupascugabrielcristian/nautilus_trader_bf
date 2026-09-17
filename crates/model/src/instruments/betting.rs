@@ -17,7 +17,7 @@ use std::hash::{Hash, Hasher};
 
 use nautilus_core::{
     Params, UnixNanos,
-    correctness::{CorrectnessResult, CorrectnessResultExt, FAILED, check_equal_u8},
+    correctness::{CorrectnessResult, check_equal_u8},
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -27,7 +27,7 @@ use ustr::Ustr;
 use super::{
     Instrument,
     any::InstrumentAny,
-    tick_scheme::{BETFAIR_TICK_SCHEME, BETFAIR_TICK_SCHEME_NAME, TickSchemeRule},
+    tick_scheme::{BETFAIR_TICK_SCHEME, BETFAIR_TICK_SCHEME_NAME, check_tick_scheme},
 };
 use crate::{
     enums::{AssetClass, InstrumentClass, OptionKind},
@@ -45,7 +45,7 @@ use crate::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -118,6 +118,8 @@ pub struct BettingInstrument {
     pub max_price: Option<Price>,
     /// The minimum allowable quoted price.
     pub min_price: Option<Price>,
+    /// The registered variable tick scheme name.
+    pub tick_scheme: Option<Ustr>,
     /// Additional instrument metadata as a JSON-serializable dictionary.
     pub info: Option<Params>,
     /// UNIX timestamp (nanoseconds) when the data event occurred.
@@ -126,18 +128,10 @@ pub struct BettingInstrument {
     pub ts_init: UnixNanos,
 }
 
+#[bon::bon]
 impl BettingInstrument {
-    /// Creates a new [`BettingInstrument`] instance with correctness checking.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any input validation fails (precision mismatches or non-positive increments).
-    ///
-    /// # Notes
-    ///
-    /// PyO3 requires a `Result` type for proper error handling and stacktrace printing in Python.
     #[expect(clippy::too_many_arguments)]
-    pub fn new_checked(
+    fn new_checked(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
         event_type_id: u64,
@@ -171,6 +165,7 @@ impl BettingInstrument {
         margin_maint: Option<Decimal>,
         maker_fee: Option<Decimal>,
         taker_fee: Option<Decimal>,
+        tick_scheme: Option<Ustr>,
         info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
@@ -189,6 +184,7 @@ impl BettingInstrument {
         )?;
         check_positive_price(price_increment, stringify!(price_increment))?;
         check_positive_quantity(size_increment, stringify!(size_increment))?;
+        check_tick_scheme(tick_scheme)?;
 
         Ok(Self {
             id: instrument_id,
@@ -224,20 +220,23 @@ impl BettingInstrument {
             margin_maint: margin_maint.unwrap_or(dec!(1)),
             maker_fee: maker_fee.unwrap_or_default(),
             taker_fee: taker_fee.unwrap_or_default(),
+            tick_scheme,
             info,
             ts_event,
             ts_init,
         })
     }
 
-    /// Creates a new [`BettingInstrument`] instance by parsing and validating input parameters.
+    /// Returns a fluent builder for a [`BettingInstrument`] instance.
     ///
-    /// # Panics
+    /// Required fields are enforced at compile time; optional fields can be omitted and use the
+    /// same defaults as checked construction. The same correctness checks run on `build`.
     ///
-    /// Panics if any required parameter is invalid or parsing fails during `new_checked`.
-    #[expect(clippy::too_many_arguments)]
-    #[must_use]
-    pub fn new(
+    /// # Errors
+    ///
+    /// Returns an error if any input validation fails.
+    #[builder(start_fn = builder, finish_fn = build)]
+    pub fn build_checked(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
         event_type_id: u64,
@@ -271,10 +270,11 @@ impl BettingInstrument {
         margin_maint: Option<Decimal>,
         maker_fee: Option<Decimal>,
         taker_fee: Option<Decimal>,
+        tick_scheme: Option<Ustr>,
         info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
-    ) -> Self {
+    ) -> CorrectnessResult<Self> {
         Self::new_checked(
             instrument_id,
             raw_symbol,
@@ -309,11 +309,11 @@ impl BettingInstrument {
             margin_maint,
             maker_fee,
             taker_fee,
+            tick_scheme,
             info,
             ts_event,
             ts_init,
         )
-        .expect_display(FAILED)
     }
 
     fn uses_betfair_tick_scheme(&self) -> bool {
@@ -336,9 +336,11 @@ impl Hash for BettingInstrument {
 }
 
 impl Instrument for BettingInstrument {
-    fn tick_scheme(&self) -> Option<&dyn TickSchemeRule> {
-        self.uses_betfair_tick_scheme()
-            .then_some(&*BETFAIR_TICK_SCHEME as &dyn TickSchemeRule)
+    fn tick_scheme(&self) -> Option<Ustr> {
+        self.tick_scheme.or_else(|| {
+            self.uses_betfair_tick_scheme()
+                .then(|| Ustr::from(BETFAIR_TICK_SCHEME_NAME))
+        })
     }
 
     fn into_any(self) -> InstrumentAny {
@@ -491,9 +493,9 @@ mod tests {
 
     use crate::{
         enums::{AssetClass, InstrumentClass},
-        identifiers::InstrumentId,
+        identifiers::{InstrumentId, Symbol},
         instruments::{BettingInstrument, Instrument, stubs::*},
-        types::{Currency, Price, Quantity},
+        types::{Currency, Money, Price, Quantity},
     };
 
     #[rstest]
@@ -547,6 +549,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             0.into(),
             0.into(),
         );
@@ -582,5 +585,93 @@ mod tests {
         assert!(betting.tick_scheme().is_none());
         assert!(betting.min_price().is_none());
         assert!(betting.max_price().is_none());
+    }
+
+    #[rstest]
+    fn test_builder_matches_new_checked() {
+        let positional = BettingInstrument::new_checked(
+            InstrumentId::from("1-123456789.BETFAIR"),
+            Symbol::from("1-123456789"),
+            6423,
+            "American Football".into(),
+            12_282_733,
+            "NFL".into(),
+            29_678_534,
+            "NFL".into(),
+            "GB".into(),
+            1.into(),
+            "ODDS".into(),
+            "1-123456789".into(),
+            "AFC Conference Winner".into(),
+            "SPECIAL".into(),
+            2.into(),
+            50214,
+            "Kansas City Chiefs".into(),
+            0.0,
+            Currency::GBP(),
+            2,
+            2,
+            Price::from("0.01"),
+            Quantity::from("0.01"),
+            Some(Quantity::from("1000")),
+            Some(Quantity::from("1")),
+            Some(Money::from("10000 GBP")),
+            Some(Money::from("10 GBP")),
+            Some(Price::from("100.00")),
+            Some(Price::from("1.00")),
+            Some(dec!(0.01)),
+            Some(dec!(0.02)),
+            Some(dec!(0.0002)),
+            Some(dec!(0.0004)),
+            None,
+            None,
+            3.into(),
+            4.into(),
+        )
+        .unwrap();
+
+        let built = BettingInstrument::builder()
+            .instrument_id(InstrumentId::from("1-123456789.BETFAIR"))
+            .raw_symbol(Symbol::from("1-123456789"))
+            .event_type_id(6423)
+            .event_type_name("American Football".into())
+            .competition_id(12_282_733)
+            .competition_name("NFL".into())
+            .event_id(29_678_534)
+            .event_name("NFL".into())
+            .event_country_code("GB".into())
+            .event_open_date(1.into())
+            .betting_type("ODDS".into())
+            .market_id("1-123456789".into())
+            .market_name("AFC Conference Winner".into())
+            .market_type("SPECIAL".into())
+            .market_start_time(2.into())
+            .selection_id(50214)
+            .selection_name("Kansas City Chiefs".into())
+            .selection_handicap(0.0)
+            .currency(Currency::GBP())
+            .price_precision(2)
+            .size_precision(2)
+            .price_increment(Price::from("0.01"))
+            .size_increment(Quantity::from("0.01"))
+            .max_quantity(Quantity::from("1000"))
+            .min_quantity(Quantity::from("1"))
+            .max_notional(Money::from("10000 GBP"))
+            .min_notional(Money::from("10 GBP"))
+            .max_price(Price::from("100.00"))
+            .min_price(Price::from("1.00"))
+            .margin_init(dec!(0.01))
+            .margin_maint(dec!(0.02))
+            .maker_fee(dec!(0.0002))
+            .taker_fee(dec!(0.0004))
+            .ts_event(3.into())
+            .ts_init(4.into())
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&positional).unwrap(),
+            serde_json::to_value(&built).unwrap(),
+        );
     }
 }

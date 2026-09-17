@@ -18,7 +18,7 @@
 use std::{num::NonZero, str::FromStr};
 
 use ahash::AHashMap;
-use chrono::Timelike;
+use jiff::tz::Offset;
 use nautilus_core::{UnixNanos, uuid::UUID4};
 #[cfg(test)]
 use nautilus_model::types::Currency;
@@ -526,7 +526,7 @@ pub fn parse_order_msg(
     let instrument_id = parse_instrument_id(msg.symbol);
     let venue_order_id = VenueOrderId::new(msg.order_id.to_string());
     let common_side: BitmexSide = msg.side.into();
-    let order_side: OrderSide = common_side.into();
+    let order_side = OrderSide::from(common_side);
 
     let order_type: OrderType = if let Some(ord_type) = msg.ord_type {
         // Pegged orders with TrailingStopPeg are trailing stop orders
@@ -571,7 +571,7 @@ pub fn parse_order_msg(
         instrument_id,
         None, // client_order_id - will be set later if present
         venue_order_id,
-        order_side,
+        order_side.into(),
         order_type,
         time_in_force,
         order_status,
@@ -596,7 +596,7 @@ pub fn parse_order_msg(
     }
 
     if let Some(avg_px) = msg.avg_px {
-        report = report.with_avg_px(avg_px)?;
+        report = report.with_avg_px(avg_px);
     }
 
     if let Some(trigger_price) = msg.stop_px {
@@ -793,7 +793,7 @@ pub fn parse_order_update_msg(
     // Uses external IDs; callers enrich with tracked identity when available
     let trader_id = TraderId::external();
     let strategy_id = StrategyId::external();
-    let instrument_id = parse_instrument_id(msg.symbol);
+    let instrument_id = parse_instrument_id(msg.symbol?);
     let venue_order_id = Some(VenueOrderId::new(msg.order_id.to_string()));
     let client_order_id = msg
         .cl_ord_id
@@ -808,6 +808,8 @@ pub fn parse_order_update_msg(
     };
     let price = msg
         .price
+        .value()
+        .copied()
         .map(|p| Price::new(p, instrument.price_precision()));
 
     // BitMEX doesn't send trigger price in regular order updates?
@@ -943,10 +945,8 @@ pub fn parse_execution_msg(
     let instrument_id = parse_instrument_id(msg.symbol?);
     let venue_order_id = VenueOrderId::new(msg.order_id?.to_string());
     let trade_id = TradeId::new(msg.trd_match_id?.to_string());
-    let order_side: OrderSide = msg.side.map_or(OrderSide::NoOrderSide, |s| {
-        let side: BitmexSide = s.into();
-        side.into()
-    });
+    let side = msg.side?;
+    let order_side = OrderSide::from(BitmexSide::from(side));
     let last_qty = parse_signed_contracts_quantity(msg.last_qty?, instrument);
     let last_px = Price::new(msg.last_px?, instrument.price_precision());
     let settlement_currency_str = msg.settl_currency.unwrap_or(Ustr::from("XBT"));
@@ -989,7 +989,7 @@ pub fn parse_position_msg(
 ) -> PositionStatusReport {
     let account_id = bitmex_account_id(msg.account);
     let instrument_id = parse_instrument_id(msg.symbol);
-    let position_side = parse_position_side(msg.current_qty).as_specified();
+    let position_side = parse_position_side(msg.current_qty);
     let quantity = parse_signed_contracts_quantity(msg.current_qty.unwrap_or(0), instrument);
     let venue_position_id = None; // Not applicable on BitMEX
     let avg_px_open = msg
@@ -1048,7 +1048,7 @@ pub fn parse_instrument_msg(
     let ts_event = parse_optional_datetime_to_unix_nanos(&Some(msg.timestamp), "");
 
     // Look up instrument for proper precision
-    let price_precision = match instruments_cache.get(&Ustr::from(&msg.symbol)) {
+    let price_precision = match instruments_cache.get(&msg.symbol) {
         Some(instrument) => instrument.price_precision(),
         None => {
             // BitMEX sends updates for all instruments on the instrument channel,
@@ -1070,7 +1070,7 @@ pub fn parse_instrument_msg(
     // For index symbols, markPrice equals lastPrice and is valid to emit
     if let Some(mark_price) = effective_mark_price {
         let price = Price::new(mark_price, price_precision);
-        updates.push(Data::MarkPriceUpdate(MarkPriceUpdate::new(
+        updates.push(Data::MarkPrice(MarkPriceUpdate::new(
             instrument_id,
             price,
             ts_event,
@@ -1081,7 +1081,7 @@ pub fn parse_instrument_msg(
     // Add index price update if present
     if let Some(index_price) = effective_index_price {
         let price = Price::new(index_price, price_precision);
-        updates.push(Data::IndexPriceUpdate(IndexPriceUpdate::new(
+        updates.push(Data::IndexPrice(IndexPriceUpdate::new(
             instrument_id,
             price,
             ts_event,
@@ -1100,9 +1100,10 @@ pub fn parse_instrument_msg(
 #[must_use]
 pub fn parse_funding_msg(msg: &BitmexFundingMsg, ts_init: UnixNanos) -> FundingRateUpdate {
     let instrument_id = InstrumentId::from(format!("{}.BITMEX", msg.symbol));
-    let interval_hours = msg.funding_interval.hour();
-    let interval_minutes = msg.funding_interval.minute();
-    let interval = Some((interval_hours * 60 + interval_minutes) as u16);
+    let funding_interval = Offset::UTC.to_datetime(msg.funding_interval);
+    let interval_hours = u16::from(funding_interval.hour().cast_unsigned());
+    let interval_minutes = u16::from(funding_interval.minute().cast_unsigned());
+    let interval = Some(interval_hours * 60 + interval_minutes);
     let ts_event = parse_optional_datetime_to_unix_nanos(&Some(msg.timestamp), "");
 
     FundingRateUpdate::new(
@@ -1200,7 +1201,7 @@ pub fn parse_margin_account_state(msg: &BitmexMarginMsg, ts_init: UnixNanos) -> 
 
 #[cfg(test)]
 mod tests {
-    use chrono::{DateTime, Utc};
+    use jiff::Timestamp;
     use nautilus_model::{
         enums::{AggressorSide, BookAction, LiquiditySide, PositionSide},
         identifiers::Symbol,
@@ -1220,33 +1221,23 @@ mod tests {
         price_precision: u8,
         size_precision: u8,
     ) -> InstrumentAny {
-        InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
-            InstrumentId::from("XBTUSD.BITMEX"),
-            Symbol::new("XBTUSD"),
-            Currency::BTC(),
-            Currency::USD(),
-            Currency::BTC(),
-            true, // is_inverse
-            price_precision,
-            size_precision,
-            Price::new(0.5, price_precision),
-            Quantity::new(1.0, size_precision),
-            None, // multiplier
-            None, // lot_size
-            None, // max_quantity
-            None, // min_quantity
-            None, // max_notional
-            None, // min_notional
-            None, // max_price
-            None, // min_price
-            None, // margin_init
-            None, // margin_maint
-            None, // maker_fee
-            None, // taker_fee
-            None, // info
-            UnixNanos::default(),
-            UnixNanos::default(),
-        ))
+        InstrumentAny::CryptoPerpetual(
+            CryptoPerpetual::builder()
+                .instrument_id(InstrumentId::from("XBTUSD.BITMEX"))
+                .raw_symbol(Symbol::new("XBTUSD"))
+                .base_currency(Currency::BTC())
+                .quote_currency(Currency::USD())
+                .settlement_currency(Currency::BTC())
+                .is_inverse(true)
+                .price_precision(price_precision)
+                .size_precision(size_precision)
+                .price_increment(Price::new(0.5, price_precision))
+                .size_increment(Quantity::new(1.0, size_precision))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
     }
 
     fn create_test_perpetual_instrument() -> InstrumentAny {
@@ -1275,7 +1266,7 @@ mod tests {
         assert_eq!(delta.instrument_id, instrument_id);
         assert_eq!(delta.order.price, Price::from("98459.9"));
         assert_eq!(delta.order.size, Quantity::from(33000));
-        assert_eq!(delta.order.side, OrderSide::Sell);
+        assert_eq!(delta.order.side, OrderSide::Sell.into());
         assert_eq!(delta.order.order_id, 62400580205);
         assert_eq!(delta.action, BookAction::Add);
         assert_eq!(delta.flags, 0);
@@ -1328,12 +1319,12 @@ mod tests {
         // Check first bid level
         assert_eq!(depth10.bids[0].price, Price::from("98490.3"));
         assert_eq!(depth10.bids[0].size, Quantity::from(22400));
-        assert_eq!(depth10.bids[0].side, OrderSide::Buy);
+        assert_eq!(depth10.bids[0].side, OrderSide::Buy.into());
 
         // Check first ask level
         assert_eq!(depth10.asks[0].price, Price::from("98490.4"));
         assert_eq!(depth10.asks[0].size, Quantity::from(17600));
-        assert_eq!(depth10.asks[0].side, OrderSide::Sell);
+        assert_eq!(depth10.asks[0].side, OrderSide::Sell.into());
 
         // Check counts (should be 1 for each populated level)
         assert_eq!(depth10.bid_counts, [1; DEPTH10_LEN]);
@@ -1398,7 +1389,7 @@ mod tests {
         assert_eq!(trade.instrument_id, instrument_id);
         assert_eq!(trade.price, Price::from("98570.9"));
         assert_eq!(trade.size, Quantity::from(100));
-        assert_eq!(trade.aggressor_side, AggressorSide::Seller);
+        assert_eq!(trade.aggressor_side, AggressorSide::Sell);
         assert_eq!(
             trade.trade_id.to_string(),
             "00000000-006d-1000-0000-000e8737d536"
@@ -1486,9 +1477,7 @@ mod tests {
         let instrument = create_test_perpetual_instrument();
 
         let msg = BitmexTradeBinMsg {
-            timestamp: DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
+            timestamp: "2024-01-01T00:00:00Z".parse::<Timestamp>().unwrap(),
             symbol: Ustr::from("XBTUSD"),
             open: 50_000.0,
             high: 49_990.0,
@@ -1523,7 +1512,8 @@ mod tests {
     #[rstest]
     fn test_parse_order_msg() {
         let json_data = load_test_json("ws_order.json");
-        let msg: BitmexOrderMsg = serde_json::from_str(&json_data).unwrap();
+        let mut msg: BitmexOrderMsg = serde_json::from_str(&json_data).unwrap();
+        msg.avg_px = Some(Decimal::from_str("30000.500000000004").unwrap());
         let mut cache = AHashMap::new();
         let instrument = create_test_perpetual_instrument();
         let report = parse_order_msg(&msg, &instrument, &mut cache, UnixNanos::default()).unwrap();
@@ -1538,13 +1528,17 @@ mod tests {
             report.client_order_id.unwrap().to_string(),
             "mm_bitmex_1a/oemUeQ4CAJZgP3fjHsA"
         );
-        assert_eq!(report.order_side, OrderSide::Buy);
+        assert_eq!(report.order_side, OrderSide::Buy.into());
         assert_eq!(report.order_type, OrderType::Limit);
         assert_eq!(report.time_in_force, TimeInForce::Gtc);
         assert_eq!(report.order_status, OrderStatus::Accepted);
         assert_eq!(report.quantity, Quantity::from(100));
         assert_eq!(report.filled_qty, Quantity::from(0));
         assert_eq!(report.price.unwrap(), Price::from("98000.0"));
+        assert_eq!(
+            report.avg_px,
+            Some(Decimal::from_str("30000.500000000004").unwrap())
+        );
         assert_eq!(report.ts_accepted, 1732530600000000000); // 2024-11-25T10:30:00.000Z
     }
 
@@ -1805,7 +1799,7 @@ mod tests {
 
         assert_eq!(report.account_id.to_string(), "BITMEX-1234567");
         assert_eq!(report.instrument_id, InstrumentId::from("XBTUSD.BITMEX"));
-        assert_eq!(report.position_side.as_position_side(), PositionSide::Long);
+        assert_eq!(report.position_side, PositionSide::Long);
         assert_eq!(report.quantity, Quantity::from(1000));
         assert!(report.venue_position_id.is_none());
         assert_eq!(report.ts_last, 1732530900789000000); // 2024-11-25T10:35:00.789Z
@@ -1819,7 +1813,7 @@ mod tests {
 
         let instrument = create_test_perpetual_instrument();
         let report = parse_position_msg(&msg, &instrument, UnixNanos::default());
-        assert_eq!(report.position_side.as_position_side(), PositionSide::Short);
+        assert_eq!(report.position_side, PositionSide::Short);
         assert_eq!(report.quantity, Quantity::from(500));
     }
 
@@ -1831,7 +1825,7 @@ mod tests {
 
         let instrument = create_test_perpetual_instrument();
         let report = parse_position_msg(&msg, &instrument, UnixNanos::default());
-        assert_eq!(report.position_side.as_position_side(), PositionSide::Flat);
+        assert_eq!(report.position_side, PositionSide::Flat);
         assert_eq!(report.quantity, Quantity::from(0));
     }
 
@@ -1920,7 +1914,7 @@ mod tests {
             withdrawable_margin: None,
             maker_fee_discount: None,
             taker_fee_discount: None,
-            timestamp: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+            timestamp: Timestamp::from_second(1_700_000_000).unwrap(),
             foreign_margin_balance: None,
             foreign_requirement: None,
         };
@@ -1971,7 +1965,7 @@ mod tests {
             withdrawable_margin: None,
             maker_fee_discount: None,
             taker_fee_discount: None,
-            timestamp: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+            timestamp: Timestamp::from_second(1_700_000_000).unwrap(),
             foreign_margin_balance: None,
             foreign_requirement: None,
         };
@@ -1998,7 +1992,7 @@ mod tests {
         assert_eq!(updates.len(), 2);
 
         match &updates[0] {
-            Data::MarkPriceUpdate(update) => {
+            Data::MarkPrice(update) => {
                 assert_eq!(update.instrument_id.to_string(), "XBTUSD.BITMEX");
                 assert_eq!(update.value.as_f64(), 95125.7);
             }
@@ -2006,7 +2000,7 @@ mod tests {
         }
 
         match &updates[1] {
-            Data::IndexPriceUpdate(update) => {
+            Data::IndexPrice(update) => {
                 assert_eq!(update.instrument_id.to_string(), "XBTUSD.BITMEX");
                 assert_eq!(update.value.as_f64(), 95126.0);
             }
@@ -2029,7 +2023,7 @@ mod tests {
 
         assert_eq!(updates.len(), 1);
         match &updates[0] {
-            Data::MarkPriceUpdate(update) => {
+            Data::MarkPrice(update) => {
                 assert_eq!(update.instrument_id.to_string(), "XBTUSD.BITMEX");
                 assert_eq!(update.value.as_f64(), 95125.7);
             }
@@ -2052,7 +2046,7 @@ mod tests {
 
         assert_eq!(updates.len(), 1);
         match &updates[0] {
-            Data::IndexPriceUpdate(update) => {
+            Data::IndexPrice(update) => {
                 assert_eq!(update.instrument_id.to_string(), "XBTUSD.BITMEX");
                 assert_eq!(update.value.as_f64(), 95126.0);
             }
@@ -2094,33 +2088,22 @@ mod tests {
 
         // Create instruments cache with proper precision for .BXBT
         let instrument_id = InstrumentId::from(".BXBT.BITMEX");
-        let instrument = CryptoPerpetual::new(
-            instrument_id,
-            Symbol::from(".BXBT"),
-            Currency::BTC(),
-            Currency::USD(),
-            Currency::USD(),
-            false, // is_inverse
-            2,     // price_precision (for 119163.05)
-            8,     // size_precision
-            Price::from("0.01"),
-            Quantity::from("0.00000001"),
-            None,                 // multiplier
-            None,                 // lot_size
-            None,                 // max_quantity
-            None,                 // min_quantity
-            None,                 // max_notional
-            None,                 // min_notional
-            None,                 // max_price
-            None,                 // min_price
-            None,                 // margin_init
-            None,                 // margin_maint
-            None,                 // maker_fee
-            None,                 // taker_fee
-            None,                 // info
-            UnixNanos::default(), // ts_event
-            UnixNanos::default(), // ts_init
-        );
+        let instrument = CryptoPerpetual::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(Symbol::from(".BXBT"))
+            .base_currency(Currency::BTC())
+            .quote_currency(Currency::USD())
+            .settlement_currency(Currency::USD())
+            .is_inverse(false)
+            // price_precision (for 119163.05)
+            .price_precision(2)
+            .size_precision(8)
+            .price_increment(Price::from("0.01"))
+            .size_increment(Quantity::from("0.00000001"))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
         let mut instruments_cache = AHashMap::new();
         instruments_cache.insert(
             Ustr::from(".BXBT"),
@@ -2133,7 +2116,7 @@ mod tests {
 
         // Check mark price update
         match &updates[0] {
-            Data::MarkPriceUpdate(update) => {
+            Data::MarkPrice(update) => {
                 assert_eq!(update.instrument_id.to_string(), ".BXBT.BITMEX");
                 assert_eq!(update.value, Price::from("119163.05"));
             }
@@ -2142,7 +2125,7 @@ mod tests {
 
         // Check index price update
         match &updates[1] {
-            Data::IndexPriceUpdate(update) => {
+            Data::IndexPrice(update) => {
                 assert_eq!(update.instrument_id.to_string(), ".BXBT.BITMEX");
                 assert_eq!(update.value, Price::from("119163.05"));
                 assert_eq!(update.ts_init, UnixNanos::from(1));
@@ -2158,33 +2141,22 @@ mod tests {
             serde_json::from_str(&load_test_json("ws_instrument_mark_update.json")).unwrap();
 
         let instrument_id = InstrumentId::from("DOTUSDT.BITMEX");
-        let instrument = CryptoPerpetual::new(
-            instrument_id,
-            Symbol::from("DOTUSDT"),
-            Currency::from_str("DOT").unwrap(),
-            Currency::USDT(),
-            Currency::USDT(),
-            false, // is_inverse
-            4,     // price_precision (1.2669)
-            8,     // size_precision
-            Price::from("0.0001"),
-            Quantity::from("0.00000001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        );
+        let instrument = CryptoPerpetual::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(Symbol::from("DOTUSDT"))
+            .base_currency(Currency::from_str("DOT").unwrap())
+            .quote_currency(Currency::USDT())
+            .settlement_currency(Currency::USDT())
+            .is_inverse(false)
+            // price_precision (1.2669)
+            .price_precision(4)
+            .size_precision(8)
+            .price_increment(Price::from("0.0001"))
+            .size_increment(Quantity::from("0.00000001"))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
         let mut instruments_cache = AHashMap::new();
         instruments_cache.insert(
             Ustr::from("DOTUSDT"),
@@ -2195,7 +2167,7 @@ mod tests {
 
         assert_eq!(updates.len(), 1);
         match &updates[0] {
-            Data::MarkPriceUpdate(update) => {
+            Data::MarkPrice(update) => {
                 assert_eq!(update.instrument_id.to_string(), "DOTUSDT.BITMEX");
                 assert_eq!(update.value, Price::from("1.2669"));
             }
@@ -2219,7 +2191,7 @@ mod tests {
 
         assert_eq!(updates.len(), 1);
         match &updates[0] {
-            Data::IndexPriceUpdate(update) => {
+            Data::IndexPrice(update) => {
                 assert_eq!(update.instrument_id.to_string(), "XBTUSD.BITMEX");
                 assert_eq!(update.value, Price::from("75847.62"));
             }

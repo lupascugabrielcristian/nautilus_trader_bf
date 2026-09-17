@@ -86,12 +86,13 @@ use crate::{
         types::HyperliquidAssetId,
     },
     http::models::{
-        ClearinghouseState, Cloid, HyperliquidExchangeResponse,
-        HyperliquidExecCancelByCloidRequest, HyperliquidExecCancelStatus, HyperliquidExecGrouping,
-        HyperliquidExecLimitParams, HyperliquidExecModifyStatus, HyperliquidExecOrderKind,
-        HyperliquidExecOrderStatus, HyperliquidExecPlaceOrderRequest, HyperliquidExecResponseData,
-        HyperliquidExecTif, HyperliquidExecTpSl, HyperliquidExecTriggerParams, RESPONSE_STATUS_OK,
-        SpotClearinghouseState,
+        ClearinghouseState, Cloid, HyperliquidExchangeCancelByCloidRequest,
+        HyperliquidExchangeCancelStatus, HyperliquidExchangeGrouping,
+        HyperliquidExchangeLimitParams, HyperliquidExchangeModifyStatus,
+        HyperliquidExchangeOrderKind, HyperliquidExchangeOrderStatus,
+        HyperliquidExchangePlaceOrderRequest, HyperliquidExchangeResponse,
+        HyperliquidExchangeResponseData, HyperliquidExchangeTif, HyperliquidExchangeTpSl,
+        HyperliquidExchangeTriggerParams, RESPONSE_STATUS_OK, SpotClearinghouseState,
     },
     websocket::messages::TrailingOffsetType,
 };
@@ -106,10 +107,10 @@ use crate::{
 pub fn make_fill_trade_id(
     hash: &str,
     oid: u64,
-    px: &str,
-    sz: &str,
+    px: Decimal,
+    sz: Decimal,
     time: u64,
-    start_position: &str,
+    start_position: Decimal,
 ) -> TradeId {
     // FNV-1a with fixed seed for deterministic output
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -123,12 +124,12 @@ pub fn make_fill_trade_id(
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
 
-    for &b in px.as_bytes() {
+    for &b in px.to_string().as_bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
 
-    for &b in sz.as_bytes() {
+    for &b in sz.to_string().as_bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
@@ -138,7 +139,7 @@ pub fn make_fill_trade_id(
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
 
-    for &b in start_position.as_bytes() {
+    for &b in start_position.to_string().as_bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
@@ -374,11 +375,11 @@ pub fn cache_alias_for_symbol(symbol: &str) -> Option<String> {
 pub fn time_in_force_to_hyperliquid_tif(
     tif: TimeInForce,
     is_post_only: bool,
-) -> anyhow::Result<HyperliquidExecTif> {
+) -> anyhow::Result<HyperliquidExchangeTif> {
     match (tif, is_post_only) {
-        (_, true) => Ok(HyperliquidExecTif::Alo), // Always use ALO for post-only orders
-        (TimeInForce::Gtc, false) => Ok(HyperliquidExecTif::Gtc),
-        (TimeInForce::Ioc, false) => Ok(HyperliquidExecTif::Ioc),
+        (_, true) => Ok(HyperliquidExchangeTif::Alo), // Always use ALO for post-only orders
+        (TimeInForce::Gtc, false) => Ok(HyperliquidExchangeTif::Gtc),
+        (TimeInForce::Ioc, false) => Ok(HyperliquidExchangeTif::Ioc),
         (TimeInForce::Fok, false) => {
             anyhow::bail!("FOK time in force is not supported by Hyperliquid")
         }
@@ -391,13 +392,13 @@ fn determine_tpsl_type(
     order_side: OrderSide,
     trigger_price: Decimal,
     current_price: Option<Decimal>,
-) -> HyperliquidExecTpSl {
+) -> HyperliquidExchangeTpSl {
     match order_type {
         // Stop orders are protective - always SL
-        OrderType::StopMarket | OrderType::StopLimit => HyperliquidExecTpSl::Sl,
+        OrderType::StopMarket | OrderType::StopLimit => HyperliquidExchangeTpSl::Sl,
 
         // If Touched orders are profit-taking or entry orders - always TP
-        OrderType::MarketIfTouched | OrderType::LimitIfTouched => HyperliquidExecTpSl::Tp,
+        OrderType::MarketIfTouched | OrderType::LimitIfTouched => HyperliquidExchangeTpSl::Tp,
 
         // For other trigger types, try to infer from price relationship if available
         _ => {
@@ -406,24 +407,23 @@ fn determine_tpsl_type(
                     OrderSide::Buy => {
                         // Buy order: trigger above market = stop loss, below = take profit
                         if trigger_price > current {
-                            HyperliquidExecTpSl::Sl
+                            HyperliquidExchangeTpSl::Sl
                         } else {
-                            HyperliquidExecTpSl::Tp
+                            HyperliquidExchangeTpSl::Tp
                         }
                     }
                     OrderSide::Sell => {
                         // Sell order: trigger below market = stop loss, above = take profit
                         if trigger_price < current {
-                            HyperliquidExecTpSl::Sl
+                            HyperliquidExchangeTpSl::Sl
                         } else {
-                            HyperliquidExecTpSl::Tp
+                            HyperliquidExchangeTpSl::Tp
                         }
                     }
-                    _ => HyperliquidExecTpSl::Sl, // Default to SL for safety
                 }
             } else {
                 // No market price available, default to SL for safety
-                HyperliquidExecTpSl::Sl
+                HyperliquidExchangeTpSl::Sl
             }
         }
     }
@@ -485,7 +485,7 @@ pub fn order_to_hyperliquid_request_with_asset(
     price_decimals: u8,
     should_normalize_prices: bool,
     slippage_bps: u32,
-) -> anyhow::Result<HyperliquidExecPlaceOrderRequest> {
+) -> anyhow::Result<HyperliquidExchangePlaceOrderRequest> {
     order_to_hyperliquid_request_with_asset_and_cloid(
         order,
         asset,
@@ -504,7 +504,7 @@ pub fn order_to_hyperliquid_request_with_asset_and_cloid(
     should_normalize_prices: bool,
     slippage_bps: u32,
     cloid: Option<Cloid>,
-) -> anyhow::Result<HyperliquidExecPlaceOrderRequest> {
+) -> anyhow::Result<HyperliquidExchangePlaceOrderRequest> {
     let is_buy = matches!(order.order_side(), OrderSide::Buy);
     let reduce_only = order.is_reduce_only();
     let order_side = order.order_side();
@@ -543,16 +543,16 @@ pub fn order_to_hyperliquid_request_with_asset_and_cloid(
 
     // Determine order kind based on order type
     let kind = match order_type {
-        OrderType::Market => HyperliquidExecOrderKind::Limit {
-            limit: HyperliquidExecLimitParams {
-                tif: HyperliquidExecTif::Ioc,
+        OrderType::Market => HyperliquidExchangeOrderKind::Limit {
+            limit: HyperliquidExchangeLimitParams {
+                tif: HyperliquidExchangeTif::Ioc,
             },
         },
         OrderType::Limit => {
             let tif =
                 time_in_force_to_hyperliquid_tif(order.time_in_force(), order.is_post_only())?;
-            HyperliquidExecOrderKind::Limit {
-                limit: HyperliquidExecLimitParams { tif },
+            HyperliquidExchangeOrderKind::Limit {
+                limit: HyperliquidExchangeLimitParams { tif },
             }
         }
         OrderType::StopMarket => {
@@ -564,8 +564,8 @@ pub fn order_to_hyperliquid_request_with_asset_and_cloid(
                     raw.normalize()
                 };
                 let tpsl = determine_tpsl_type(order_type, order_side, trigger_price_decimal, None);
-                HyperliquidExecOrderKind::Trigger {
-                    trigger: HyperliquidExecTriggerParams {
+                HyperliquidExchangeOrderKind::Trigger {
+                    trigger: HyperliquidExchangeTriggerParams {
                         is_market: true,
                         trigger_px: trigger_price_decimal,
                         tpsl,
@@ -584,8 +584,8 @@ pub fn order_to_hyperliquid_request_with_asset_and_cloid(
                     raw.normalize()
                 };
                 let tpsl = determine_tpsl_type(order_type, order_side, trigger_price_decimal, None);
-                HyperliquidExecOrderKind::Trigger {
-                    trigger: HyperliquidExecTriggerParams {
+                HyperliquidExchangeOrderKind::Trigger {
+                    trigger: HyperliquidExchangeTriggerParams {
                         is_market: false,
                         trigger_px: trigger_price_decimal,
                         tpsl,
@@ -603,11 +603,11 @@ pub fn order_to_hyperliquid_request_with_asset_and_cloid(
                 } else {
                     raw.normalize()
                 };
-                HyperliquidExecOrderKind::Trigger {
-                    trigger: HyperliquidExecTriggerParams {
+                HyperliquidExchangeOrderKind::Trigger {
+                    trigger: HyperliquidExchangeTriggerParams {
                         is_market: true,
                         trigger_px: trigger_price_decimal,
-                        tpsl: HyperliquidExecTpSl::Tp,
+                        tpsl: HyperliquidExchangeTpSl::Tp,
                     },
                 }
             } else {
@@ -622,11 +622,11 @@ pub fn order_to_hyperliquid_request_with_asset_and_cloid(
                 } else {
                     raw.normalize()
                 };
-                HyperliquidExecOrderKind::Trigger {
-                    trigger: HyperliquidExecTriggerParams {
+                HyperliquidExchangeOrderKind::Trigger {
+                    trigger: HyperliquidExchangeTriggerParams {
                         is_market: false,
                         trigger_px: trigger_price_decimal,
-                        tpsl: HyperliquidExecTpSl::Tp,
+                        tpsl: HyperliquidExchangeTpSl::Tp,
                     },
                 }
             } else {
@@ -636,7 +636,7 @@ pub fn order_to_hyperliquid_request_with_asset_and_cloid(
         _ => anyhow::bail!("Unsupported order type for Hyperliquid: {order_type:?}"),
     };
 
-    Ok(HyperliquidExecPlaceOrderRequest {
+    Ok(HyperliquidExchangePlaceOrderRequest {
         asset,
         is_buy,
         price: price_decimal,
@@ -705,9 +705,9 @@ pub fn clamp_price_to_precision(price: Decimal, decimals: u8, is_buy: bool) -> D
 pub fn client_order_id_to_cancel_request_with_asset(
     client_order_id: &str,
     asset: u32,
-) -> HyperliquidExecCancelByCloidRequest {
+) -> HyperliquidExchangeCancelByCloidRequest {
     let cloid = Cloid::from_client_order_id(ClientOrderId::from(client_order_id));
-    HyperliquidExecCancelByCloidRequest { asset, cloid }
+    HyperliquidExchangeCancelByCloidRequest { asset, cloid }
 }
 
 /// Extracts per-item error from a successful Hyperliquid exchange response.
@@ -719,27 +719,27 @@ pub fn extract_inner_error(response: &HyperliquidExchangeResponse) -> Option<Str
     let HyperliquidExchangeResponse::Status { response, .. } = response else {
         return None;
     };
-    let data: HyperliquidExecResponseData = serde_json::from_value(response.clone()).ok()?;
+    let data: HyperliquidExchangeResponseData = serde_json::from_value(response.clone()).ok()?;
     match data {
-        HyperliquidExecResponseData::Order { data } => {
+        HyperliquidExchangeResponseData::Order { data } => {
             for status in &data.statuses {
-                if let HyperliquidExecOrderStatus::Error { error } = status {
+                if let HyperliquidExchangeOrderStatus::Error { error } = status {
                     return Some(error.clone());
                 }
             }
             None
         }
-        HyperliquidExecResponseData::Cancel { data } => {
+        HyperliquidExchangeResponseData::Cancel { data } => {
             for status in &data.statuses {
-                if let HyperliquidExecCancelStatus::Error { error } = status {
+                if let HyperliquidExchangeCancelStatus::Error { error } = status {
                     return Some(error.clone());
                 }
             }
             None
         }
-        HyperliquidExecResponseData::Modify { data } => {
+        HyperliquidExchangeResponseData::Modify { data } => {
             for status in &data.statuses {
-                if let HyperliquidExecModifyStatus::Error { error } = status {
+                if let HyperliquidExchangeModifyStatus::Error { error } = status {
                     return Some(error.clone());
                 }
             }
@@ -758,33 +758,34 @@ pub fn extract_inner_errors(response: &HyperliquidExchangeResponse) -> Vec<Optio
     let HyperliquidExchangeResponse::Status { response, .. } = response else {
         return Vec::new();
     };
-    let Ok(data) = serde_json::from_value::<HyperliquidExecResponseData>(response.clone()) else {
+    let Ok(data) = serde_json::from_value::<HyperliquidExchangeResponseData>(response.clone())
+    else {
         return Vec::new();
     };
 
     match data {
-        HyperliquidExecResponseData::Order { data } => data
+        HyperliquidExchangeResponseData::Order { data } => data
             .statuses
             .into_iter()
             .map(|s| match s {
-                HyperliquidExecOrderStatus::Error { error } => Some(error),
+                HyperliquidExchangeOrderStatus::Error { error } => Some(error),
                 _ => None,
             })
             .collect(),
-        HyperliquidExecResponseData::Cancel { data } => data
+        HyperliquidExchangeResponseData::Cancel { data } => data
             .statuses
             .into_iter()
             .map(|s| match s {
-                HyperliquidExecCancelStatus::Error { error } => Some(error),
-                HyperliquidExecCancelStatus::Success(_) => None,
+                HyperliquidExchangeCancelStatus::Error { error } => Some(error),
+                HyperliquidExchangeCancelStatus::Success(_) => None,
             })
             .collect(),
-        HyperliquidExecResponseData::Modify { data } => data
+        HyperliquidExchangeResponseData::Modify { data } => data
             .statuses
             .into_iter()
             .map(|s| match s {
-                HyperliquidExecModifyStatus::Error { error } => Some(error),
-                HyperliquidExecModifyStatus::Success(_) => None,
+                HyperliquidExchangeModifyStatus::Error { error } => Some(error),
+                HyperliquidExchangeModifyStatus::Success(_) => None,
             })
             .collect(),
         _ => Vec::new(),
@@ -815,7 +816,10 @@ pub fn extract_error_message(response: &HyperliquidExchangeResponse) -> String {
 /// # Returns
 ///
 /// `true` if the order is a conditional order, `false` otherwise.
-pub fn is_conditional_order_data(trigger_px: Option<&str>, tpsl: Option<&HyperliquidTpSl>) -> bool {
+pub fn is_conditional_order_data(
+    trigger_px: Option<Decimal>,
+    tpsl: Option<&HyperliquidTpSl>,
+) -> bool {
     trigger_px.is_some() && tpsl.is_some()
 }
 
@@ -1043,11 +1047,11 @@ pub fn parse_spot_account_balances(
 /// as Hyperliquid TP/SL groups.
 ///
 /// - `NormalTpsl` (OTOCO bracket): entry order is OTO and not reduce-only,
-///   all child orders are OCO, reduce-only, and reference the entry as parent.
-/// - `PositionTpsl` (OCO pair): every order is OCO, reduce-only, and linked
-///   to the same sibling set.
+///   all child orders are OCO or OUO, reduce-only, and reference the entry as parent.
+/// - `PositionTpsl` (linked exit pair): every order is OCO or OUO, reduce-only,
+///   and linked to the same sibling set.
 /// - `Na`: everything else (independent batch).
-pub(crate) fn determine_order_list_grouping(orders: &[OrderAny]) -> HyperliquidExecGrouping {
+pub(crate) fn determine_order_list_grouping(orders: &[OrderAny]) -> HyperliquidExchangeGrouping {
     if orders.len() >= 2 {
         let entry = &orders[0];
         let children = &orders[1..];
@@ -1055,20 +1059,25 @@ pub(crate) fn determine_order_list_grouping(orders: &[OrderAny]) -> HyperliquidE
         let entry_is_oto =
             entry.contingency_type() == Some(ContingencyType::Oto) && !entry.is_reduce_only();
         let children_are_linked = children.iter().all(|o| {
-            o.contingency_type() == Some(ContingencyType::Oco)
-                && o.is_reduce_only()
+            matches!(
+                o.contingency_type(),
+                Some(ContingencyType::Oco | ContingencyType::Ouo)
+            ) && o.is_reduce_only()
                 && o.parent_order_id() == Some(entry_id)
         });
 
         if entry_is_oto && children_are_linked {
-            return HyperliquidExecGrouping::NormalTpsl;
+            return HyperliquidExchangeGrouping::NormalTpsl;
         }
     }
 
     let all_oco_linked = orders.len() >= 2
-        && orders
-            .iter()
-            .all(|o| o.contingency_type() == Some(ContingencyType::Oco) && o.is_reduce_only())
+        && orders.iter().all(|o| {
+            matches!(
+                o.contingency_type(),
+                Some(ContingencyType::Oco | ContingencyType::Ouo)
+            ) && o.is_reduce_only()
+        })
         && orders.iter().all(|o| {
             o.linked_order_ids().is_some_and(|ids| {
                 ids.iter()
@@ -1077,9 +1086,9 @@ pub(crate) fn determine_order_list_grouping(orders: &[OrderAny]) -> HyperliquidE
         });
 
     if all_oco_linked {
-        HyperliquidExecGrouping::PositionTpsl
+        HyperliquidExchangeGrouping::PositionTpsl
     } else {
-        HyperliquidExecGrouping::Na
+        HyperliquidExchangeGrouping::Na
     }
 }
 
@@ -1099,6 +1108,21 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
+
+    #[rstest]
+    fn test_make_fill_trade_id_is_stable() {
+        // Pins the deterministic FNV output so the Decimal `Display` hashing
+        // stays stable for reconciliation dedup across the String->Decimal change.
+        let id = make_fill_trade_id(
+            "0xabc123",
+            12345,
+            dec!(50000.0),
+            dec!(0.1),
+            1704470400000,
+            dec!(0.0),
+        );
+        assert_eq!(id.to_string(), "a846ae6f557868e9-0000000000003039");
+    }
 
     #[derive(Serialize, Deserialize)]
     struct TestStruct {
@@ -1429,12 +1453,12 @@ mod tests {
     fn test_is_conditional_order_data() {
         // Test with trigger price and tpsl (conditional)
         assert!(is_conditional_order_data(
-            Some("50000.0"),
+            Some(dec!(50000.0)),
             Some(&HyperliquidTpSl::Sl)
         ));
 
         // Test with only trigger price (not conditional - needs both)
-        assert!(!is_conditional_order_data(Some("50000.0"), None));
+        assert!(!is_conditional_order_data(Some(dec!(50000.0)), None));
 
         // Test with only tpsl (not conditional - needs both)
         assert!(!is_conditional_order_data(None, Some(&HyperliquidTpSl::Tp)));
@@ -1693,11 +1717,11 @@ mod tests {
         let expected_trigger = normalize_price(trigger, price_decimals).normalize();
         assert_eq!(
             request.kind,
-            HyperliquidExecOrderKind::Trigger {
-                trigger: HyperliquidExecTriggerParams {
+            HyperliquidExchangeOrderKind::Trigger {
+                trigger: HyperliquidExchangeTriggerParams {
                     is_market: true,
                     trigger_px: expected_trigger,
-                    tpsl: HyperliquidExecTpSl::Sl,
+                    tpsl: HyperliquidExchangeTpSl::Sl,
                 },
             },
         );

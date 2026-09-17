@@ -42,9 +42,9 @@
 //! - `time`: `Duration`, `Instant`, `Interval`, `MissedTickBehavior`, `Sleep`,
 //!   `error` (submodule), `interval`, `interval_at`, `sleep`, `sleep_until`,
 //!   `timeout`
-//! - `task`: `JoinHandle`, `spawn`, `spawn_local`, `yield_now`
+//! - `task`: `JoinError`, `JoinHandle`, `spawn`, `spawn_local`, `yield_now`
 //! - `runtime`: `Builder`, `Handle`, `Runtime`
-//! - `signal`: `ctrl_c`
+//! - `signal`: `ctrl_c`, `terminate`
 //!
 //! # Related seam
 //!
@@ -77,9 +77,9 @@ pub mod time {
 /// Deterministic task spawning: fixed-order scheduler under simulation.
 pub mod task {
     #[cfg(all(feature = "simulation", madsim))]
-    pub use madsim::task::{JoinHandle, spawn, spawn_local, yield_now};
+    pub use madsim::task::{JoinError, JoinHandle, spawn, spawn_local, yield_now};
     #[cfg(not(all(feature = "simulation", madsim)))]
-    pub use tokio::task::{JoinHandle, spawn, spawn_local, yield_now};
+    pub use tokio::task::{JoinError, JoinHandle, spawn, spawn_local, yield_now};
 }
 
 /// Deterministic runtime: single-threaded sim runtime under simulation.
@@ -146,12 +146,36 @@ pub mod runtime {
 /// Deterministic signal handling: injectable signals under simulation.
 ///
 /// Under simulation (`simulation` + `cfg(madsim)`), `ctrl_c()` responds to
-/// `madsim::runtime::Handle::send_ctrl_c(node_id)` from test code.
+/// `madsim::runtime::Handle::send_ctrl_c(node_id)` from test code. Unix
+/// builds also expose SIGTERM; simulation and non-Unix builds never complete
+/// that future.
 pub mod signal {
     #[cfg(all(feature = "simulation", madsim))]
     pub use madsim::signal::ctrl_c;
     #[cfg(not(all(feature = "simulation", madsim)))]
     pub use tokio::signal::ctrl_c;
+
+    /// Waits for SIGTERM on Unix builds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SIGTERM listener cannot be installed.
+    #[cfg(all(not(all(feature = "simulation", madsim)), unix))]
+    pub async fn terminate() -> std::io::Result<()> {
+        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        signal.recv().await;
+        Ok(())
+    }
+
+    /// Waits forever on builds without a real SIGTERM listener.
+    ///
+    /// # Errors
+    ///
+    /// This function never returns on these builds.
+    #[cfg(any(all(feature = "simulation", madsim), not(unix)))]
+    pub async fn terminate() -> std::io::Result<()> {
+        std::future::pending::<std::io::Result<()>>().await
+    }
 }
 
 /// Compile-time probe of the DST re-export surface.
@@ -175,8 +199,8 @@ pub mod signal {
 mod surface {
     use super::{
         runtime::{Builder, Handle, Runtime},
-        signal::ctrl_c,
-        task::{JoinHandle, spawn, spawn_local, yield_now},
+        signal::{ctrl_c, terminate},
+        task::{JoinError, JoinHandle, spawn, spawn_local, yield_now},
         time::{
             Duration, Instant, Interval, MissedTickBehavior, Sleep, error, interval, interval_at,
             sleep, sleep_until, timeout,
@@ -292,7 +316,7 @@ mod tests {
     #[madsim::test]
     async fn test_dst_wall_clock_advances_with_virtual_time() {
         let before = nanos_since_unix_epoch();
-        time::sleep(time::Duration::from_secs(60)).await;
+        time::sleep(time::Duration::from_mins(1)).await;
         let after = nanos_since_unix_epoch();
 
         let elapsed_ns = after.saturating_sub(before);

@@ -12,20 +12,28 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
+"""
+Test configs behavior.
+"""
+
+from pathlib import Path
 
 import pytest
 
 from nautilus_trader.common import CacheConfig
 from nautilus_trader.common import DataActorConfig
-from nautilus_trader.common import DatabaseConfig
 from nautilus_trader.common import FileWriterConfig
 from nautilus_trader.common import ImportableActorConfig
 from nautilus_trader.common import LoggerConfig
+from nautilus_trader.common import LogLevel
 from nautilus_trader.common import MessageBusConfig
 from nautilus_trader.model import ActorId
 
 
-def test_cache_config_defaults():
+def test_cache_config_defaults() -> None:
+    """
+    Test cache config defaults.
+    """
     config = CacheConfig(
         None,
         False,
@@ -41,7 +49,7 @@ def test_cache_config_defaults():
         True,
     )
 
-    assert str(config.encoding) == "SerializationEncoding.MSG_PACK"
+    assert str(config.encoding) == "SerializationEncoding.JSON"
     assert config.timestamps_as_iso8601 is False
     assert config.buffer_interval_ms is None
     assert config.bulk_read_batch_size is None
@@ -55,7 +63,10 @@ def test_cache_config_defaults():
     assert config.persist_account_events is True
 
 
-def test_cache_config_accepts_explicit_values():
+def test_cache_config_accepts_explicit_values() -> None:
+    """
+    Test cache config accepts explicit values.
+    """
     # Get SerializationEncoding.JSON via the enum type
     default = CacheConfig(
         None,
@@ -102,12 +113,26 @@ def test_cache_config_accepts_explicit_values():
     assert config.persist_account_events is False
 
 
-def test_cache_config_rejects_public_string_encoding_argument():
+def test_cache_config_rejects_public_string_encoding_argument() -> None:
+    """
+    Test cache config rejects public string encoding argument.
+    """
     with pytest.raises(TypeError, match="SerializationEncoding"):
         CacheConfig("msgpack", False, True, True, False, False, False, 1000, 1000, 100, 1000, True)
 
 
-def test_data_actor_config_accepts_explicit_kwargs():
+def test_cache_config_rejects_embedded_database_config() -> None:
+    """
+    Test cache config rejects embedded database config.
+    """
+    with pytest.raises(TypeError, match="database"):
+        CacheConfig(database=None)
+
+
+def test_data_actor_config_accepts_explicit_kwargs() -> None:
+    """
+    Test data actor config accepts explicit kwargs.
+    """
     config = DataActorConfig(
         actor_id=ActorId("ACTOR-001"),
         log_events=False,
@@ -115,56 +140,51 @@ def test_data_actor_config_accepts_explicit_kwargs():
     )
 
     assert isinstance(config, DataActorConfig)
+    assert config.actor_id == ActorId("ACTOR-001")
+    assert config.log_events is False
+    assert config.log_commands is True
 
 
-def test_database_config_defaults():
-    config = DatabaseConfig()
+def test_data_actor_config_defaults_are_readable() -> None:
+    """
+    Test data actor config defaults are readable.
+    """
+    config = DataActorConfig()
 
-    assert config.database_type == "redis"
-    assert config.host is None
-    assert config.port is None
-    assert config.username is None
-    assert config.password is None
-    assert config.ssl is False
-    assert config.connection_timeout == 20
-    assert config.response_timeout == 20
-    assert config.number_of_retries == 100
-    assert config.exponent_base == 2
-    assert config.max_delay == 1000
-    assert config.factor == 2
+    assert config.actor_id is None
+    assert config.log_events is True
+    assert config.log_commands is True
 
 
-def test_database_config_accepts_explicit_kwargs():
-    config = DatabaseConfig(
-        database_type="redis",
-        host="localhost",
-        port=6379,
-        username="user",
-        password="pass",
-        ssl=True,
-        connection_timeout=1,
-        response_timeout=2,
-        number_of_retries=3,
-        exponent_base=4,
-        max_delay=5,
-        factor=6,
-    )
+def test_data_actor_config_fields_are_writable_from_python_subclasses() -> None:
+    """
+    Test data actor config fields are writable from python subclasses.
+    """
 
-    assert config.database_type == "redis"
-    assert config.host == "localhost"
-    assert config.port == 6379
-    assert config.username == "user"
-    assert config.password == "pass"
-    assert config.ssl is True
-    assert config.connection_timeout == 1
-    assert config.response_timeout == 2
-    assert config.number_of_retries == 3
-    assert config.exponent_base == 4
-    assert config.max_delay == 5
-    assert config.factor == 6
+    class PythonDataActorConfig(DataActorConfig):
+        """
+        Collect python data actor config tests.
+        """
+
+        def __init__(self) -> None:
+            """
+            Initialize the helper.
+            """
+            self.actor_id = ActorId("ACTOR-002")
+            self.log_events = False
+            self.log_commands = False
+
+    config = PythonDataActorConfig()
+
+    assert config.actor_id == ActorId("ACTOR-002")
+    assert config.log_events is False
+    assert config.log_commands is False
 
 
-def test_file_writer_config_construction(tmp_path):
+def test_file_writer_config_construction(tmp_path: Path) -> None:
+    """
+    Test file writer config construction.
+    """
     config = FileWriterConfig(
         directory=str(tmp_path),
         file_name="common.log",
@@ -172,10 +192,16 @@ def test_file_writer_config_construction(tmp_path):
         file_rotate=(1, 2),
     )
 
-    assert type(config).__name__ == "FileWriterConfig"
+    assert config.directory == str(tmp_path)
+    assert config.file_name == "common.log"
+    assert config.file_format == "json"
+    assert config.file_rotate == (1, 2)
 
 
-def test_importable_actor_config_fields():
+def test_importable_actor_config_fields() -> None:
+    """
+    Test importable actor config fields.
+    """
     config = ImportableActorConfig(
         actor_path="tests.unit.common.actor:TestActor",
         config_path="tests.unit.common.actor:TestActorConfig",
@@ -187,19 +213,58 @@ def test_importable_actor_config_fields():
     assert config.config == {"log_events": False}
 
 
-def test_logger_config_from_spec():
+def test_logger_config_from_spec() -> None:
+    """
+    Test logger config from spec.
+    """
     config = LoggerConfig.from_spec("stdout=INFO;file=DEBUG")
 
     assert type(config).__name__ == "LoggerConfig"
 
 
-def test_message_bus_config_defaults():
+def test_logger_config_readback(tmp_path: Path) -> None:
+    """
+    Test logger config readback.
+    """
+    file_config = FileWriterConfig(directory=str(tmp_path), file_name="events.log")
+    config = LoggerConfig(
+        stdout_level=LogLevel.DEBUG,
+        fileout_level=LogLevel.ERROR,
+        component_levels={"RiskEngine": "WARNING"},
+        is_colored=False,
+        print_config=True,
+        bypass_logging=True,
+        log_components_only=True,
+        file_config=file_config,
+        clear_log_file=True,
+        fileout_sync_on_flush=False,
+        buffered_stdout=True,
+    )
+
+    assert config.stdout_level == LogLevel.DEBUG
+    assert config.fileout_level == LogLevel.ERROR
+    assert config.component_levels == {"RiskEngine": "WARN"}
+    assert config.is_colored is False
+    assert config.print_config is True
+    assert config.bypass_logging is True
+    assert config.log_components_only is True
+    assert config.file_config is not None
+    assert config.file_config.file_name == "events.log"
+    assert config.clear_log_file is True
+    assert config.fileout_sync_on_flush is False
+    assert config.buffered_stdout is True
+
+
+def test_message_bus_config_defaults() -> None:
+    """
+    Test message bus config defaults.
+    """
     config = MessageBusConfig()
 
-    assert config.database is None
     assert config.timestamps_as_iso8601 is False
     assert config.buffer_interval_ms is None
     assert config.autotrim_mins is None
+    assert config.autotrim_maxlen is None
     assert config.use_trader_prefix is True
     assert config.use_trader_id is True
     assert config.use_instance_id is False
@@ -210,26 +275,15 @@ def test_message_bus_config_defaults():
     assert config.heartbeat_interval_secs is None
 
 
-def test_message_bus_config_accepts_explicit_kwargs():
-    database = DatabaseConfig(
-        database_type="redis",
-        host="localhost",
-        port=6379,
-        username="user",
-        password="pass",
-        ssl=True,
-        connection_timeout=1,
-        response_timeout=2,
-        number_of_retries=3,
-        exponent_base=4,
-        max_delay=5,
-        factor=6,
-    )
+def test_message_bus_config_accepts_explicit_kwargs() -> None:
+    """
+    Test message bus config accepts explicit kwargs.
+    """
     config = MessageBusConfig(
-        database=database,
         timestamps_as_iso8601=True,
         buffer_interval_ms=7,
         autotrim_mins=8,
+        autotrim_maxlen=1_000,
         use_trader_prefix=False,
         use_trader_id=False,
         use_instance_id=True,
@@ -240,10 +294,10 @@ def test_message_bus_config_accepts_explicit_kwargs():
         heartbeat_interval_secs=9,
     )
 
-    assert config.database.host == "localhost"
     assert config.timestamps_as_iso8601 is True
     assert config.buffer_interval_ms == 7
     assert config.autotrim_mins == 8
+    assert config.autotrim_maxlen == 1_000
     assert config.use_trader_prefix is False
     assert config.use_trader_id is False
     assert config.use_instance_id is True
@@ -252,3 +306,11 @@ def test_message_bus_config_accepts_explicit_kwargs():
     assert config.external_streams == ["orders", "fills"]
     assert config.types_filter == ["Signal", "CustomData"]
     assert config.heartbeat_interval_secs == 9
+
+
+def test_message_bus_config_rejects_embedded_backing_config() -> None:
+    """
+    Test message bus config rejects embedded backing config.
+    """
+    with pytest.raises(TypeError, match="backing"):
+        MessageBusConfig(backing=None)

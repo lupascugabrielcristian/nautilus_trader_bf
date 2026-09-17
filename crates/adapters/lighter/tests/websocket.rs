@@ -25,8 +25,8 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -37,7 +37,8 @@ use axum::{
         State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    response::Response,
+    http::StatusCode,
+    response::{IntoResponse, Response},
     routing::get,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -61,7 +62,10 @@ use nautilus_model::{
     instruments::{CryptoPerpetual, CurrencyPair, InstrumentAny},
     types::{Currency, Price, Quantity},
 };
-use nautilus_network::websocket::TransportBackend;
+use nautilus_network::{
+    SocketState, SocketStateSink, transport::TransportError, websocket::TransportBackend,
+};
+use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
 const PERP_MARKET_INDEX: i16 = 0;
@@ -87,33 +91,23 @@ fn perp_instrument(
     registry: &MarketRegistry,
 ) -> InstrumentAny {
     let instrument_id = registry.insert(market_index, venue_symbol, LighterProductType::Perp);
-    InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
-        instrument_id,
-        Symbol::new(format!("{venue_symbol}-PERP")),
-        Currency::from(venue_symbol),
-        Currency::from("USDC"),
-        Currency::from("USDC"),
-        false,
-        2,
-        4,
-        Price::from("0.01"),
-        Quantity::from("0.0001"),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        UnixNanos::default(),
-        UnixNanos::default(),
-    ))
+    InstrumentAny::CryptoPerpetual(
+        CryptoPerpetual::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(Symbol::new(format!("{venue_symbol}-PERP")))
+            .base_currency(Currency::from(venue_symbol))
+            .quote_currency(Currency::from("USDC"))
+            .settlement_currency(Currency::from("USDC"))
+            .is_inverse(false)
+            .price_precision(2)
+            .size_precision(4)
+            .price_increment(Price::from("0.01"))
+            .size_increment(Quantity::from("0.0001"))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap(),
+    )
 }
 
 fn spot_instrument(
@@ -122,36 +116,29 @@ fn spot_instrument(
     registry: &MarketRegistry,
 ) -> InstrumentAny {
     let instrument_id = registry.insert(market_index, venue_symbol, LighterProductType::Spot);
-    InstrumentAny::CurrencyPair(CurrencyPair::new(
-        instrument_id,
-        Symbol::new(format!("{venue_symbol}-SPOT")),
-        Currency::from(venue_symbol),
-        Currency::from("USDC"),
-        2,
-        4,
-        Price::from("0.01"),
-        Quantity::from("0.0001"),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        UnixNanos::default(),
-        UnixNanos::default(),
-    ))
+    InstrumentAny::CurrencyPair(
+        CurrencyPair::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(Symbol::new(format!("{venue_symbol}-SPOT")))
+            .base_currency(Currency::from(venue_symbol))
+            .quote_currency(Currency::from("USDC"))
+            .price_precision(2)
+            .size_precision(4)
+            .price_increment(Price::from("0.01"))
+            .size_increment(Quantity::from("0.0001"))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap(),
+    )
 }
 
 #[derive(Clone, Default)]
 struct TestServerState {
     connection_count: Arc<tokio::sync::Mutex<usize>>,
+    upgrade_attempts: Arc<AtomicUsize>,
+    transient_upgrade_failures: Arc<AtomicUsize>,
+    reject_upgrade: Arc<AtomicBool>,
     subscribes: Arc<tokio::sync::Mutex<Vec<Value>>>,
     unsubscribes: Arc<tokio::sync::Mutex<Vec<Value>>>,
     send_txs: Arc<tokio::sync::Mutex<Vec<Value>>>,
@@ -196,6 +183,22 @@ async fn handle_ws_upgrade(
     ws: WebSocketUpgrade,
     State(state): State<Arc<TestServerState>>,
 ) -> Response {
+    state.upgrade_attempts.fetch_add(1, Ordering::SeqCst);
+
+    if state.reject_upgrade.load(Ordering::SeqCst) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    if state
+        .transient_upgrade_failures
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
+    {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
@@ -304,7 +307,11 @@ async fn start_ws_server(state: Arc<TestServerState>) -> SocketAddr {
     tokio::spawn(async move {
         axum::serve(listener, router).await.expect("ws server");
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_until_async(
+        || async { tokio::net::TcpStream::connect(addr).await.is_ok() },
+        Duration::from_secs(2),
+    )
+    .await;
     addr
 }
 
@@ -315,18 +322,27 @@ struct ClientHarness {
 
 impl ClientHarness {
     async fn build(addr: SocketAddr) -> Self {
+        Self::build_with_state_sink(addr, None).await
+    }
+
+    async fn build_with_state_sink(addr: SocketAddr, state_sink: Option<SocketStateSink>) -> Self {
         let registry = Arc::new(MarketRegistry::new());
         let perp = perp_instrument(PERP_MARKET_INDEX, PERP_VENUE_SYMBOL, &registry);
         let second = perp_instrument(SECOND_MARKET_INDEX, SECOND_VENUE_SYMBOL, &registry);
         let spot = spot_instrument(SPOT_MARKET_INDEX, SPOT_VENUE_SYMBOL, &registry);
 
-        let mut client = LighterWebSocketClient::new(
+        let client = LighterWebSocketClient::new(
             Some(format!("ws://{addr}/stream")),
             LighterEnvironment::Testnet,
             Arc::clone(&registry),
             TransportBackend::default(),
+            5,
             None,
         );
+        let mut client = match state_sink {
+            Some(sink) => client.with_state_sink(sink),
+            None => client,
+        };
         client.cache_instruments(vec![
             (PERP_MARKET_INDEX, perp),
             (SECOND_MARKET_INDEX, second),
@@ -387,6 +403,14 @@ async fn await_send_tx_count(state: &TestServerState, target: usize) {
     .await;
 }
 
+async fn await_upgrade_attempts(state: &TestServerState, target: usize) {
+    wait_until_async(
+        || async { state.upgrade_attempts.load(Ordering::SeqCst) >= target },
+        Duration::from_secs(2),
+    )
+    .await;
+}
+
 async fn await_subscription_count(client: &LighterWebSocketClient, target: usize) {
     wait_until_async(
         || async { client.subscription_count() >= target },
@@ -411,16 +435,8 @@ fn book_snapshot_frame_for_market(market_index: i16) -> Value {
     frame
 }
 
-/// Returns a clone of the incremental order_book fixture rewritten to target
-/// a specific `market_index`.
 fn book_update_frame_for_market(market_index: i16) -> Value {
-    let mut frame = load_json("ws_order_book_update.json");
-    frame["channel"] = json!(format!("order_book:{market_index}"));
-    frame
-}
-
-fn book_update_frame_with_cached_changes() -> Value {
-    json!({
+    let mut frame = json!({
         "channel": "order_book:0",
         "last_updated_at": 1778138389656150_u64,
         "offset": 2165,
@@ -441,7 +457,13 @@ fn book_update_frame_with_cached_changes() -> Value {
         },
         "timestamp": 1778138583602_u64,
         "type": "update/order_book"
-    })
+    });
+    frame["channel"] = json!(format!("order_book:{market_index}"));
+    frame
+}
+
+fn book_update_frame_with_cached_changes() -> Value {
+    book_update_frame_for_market(PERP_MARKET_INDEX)
 }
 
 fn assert_depth10_matches_cached_changes(depth: &OrderBookDepth10) {
@@ -481,6 +503,172 @@ async fn test_websocket_connection_lifecycle() {
         Duration::from_secs(2),
     )
     .await;
+}
+
+#[tokio::test]
+async fn test_initial_connect_retries_transient_upgrade_rejection() {
+    let state = Arc::new(TestServerState::default());
+    state.transient_upgrade_failures.store(1, Ordering::SeqCst);
+    let addr = start_ws_server(state.clone()).await;
+    let mut client = LighterWebSocketClient::new(
+        Some(format!("ws://{addr}/stream")),
+        LighterEnvironment::Testnet,
+        Arc::new(MarketRegistry::new()),
+        TransportBackend::default(),
+        5,
+        None,
+    );
+
+    client.connect().await.expect("connect after retry");
+
+    assert_eq!(state.upgrade_attempts.load(Ordering::SeqCst), 2);
+    assert!(client.is_active());
+
+    client.disconnect().await.expect("disconnect");
+}
+
+#[tokio::test]
+async fn test_initial_connect_does_not_retry_permanent_upgrade_rejection() {
+    let state = Arc::new(TestServerState::default());
+    state.reject_upgrade.store(true, Ordering::SeqCst);
+    let addr = start_ws_server(state.clone()).await;
+    let mut client = LighterWebSocketClient::new(
+        Some(format!("ws://{addr}/stream")),
+        LighterEnvironment::Testnet,
+        Arc::new(MarketRegistry::new()),
+        TransportBackend::default(),
+        5,
+        None,
+    );
+
+    let error = client
+        .connect()
+        .await
+        .expect_err("permanent rejection must fail");
+
+    assert_eq!(state.upgrade_attempts.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        error.downcast_ref::<TransportError>(),
+        Some(TransportError::UpgradeRejected(401)),
+    ));
+}
+
+#[tokio::test]
+async fn test_initial_connect_retries_share_configured_timeout_budget() {
+    let state = Arc::new(TestServerState::default());
+    state.transient_upgrade_failures.store(10, Ordering::SeqCst);
+    let addr = start_ws_server(state.clone()).await;
+    let mut client = LighterWebSocketClient::new(
+        Some(format!("ws://{addr}/stream")),
+        LighterEnvironment::Testnet,
+        Arc::new(MarketRegistry::new()),
+        TransportBackend::default(),
+        1,
+        None,
+    );
+
+    let error = tokio::time::timeout(Duration::from_secs(2), client.connect())
+        .await
+        .expect("initial connect exceeded configured timeout budget")
+        .expect_err("transient rejections must exhaust the timeout budget");
+
+    assert_eq!(
+        error.to_string(),
+        "Lighter WebSocket initial connection timeout after 1 seconds",
+    );
+    assert_eq!(state.upgrade_attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn test_disconnect_cancels_initial_connect_and_allows_retry() {
+    let state = Arc::new(TestServerState::default());
+    state.transient_upgrade_failures.store(10, Ordering::SeqCst);
+    let addr = start_ws_server(state.clone()).await;
+    let client = LighterWebSocketClient::new(
+        Some(format!("ws://{addr}/stream")),
+        LighterEnvironment::Testnet,
+        Arc::new(MarketRegistry::new()),
+        TransportBackend::default(),
+        5,
+        None,
+    );
+    let mut connecting_client = client.clone();
+    let mut disconnecting_client = client;
+
+    let connect_task = tokio::spawn(async move {
+        let result = connecting_client.connect().await;
+        (connecting_client, result)
+    });
+    await_upgrade_attempts(&state, 1).await;
+
+    disconnecting_client
+        .disconnect()
+        .await
+        .expect("cancel initial connect");
+    let (mut reconnecting_client, result) =
+        tokio::time::timeout(Duration::from_secs(1), connect_task)
+            .await
+            .expect("initial connect cancellation timeout")
+            .expect("initial connect task");
+
+    let error = result.expect_err("initial connect must be cancelled");
+    let transport_error = error
+        .downcast_ref::<TransportError>()
+        .expect("transport cancellation error");
+    let TransportError::Io(io_error) = transport_error else {
+        panic!("expected I/O cancellation error, was {transport_error:?}");
+    };
+    assert_eq!(io_error.kind(), std::io::ErrorKind::Interrupted);
+
+    state.transient_upgrade_failures.store(0, Ordering::SeqCst);
+    reconnecting_client.connect().await.expect("reconnect");
+
+    assert!(reconnecting_client.is_active());
+
+    reconnecting_client.disconnect().await.expect("disconnect");
+}
+
+#[tokio::test]
+async fn test_state_sink_reports_connection_loss_and_recovery() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_ws_server(state.clone()).await;
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&observed);
+    let sink = SocketStateSink::new(move |state| recorded.lock().unwrap().push(state));
+
+    let harness = ClientHarness::build_with_state_sink(addr, Some(sink)).await;
+    assert_eq!(*observed.lock().unwrap(), vec![SocketState::Connected]);
+
+    // The server acks this subscribe and then closes, so the client observes a
+    // connection loss rather than a graceful disconnect.
+    state
+        .drop_after_next_subscribe
+        .store(true, Ordering::Relaxed);
+    harness
+        .client
+        .subscribe_book(harness.instrument(PERP_MARKET_INDEX))
+        .await
+        .expect("subscribe_book");
+    await_subscribe_count(&state, 1).await;
+
+    wait_until_async(
+        || {
+            let observed = observed.clone();
+            async move { observed.lock().unwrap().len() >= 3 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(
+        *observed.lock().unwrap(),
+        vec![
+            SocketState::Connected,
+            SocketState::Disconnected,
+            SocketState::Connected,
+        ]
+    );
 }
 
 #[tokio::test]
@@ -646,6 +834,7 @@ async fn test_send_tx_errors_when_handler_unavailable() {
         LighterEnvironment::Testnet,
         registry,
         TransportBackend::default(),
+        5,
         None,
     );
 
@@ -707,6 +896,160 @@ async fn test_order_book_update_before_snapshot_is_dropped() {
 }
 
 #[tokio::test]
+async fn test_order_book_nonce_gap_drops_update_and_resubscribes() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_ws_server(state.clone()).await;
+    let mut harness = ClientHarness::build(addr).await;
+
+    state
+        .enqueue_push(load_json("ws_order_book_subscribed.json"))
+        .await;
+
+    let id = harness.instrument(PERP_MARKET_INDEX);
+    harness.client.subscribe_book(id).await.expect("subscribe");
+
+    let snapshot_event = next_event_within(&mut harness.client, Duration::from_secs(2))
+        .await
+        .expect("snapshot deltas");
+    let NautilusWsMessage::Deltas(deltas) = snapshot_event else {
+        panic!("expected snapshot Deltas, was {snapshot_event:?}");
+    };
+    assert!(
+        deltas
+            .deltas
+            .iter()
+            .any(|d| d.flags & RecordFlag::F_SNAPSHOT as u8 != 0),
+        "initial snapshot must seed the cached book",
+    );
+
+    state
+        .enqueue_push(load_json("ws_order_book_update.json"))
+        .await;
+    state
+        .enqueue_push(load_json("ws_order_book_subscribed.json"))
+        .await;
+    harness
+        .client
+        .subscribe_quotes(id)
+        .await
+        .expect("trigger nonce-gap update");
+
+    await_unsubscribe_count(&state, 1).await;
+    await_subscribe_count(&state, 3).await;
+
+    let event = next_event_within(&mut harness.client, Duration::from_secs(2))
+        .await
+        .expect("resync snapshot");
+    let NautilusWsMessage::Deltas(deltas) = event else {
+        panic!("expected resync snapshot Deltas, was {event:?}");
+    };
+    let first = deltas.deltas.first().expect("at least one delta");
+
+    assert_eq!(first.action, BookAction::Clear);
+    assert!(
+        deltas
+            .deltas
+            .iter()
+            .any(|d| d.flags & RecordFlag::F_SNAPSHOT as u8 != 0),
+        "nonce-gap update must be dropped until a fresh snapshot arrives",
+    );
+
+    let order_book_subs = state
+        .subscribes()
+        .await
+        .into_iter()
+        .filter(|sub| sub["channel"] == "order_book/0")
+        .count();
+    let order_book_unsubs = state
+        .unsubscribes()
+        .await
+        .into_iter()
+        .filter(|unsub| unsub["channel"] == "order_book/0")
+        .count();
+
+    assert_eq!(order_book_subs, 2, "gap must force one book resubscribe");
+    assert_eq!(
+        order_book_unsubs, 1,
+        "gap must force one venue book unsubscribe",
+    );
+
+    harness.client.disconnect().await.expect("disconnect");
+}
+
+#[tokio::test]
+async fn test_order_book_depth10_nonce_gap_drops_update_and_resubscribes() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_ws_server(state.clone()).await;
+    let mut harness = ClientHarness::build(addr).await;
+
+    state
+        .enqueue_push(load_json("ws_order_book_subscribed.json"))
+        .await;
+
+    let id = harness.instrument(PERP_MARKET_INDEX);
+    harness
+        .client
+        .subscribe_book_depth10(id)
+        .await
+        .expect("subscribe_book_depth10");
+
+    let snapshot_event = next_event_within(&mut harness.client, Duration::from_secs(2))
+        .await
+        .expect("snapshot depth10");
+    let NautilusWsMessage::Depth10(depth) = snapshot_event else {
+        panic!("expected snapshot Depth10, was {snapshot_event:?}");
+    };
+    assert_eq!(depth.instrument_id, id);
+    assert_eq!(depth.sequence, 904845);
+
+    state
+        .enqueue_push(load_json("ws_order_book_update.json"))
+        .await;
+    state
+        .enqueue_push(load_json("ws_order_book_subscribed.json"))
+        .await;
+    harness
+        .client
+        .subscribe_quotes(id)
+        .await
+        .expect("trigger nonce-gap update");
+
+    await_unsubscribe_count(&state, 1).await;
+    await_subscribe_count(&state, 3).await;
+
+    let event = next_event_within(&mut harness.client, Duration::from_secs(2))
+        .await
+        .expect("resync depth10");
+    let NautilusWsMessage::Depth10(depth) = event else {
+        panic!("expected resync Depth10, was {event:?}");
+    };
+
+    assert_eq!(depth.instrument_id, id);
+    assert_eq!(depth.sequence, 904845);
+
+    let order_book_subs = state
+        .subscribes()
+        .await
+        .into_iter()
+        .filter(|sub| sub["channel"] == "order_book/0")
+        .count();
+    let order_book_unsubs = state
+        .unsubscribes()
+        .await
+        .into_iter()
+        .filter(|unsub| unsub["channel"] == "order_book/0")
+        .count();
+
+    assert_eq!(order_book_subs, 2, "gap must force one book resubscribe");
+    assert_eq!(
+        order_book_unsubs, 1,
+        "gap must force one venue book unsubscribe",
+    );
+
+    harness.client.disconnect().await.expect("disconnect");
+}
+
+#[tokio::test]
 async fn test_order_book_second_frame_is_incremental_no_depth10() {
     let state = Arc::new(TestServerState::default());
     let addr = start_ws_server(state.clone()).await;
@@ -738,7 +1081,7 @@ async fn test_order_book_second_frame_is_incremental_no_depth10() {
     // so the second frame parses as incremental even when delivered through
     // a fresh push.
     state
-        .enqueue_push(load_json("ws_order_book_update.json"))
+        .enqueue_push(book_update_frame_with_cached_changes())
         .await;
     harness
         .client
@@ -1018,7 +1361,7 @@ async fn test_ticker_frame_resolves_via_channel_index() {
     let mut harness = ClientHarness::build(addr).await;
 
     // Use the existing fixture but rewrite `s` to a symbol that does NOT
-    // match any cached raw_symbol — verifies the handler resolves from the
+    // match any cached raw_symbol - verifies the handler resolves from the
     // channel field, not the payload symbol field.
     let mut frame = load_json("ws_ticker_update.json");
     frame["ticker"]["s"] = json!("UNRELATED");
@@ -1085,11 +1428,8 @@ async fn test_market_stats_frame_emits_mark_index_and_funding_updates() {
             NautilusWsMessage::FundingRate(update) => {
                 saw_funding = true;
                 assert_eq!(update.instrument_id, harness.instrument(PERP_MARKET_INDEX));
-                assert_eq!(update.rate.to_string(), "0.000001");
-                assert_eq!(
-                    update.next_funding_ns,
-                    Some(UnixNanos::from(1_774_886_400_000_000_000))
-                );
+                assert_eq!(update.rate, Decimal::new(1, 6));
+                assert_eq!(update.next_funding_ns, None);
             }
             _ => {}
         }
@@ -1209,7 +1549,7 @@ async fn test_typed_snapshot_then_update_marks_only_first_with_f_snapshot() {
     // tracks `book_snapshots_seen` per market_index, so the second frame
     // must parse as incremental.
     state
-        .enqueue_push(load_json("ws_order_book_update.json"))
+        .enqueue_push(book_update_frame_with_cached_changes())
         .await;
     harness
         .client
@@ -1270,7 +1610,7 @@ async fn test_unsubscribe_trade_does_not_clear_book_snapshot_state() {
 
     // Push a second order_book frame.
     state
-        .enqueue_push(load_json("ws_order_book_update.json"))
+        .enqueue_push(book_update_frame_with_cached_changes())
         .await;
     harness
         .client
@@ -1331,7 +1671,7 @@ async fn test_unsubscribe_book_ack_resets_snapshot_state() {
     // Resubscribe; an update arriving before the next subscription snapshot
     // must be dropped because the unsubscribe ack cleared book_snapshots_seen.
     state
-        .enqueue_push(load_json("ws_order_book_update.json"))
+        .enqueue_push(book_update_frame_with_cached_changes())
         .await;
     harness
         .client
@@ -1613,7 +1953,7 @@ async fn test_reconnect_replays_authenticated_and_public_subscriptions() {
     // Drain events until Reconnected lands. The network layer reconnects
     // after `RECONNECT_BASE_BACKOFF` (250 ms) plus jitter, so a few seconds
     // is plenty of headroom.
-    let mut saw_reconnected = false;
+    let mut reconnect_epoch = None;
 
     for _ in 0..20 {
         let Some(event) = next_event_within(&mut harness.client, Duration::from_secs(3)).await
@@ -1621,14 +1961,15 @@ async fn test_reconnect_replays_authenticated_and_public_subscriptions() {
             break;
         };
 
-        if matches!(event, NautilusWsMessage::Reconnected) {
-            saw_reconnected = true;
+        if let NautilusWsMessage::Reconnected { connection_epoch } = event {
+            reconnect_epoch = Some(connection_epoch);
             break;
         }
     }
-    assert!(
-        saw_reconnected,
-        "expected Reconnected after server-driven close"
+    assert_eq!(
+        reconnect_epoch,
+        Some(1),
+        "first replacement connection must own epoch 1",
     );
 
     // The spawn loop replays both topics from `subscription_args`. Order is

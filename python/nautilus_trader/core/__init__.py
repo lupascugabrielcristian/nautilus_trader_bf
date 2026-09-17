@@ -12,9 +12,14 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
+"""
+Core primitives and low-level utilities.
+"""
 
 from nautilus_trader._fixup import fixup_module_names
 from nautilus_trader._libnautilus.core import *  # noqa: F403 (undefined-local-with-import-star)
+from nautilus_trader.core.datetime import dt_to_unix_nanos as dt_to_unix_nanos
+from nautilus_trader.core.datetime import unix_nanos_to_dt as unix_nanos_to_dt
 
 
 fixup_module_names(globals(), __name__)

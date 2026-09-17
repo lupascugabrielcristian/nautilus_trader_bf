@@ -16,29 +16,30 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use nautilus_common::{
-    live::get_runtime,
-    messages::{
-        DataEvent, DataResponse,
-        data::{
-            BookResponse, CustomDataResponse, InstrumentResponse, InstrumentsResponse,
-            RequestBookSnapshot, RequestCustomData, RequestInstrument, RequestInstruments,
-            RequestTrades, TradesResponse,
-        },
+use nautilus_common::messages::{
+    DataEvent, DataResponse,
+    data::{
+        BookResponse, CustomDataResponse, InstrumentResponse, InstrumentsResponse,
+        RequestBookSnapshot, RequestCustomData, RequestInstrument, RequestInstruments,
+        RequestTrades, TradesResponse,
     },
 };
 use nautilus_core::datetime::datetime_to_unix_nanos;
 use nautilus_model::{data::CustomData, instruments::Instrument};
 
-use super::{PolymarketDataClient, dispatch::WsMessageContext, instruments::cache_instrument};
+use super::{
+    PolymarketDataClient,
+    instruments::{apply_live_instrument, cache_instrument_if_active},
+};
 use crate::{
     common::consts::POLYMARKET_VENUE,
     providers::extract_condition_id,
     resolve::{
         PolymarketResolveRequestSummaryData, RESOLVE_REQUEST_TYPE_NAME, ResolveBatchErrorMode,
-        ResolveRequestSummary, ResolveWatchSelectionMode, collect_resolve_watch_selection,
-        fetch_and_apply_resolutions_by_condition_ids, parse_condition_ids_from_request_params,
-        pause_resolve_watch_entries, request_params_has_explicit_condition_selector,
+        ResolveContext, ResolveRequestSummary, ResolveWatchSelectionMode,
+        collect_resolve_watch_selection, fetch_and_apply_resolutions_by_condition_ids,
+        parse_condition_ids_from_request_params, pause_resolve_watch_entries,
+        request_params_has_explicit_condition_selector,
     },
 };
 
@@ -70,30 +71,14 @@ pub(super) fn request_data(client: &PolymarketDataClient, request: RequestCustom
     let resolve_poll_enabled = client.config.resolve_poll_enabled;
     let grace_secs = client.config.resolve_poll_grace_secs;
     let max_wait_secs = client.config.resolve_poll_max_wait_secs.max(grace_secs);
-    let ctx = WsMessageContext {
+    let clob_public_client = client.clob_public_client.clone();
+    let resolve_ctx = ResolveContext {
         clock: client.clock,
         data_sender: client.data_sender.clone(),
-        token_meta: client.token_meta.clone(),
-        instruments: client.instruments.clone(),
-        gamma_client: client.provider.http_client().clone(),
-        clob_public_client: client.clob_public_client.clone(),
-        filters: client.provider.filters(),
-        order_books: client.order_books.clone(),
-        last_quotes: client.last_quotes.clone(),
-        active_quote_subs: client.active_quote_subs.clone(),
-        active_delta_subs: client.active_delta_subs.clone(),
-        active_trade_subs: client.active_trade_subs.clone(),
-        resolve_poll_watchlist: client.resolve_poll_watchlist.clone(),
-        resolve_watch_apply_mutex: client.resolve_watch_apply_mutex.clone(),
-        pending_snapshot_after_tick_change: client.pending_snapshot_after_tick_change.clone(),
-        new_market_inflight_keys: client.new_market_inflight_keys.clone(),
-        new_market_fetch_semaphore: client.new_market_fetch_semaphore.clone(),
-        subscribe_new_markets: client.config.subscribe_new_markets,
-        new_market_filter: client.config.new_market_filter.clone(),
-        cancellation_token: client.cancellation_token.clone(),
+        watchlist: client.resolve_poll_watchlist.clone(),
+        apply_mutex: client.resolve_watch_apply_mutex.clone(),
     };
-
-    get_runtime().spawn(async move {
+    let future = async move {
         let mut summary = ResolveRequestSummary {
             requested_condition_ids: Vec::new(),
             fetched_markets: 0,
@@ -107,8 +92,7 @@ pub(super) fn request_data(client: &PolymarketDataClient, request: RequestCustom
             error: None,
         };
 
-        let has_explicit_selector =
-            request_params_has_explicit_condition_selector(&request_params);
+        let has_explicit_selector = request_params_has_explicit_condition_selector(&request_params);
         let mut condition_ids = parse_condition_ids_from_request_params(&request_params);
         if condition_ids.is_empty() {
             if has_explicit_selector {
@@ -143,8 +127,8 @@ pub(super) fn request_data(client: &PolymarketDataClient, request: RequestCustom
 
         let stats = fetch_and_apply_resolutions_by_condition_ids(
             &gamma_client,
-            &ctx.clob_public_client,
-            &ctx.resolve_context(),
+            &clob_public_client,
+            &resolve_ctx,
             &condition_ids,
             ResolveBatchErrorMode::StopOnFirstError,
         )
@@ -159,7 +143,7 @@ pub(super) fn request_data(client: &PolymarketDataClient, request: RequestCustom
             summary.error = stats.error;
         }
 
-        log::info!(
+        log::debug!(
             "Polymarket manual resolve request requested={} fetched={} resolved={} emitted={} failed={} skipped_non_binary={} clob_fallback_successes={} timed_out_watchlist={} used_watchlist_fallback={}",
             summary.requested_condition_ids.len(),
             summary.fetched_markets,
@@ -193,7 +177,11 @@ pub(super) fn request_data(client: &PolymarketDataClient, request: RequestCustom
         if let Err(e) = sender.send(DataEvent::Response(response)) {
             log::error!("Failed to send resolve custom data response: {e}");
         }
-    });
+    };
+
+    if let Err(e) = client.tasks.spawn(future) {
+        log::debug!("Skipping Polymarket data task after shutdown began: {e}");
+    }
 }
 
 pub(super) fn request_instruments(client: &PolymarketDataClient, request: RequestInstruments) {
@@ -203,6 +191,7 @@ pub(super) fn request_instruments(client: &PolymarketDataClient, request: Reques
     let instrument_config = client.provider.config().clone();
     let instruments_cache = client.instruments.clone();
     let token_meta = client.token_meta.clone();
+    let closed_condition_ids = client.closed_condition_ids.clone();
     let request_id = request.request_id;
     let client_id = request.client_id.unwrap_or(client.client_id);
     let venue = *POLYMARKET_VENUE;
@@ -210,8 +199,7 @@ pub(super) fn request_instruments(client: &PolymarketDataClient, request: Reques
     let end_nanos = datetime_to_unix_nanos(request.end);
     let params = request.params;
     let clock = client.clock;
-
-    get_runtime().spawn(async move {
+    let future = async move {
         let instruments = if instrument_config.should_load_all() || instrument_config.has_load_ids()
         {
             crate::providers::fetch_configured_instruments(&http, &instrument_config, &filters)
@@ -229,7 +217,18 @@ pub(super) fn request_instruments(client: &PolymarketDataClient, request: Reques
         };
 
         for instrument in &instruments {
-            cache_instrument(&instruments_cache, &token_meta, instrument);
+            if !cache_instrument_if_active(
+                clock.get_time_ns(),
+                &closed_condition_ids,
+                &instruments_cache,
+                &token_meta,
+                instrument,
+            ) {
+                log::debug!(
+                    "Skipping expired instrument {} during request_instruments cache update",
+                    instrument.id()
+                );
+            }
         }
 
         let response = DataResponse::Instruments(InstrumentsResponse::new(
@@ -246,7 +245,11 @@ pub(super) fn request_instruments(client: &PolymarketDataClient, request: Reques
         if let Err(e) = sender.send(DataEvent::Response(response)) {
             log::error!("Failed to send instruments response: {e}");
         }
-    });
+    };
+
+    if let Err(e) = client.tasks.spawn(future) {
+        log::debug!("Skipping Polymarket data task after shutdown began: {e}");
+    }
 }
 
 pub(super) fn request_instrument(client: &PolymarketDataClient, request: RequestInstrument) {
@@ -255,14 +258,14 @@ pub(super) fn request_instrument(client: &PolymarketDataClient, request: Request
     let sender = client.data_sender.clone();
     let instruments_cache = client.instruments.clone();
     let token_meta = client.token_meta.clone();
+    let closed_condition_ids = client.closed_condition_ids.clone();
     let client_id = request.client_id.unwrap_or(client.client_id);
     let request_id = request.request_id;
     let start = request.start;
     let end = request.end;
     let params = request.params;
     let clock = client.clock;
-
-    get_runtime().spawn(async move {
+    let future = async move {
         let condition_id = match extract_condition_id(&instrument_id) {
             Ok(cid) => cid,
             Err(e) => {
@@ -272,7 +275,7 @@ pub(super) fn request_instrument(client: &PolymarketDataClient, request: Request
         };
 
         let query_params = crate::http::query::GetGammaMarketsParams {
-            condition_ids: Some(condition_id),
+            condition_ids: Some(vec![condition_id]),
             ..Default::default()
         };
 
@@ -285,12 +288,24 @@ pub(super) fn request_instrument(client: &PolymarketDataClient, request: Request
         };
 
         if let Some(inst) = instrument {
-            cache_instrument(&instruments_cache, &token_meta, &inst);
-
-            // Publish onto the data bus so other clients (e.g. the exec
-            // client's token map) can update from the same fetch.
-            if let Err(e) = sender.send(DataEvent::Instrument(inst.clone())) {
-                log::warn!("Failed to publish instrument {instrument_id}: {e}");
+            if crate::data::runtime::is_instrument_expired(&inst, clock.get_time_ns()) {
+                log::debug!(
+                    "Skipping expired instrument {instrument_id} during request_instrument cache update"
+                );
+            } else {
+                apply_live_instrument(
+                    &closed_condition_ids,
+                    &instruments_cache,
+                    &token_meta,
+                    &inst,
+                    |instrument| {
+                        // Publish onto the data bus so other clients (e.g. the exec
+                        // client's token map) can update from the same fetch.
+                        if let Err(e) = sender.send(DataEvent::Instrument(instrument.clone())) {
+                            log::warn!("Failed to publish instrument {instrument_id}: {e}");
+                        }
+                    },
+                );
             }
 
             let response = DataResponse::Instrument(Box::new(InstrumentResponse::new(
@@ -310,7 +325,11 @@ pub(super) fn request_instrument(client: &PolymarketDataClient, request: Request
         } else {
             log::error!("Instrument {instrument_id} not found on Polymarket");
         }
-    });
+    };
+
+    if let Err(e) = client.tasks.spawn(future) {
+        log::debug!("Skipping Polymarket data task after shutdown began: {e}");
+    }
 }
 
 pub(super) fn request_book_snapshot(
@@ -318,10 +337,7 @@ pub(super) fn request_book_snapshot(
     request: RequestBookSnapshot,
 ) -> anyhow::Result<()> {
     let instrument_id = request.instrument_id;
-    let instruments = client.instruments.load();
-    let instrument = instruments
-        .get(&instrument_id)
-        .ok_or_else(|| anyhow::anyhow!("Instrument {instrument_id} not found"))?;
+    let instrument = client.ensure_market_data_request_allowed(instrument_id)?;
 
     let token_id = instrument.raw_symbol().as_str().to_string();
     let price_precision = instrument.price_precision();
@@ -333,8 +349,7 @@ pub(super) fn request_book_snapshot(
     let request_id = request.request_id;
     let params = request.params;
     let clock = client.clock;
-
-    get_runtime().spawn(async move {
+    let future = async move {
         match clob_client
             .request_book_snapshot(instrument_id, &token_id, price_precision, size_precision)
             .await
@@ -358,7 +373,11 @@ pub(super) fn request_book_snapshot(
             }
             Err(e) => log::error!("Book snapshot request failed: {e:?}"),
         }
-    });
+    };
+
+    if let Err(e) = client.tasks.spawn(future) {
+        log::debug!("Skipping Polymarket data task after shutdown began: {e}");
+    }
 
     Ok(())
 }
@@ -368,10 +387,7 @@ pub(super) fn request_trades(
     request: RequestTrades,
 ) -> anyhow::Result<()> {
     let instrument_id = request.instrument_id;
-    let instruments = client.instruments.load();
-    let instrument = instruments
-        .get(&instrument_id)
-        .ok_or_else(|| anyhow::anyhow!("Instrument {instrument_id} not found"))?;
+    let instrument = client.ensure_market_data_request_allowed(instrument_id)?;
 
     let condition_id = extract_condition_id(&instrument_id)?;
     let token_id = instrument.raw_symbol().as_str().to_string();
@@ -387,8 +403,7 @@ pub(super) fn request_trades(
     let clock = client.clock;
     let start_nanos = datetime_to_unix_nanos(request.start);
     let end_nanos = datetime_to_unix_nanos(request.end);
-
-    get_runtime().spawn(async move {
+    let future = async move {
         match data_api_client
             .request_trade_ticks(
                 instrument_id,
@@ -396,6 +411,8 @@ pub(super) fn request_trades(
                 &token_id,
                 price_precision,
                 size_precision,
+                start_nanos,
+                end_nanos,
                 limit,
             )
             .await
@@ -419,7 +436,11 @@ pub(super) fn request_trades(
             }
             Err(e) => log::error!("Trade request failed for {instrument_id}: {e:?}"),
         }
-    });
+    };
+
+    if let Err(e) = client.tasks.spawn(future) {
+        log::debug!("Skipping Polymarket data task after shutdown began: {e}");
+    }
 
     Ok(())
 }

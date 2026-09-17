@@ -82,12 +82,22 @@ struct TestServerState {
     last_trades_params: Arc<tokio::sync::Mutex<Option<HashMap<String, String>>>>,
 }
 
+fn fast_test_retry_config(max_retries: u32) -> RetryConfig {
+    RetryConfig {
+        max_retries,
+        initial_delay_ms: 1,
+        max_delay_ms: 1,
+        backoff_factor: 1.0,
+        jitter_ms: 0,
+        ..Default::default()
+    }
+}
+
 static DATA_CLIENT_CREATION_LOCK: Mutex<()> = Mutex::new(());
 
 async fn wait_for_server(addr: SocketAddr, path: &str) {
     let health_url = format!("http://{addr}{path}");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    let http_client = HttpClient::builder().build().unwrap();
     wait_until_async(
         || {
             let url = health_url.clone();
@@ -521,8 +531,8 @@ async fn test_trades_chronological_order() {
 
     // dYdX returns trades in reverse chronological order (newest first)
     for i in 0..trades.trades.len() - 1 {
-        let current = trades.trades[i].created_at.timestamp_millis();
-        let next = trades.trades[i + 1].created_at.timestamp_millis();
+        let current = trades.trades[i].created_at.as_millisecond();
+        let next = trades.trades[i + 1].created_at.as_millisecond();
         assert!(
             current >= next,
             "Trades should be in reverse chronological order (newest first)"
@@ -629,8 +639,8 @@ async fn test_candles_chronological_order() {
 
     // dYdX returns candles in reverse chronological order (newest first)
     for i in 0..candles.candles.len() - 1 {
-        let current = candles.candles[i].started_at.timestamp_millis();
-        let next = candles.candles[i + 1].started_at.timestamp_millis();
+        let current = candles.candles[i].started_at.as_millisecond();
+        let next = candles.candles[i + 1].started_at.as_millisecond();
         assert!(
             current >= next,
             "Candles should be in reverse chronological order (newest first)"
@@ -671,7 +681,7 @@ async fn test_network_error() {
         1,
         None,
         DydxNetwork::Mainnet,
-        None,
+        Some(fast_test_retry_config(0)),
     )
     .unwrap();
 
@@ -703,7 +713,14 @@ async fn test_server_error_500() {
     wait_for_server(addr, "/v4/perpetualMarkets").await;
 
     let base_url = format!("http://{addr}");
-    let client = DydxHttpClient::new(Some(base_url), 5, None, DydxNetwork::Mainnet, None).unwrap();
+    let client = DydxHttpClient::new(
+        Some(base_url),
+        5,
+        None,
+        DydxNetwork::Mainnet,
+        Some(fast_test_retry_config(0)),
+    )
+    .unwrap();
 
     let result = client.request_instruments(None, None, None).await;
     assert!(result.is_err());
@@ -733,7 +750,14 @@ async fn test_server_error_429_rate_limit() {
     wait_for_server(addr, "/v4/perpetualMarkets").await;
 
     let base_url = format!("http://{addr}");
-    let client = DydxHttpClient::new(Some(base_url), 5, None, DydxNetwork::Mainnet, None).unwrap();
+    let client = DydxHttpClient::new(
+        Some(base_url),
+        5,
+        None,
+        DydxNetwork::Mainnet,
+        Some(fast_test_retry_config(0)),
+    )
+    .unwrap();
 
     let result = client.request_instruments(None, None, None).await;
     assert!(result.is_err());

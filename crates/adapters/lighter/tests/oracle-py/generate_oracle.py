@@ -17,14 +17,13 @@
 Layer 2 oracle for the Lighter L2 tx signer.
 
 Loads the closed-source signer that ships with `lighter-python`, runs it against
-deterministic inputs covering the trading-critical L2 tx types, and writes a
-JSON fixture consumed by `signing/tx/encode.rs` tests.
+deterministic inputs covering the trading-critical L2 tx types, and writes a JSON
+fixture consumed by `signing/tx/encode.rs` tests.
 
-The signer's `SignedHash` is a deterministic Poseidon2 hash over the tx body
-elements. The signature itself uses a randomly sampled nonce `k`, so signature
-bytes vary between runs; the fixture is regenerated when the signer pin moves
-and the tests treat `sig` as a single valid witness rather than an equality
-target.
+The signer's `SignedHash` is a deterministic Poseidon2 hash over the tx body elements.
+The signature itself uses a randomly sampled nonce `k`, so signature bytes vary between
+runs; the fixture is regenerated when the signer pin moves and the tests treat `sig` as
+a single valid witness rather than an equality target.
 
 """
 
@@ -39,15 +38,23 @@ from pathlib import Path
 
 
 CHAIN_ID_TESTNET = 300
+UPSTREAM_VERSION = "1.1.2"
+UPSTREAM_REVISION = "6957dd8a1b36894ca9580be0d51de30aeea3bd4a"
 
 # Tx type discriminants, mirrored from the lighter-go constants.
 TX_TYPE_L2_CREATE_ORDER = 14
 TX_TYPE_L2_CANCEL_ORDER = 15
+TX_TYPE_L2_CANCEL_ALL_ORDERS = 16
 TX_TYPE_L2_MODIFY_ORDER = 17
+TX_TYPE_L2_UPDATE_LEVERAGE = 20
 TX_TYPE_L2_APPROVE_INTEGRATOR = 45
 
 
 class SignedTxResponse(ctypes.Structure):
+    """
+    Mirror the signer's signed-transaction response FFI struct.
+    """
+
     _fields_ = [
         ("txType", ctypes.c_uint8),
         ("txInfo", ctypes.c_void_p),
@@ -58,6 +65,10 @@ class SignedTxResponse(ctypes.Structure):
 
 
 class StrOrErr(ctypes.Structure):
+    """
+    Mirror the signer's string-or-error result FFI struct.
+    """
+
     _fields_ = [("str", ctypes.c_void_p), ("err", ctypes.c_void_p)]
 
 
@@ -73,6 +84,9 @@ def take_str(lib: ctypes.CDLL, ptr: int | None) -> str | None:
 
 
 def setup_lib(path: Path) -> ctypes.CDLL:
+    """
+    Load the signer shared library and bind every FFI signature used.
+    """
     lib = ctypes.CDLL(str(path))
 
     lib.CreateClient.argtypes = [
@@ -98,6 +112,8 @@ def setup_lib(path: Path) -> ctypes.CDLL:
         ctypes.c_longlong,
         ctypes.c_int,
         ctypes.c_int,
+        ctypes.c_uint8,
+        ctypes.c_uint8,
         ctypes.c_uint8,
         ctypes.c_longlong,
         ctypes.c_int,
@@ -125,11 +141,35 @@ def setup_lib(path: Path) -> ctypes.CDLL:
         ctypes.c_int,
         ctypes.c_int,
         ctypes.c_uint8,
+        ctypes.c_uint8,
+        ctypes.c_uint8,
         ctypes.c_longlong,
         ctypes.c_int,
         ctypes.c_longlong,
     ]
     lib.SignModifyOrder.restype = SignedTxResponse
+
+    lib.SignCancelAllOrders.argtypes = [
+        ctypes.c_int,
+        ctypes.c_longlong,
+        ctypes.c_int,
+        ctypes.c_uint8,
+        ctypes.c_longlong,
+        ctypes.c_int,
+        ctypes.c_longlong,
+    ]
+    lib.SignCancelAllOrders.restype = SignedTxResponse
+
+    lib.SignUpdateLeverage.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint8,
+        ctypes.c_longlong,
+        ctypes.c_int,
+        ctypes.c_longlong,
+    ]
+    lib.SignUpdateLeverage.restype = SignedTxResponse
 
     lib.SignApproveIntegrator.argtypes = [
         ctypes.c_longlong,
@@ -158,6 +198,9 @@ def setup_lib(path: Path) -> ctypes.CDLL:
 
 
 def decode(lib: ctypes.CDLL, resp: SignedTxResponse) -> dict:
+    """
+    Decode a signed-tx response into its fixture fields.
+    """
     err = take_str(lib, resp.err)
     info = take_str(lib, resp.txInfo)
     tx_hash = take_str(lib, resp.txHash)
@@ -178,7 +221,22 @@ def decode(lib: ctypes.CDLL, resp: SignedTxResponse) -> dict:
     }
 
 
+def decode_expected(lib: ctypes.CDLL, resp: SignedTxResponse, expected_tx_type: int) -> dict:
+    """
+    Decode a signed-tx response and check its tx type discriminant.
+    """
+    decoded = decode(lib, resp)
+    if decoded["tx_type"] != expected_tx_type:
+        raise RuntimeError(
+            f"signer returned tx type {decoded['tx_type']}, expected {expected_tx_type}",
+        )
+    return decoded
+
+
 def fixed_private_key() -> str:
+    """
+    Return the deterministic 40-byte private key shared by all vectors.
+    """
     # 40-byte (80-hex) deterministic key. Bytes are arbitrary but non-trivial
     # so every limb of the underlying scalar takes a non-zero value.
     return "0b8e0f63c24d8baacd9d29ad4e9a4b73c4a8d2bb8b16dc4fa9d7c2e1d3a8b1f0e8d3a4c5b6e7f001"
@@ -188,19 +246,21 @@ def derived_public_key_hex(lib: ctypes.CDLL, sk_hex: str) -> str:
     """
     Re-run the signer once to harvest the matching public-key bytes.
 
-    The closed signer does not export PubKey directly to Python, but every
-    signed tx response embeds the pubkey-derived `tx_hash`, and the signer
-    accepts the same private key in `CreateClient`. We capture the pubkey by
-    signing a throwaway tx and decoding it, but a simpler path is to just
-    bake the public key recovered from the curve-side fixtures into the
-    fixture file. To keep this script self-contained we instead compute the
-    pubkey out-of-band and the caller passes it in.
+    The closed signer does not export PubKey directly to Python, but every signed tx
+    response embeds the pubkey-derived `tx_hash`, and the signer accepts the same
+    private key in `CreateClient`. We capture the pubkey by signing a throwaway tx and
+    decoding it, but a simpler path is to just bake the public key recovered from the
+    curve-side fixtures into the fixture file. To keep this script self-contained we
+    instead compute the pubkey out-of-band and the caller passes it in.
 
     """
     raise NotImplementedError("PublicKey derivation is performed in Rust at fixture-load time")
 
 
 def gen_create_order(lib: ctypes.CDLL, ctx: dict, fields: dict) -> dict:
+    """
+    Sign a create-order tx and decode it against the expected tx type.
+    """
     resp = lib.SignCreateOrder(
         fields["market_index"],
         fields["client_order_index"],
@@ -215,15 +275,20 @@ def gen_create_order(lib: ctypes.CDLL, ctx: dict, fields: dict) -> dict:
         fields["integrator_account_index"],
         fields["integrator_taker_fee"],
         fields["integrator_maker_fee"],
+        0,  # default self-trade behavior: expire maker
+        0,  # default self-trade equality: account index
         fields["skip_nonce"],
         ctx["nonce"],
         ctx["api_key_index"],
         ctx["account_index"],
     )
-    return decode(lib, resp)
+    return decode_expected(lib, resp, TX_TYPE_L2_CREATE_ORDER)
 
 
 def gen_cancel_order(lib: ctypes.CDLL, ctx: dict, fields: dict) -> dict:
+    """
+    Sign a cancel-order tx and decode it against the expected tx type.
+    """
     resp = lib.SignCancelOrder(
         fields["market_index"],
         fields["index"],
@@ -232,10 +297,13 @@ def gen_cancel_order(lib: ctypes.CDLL, ctx: dict, fields: dict) -> dict:
         ctx["api_key_index"],
         ctx["account_index"],
     )
-    return decode(lib, resp)
+    return decode_expected(lib, resp, TX_TYPE_L2_CANCEL_ORDER)
 
 
 def gen_modify_order(lib: ctypes.CDLL, ctx: dict, fields: dict) -> dict:
+    """
+    Sign a modify-order tx and decode it against the expected tx type.
+    """
     resp = lib.SignModifyOrder(
         fields["market_index"],
         fields["index"],
@@ -245,15 +313,52 @@ def gen_modify_order(lib: ctypes.CDLL, ctx: dict, fields: dict) -> dict:
         fields["integrator_account_index"],
         fields["integrator_taker_fee"],
         fields["integrator_maker_fee"],
+        0,  # default self-trade behavior: expire maker
+        0,  # default self-trade equality: account index
         fields["skip_nonce"],
         ctx["nonce"],
         ctx["api_key_index"],
         ctx["account_index"],
     )
-    return decode(lib, resp)
+    return decode_expected(lib, resp, TX_TYPE_L2_MODIFY_ORDER)
+
+
+def gen_cancel_all_orders(lib: ctypes.CDLL, ctx: dict, fields: dict) -> dict:
+    """
+    Sign a cancel-all-orders tx and decode it against the expected tx type.
+    """
+    resp = lib.SignCancelAllOrders(
+        fields["time_in_force"],
+        fields["scheduled_time_ms"],
+        fields["cancel_all_market_index"],
+        fields["skip_nonce"],
+        ctx["nonce"],
+        ctx["api_key_index"],
+        ctx["account_index"],
+    )
+    return decode_expected(lib, resp, TX_TYPE_L2_CANCEL_ALL_ORDERS)
+
+
+def gen_update_leverage(lib: ctypes.CDLL, ctx: dict, fields: dict) -> dict:
+    """
+    Sign an update-leverage tx and decode it against the expected tx type.
+    """
+    resp = lib.SignUpdateLeverage(
+        fields["market_index"],
+        fields["initial_margin_fraction"],
+        fields["margin_mode"],
+        fields["skip_nonce"],
+        ctx["nonce"],
+        ctx["api_key_index"],
+        ctx["account_index"],
+    )
+    return decode_expected(lib, resp, TX_TYPE_L2_UPDATE_LEVERAGE)
 
 
 def gen_approve_integrator(lib: ctypes.CDLL, ctx: dict, fields: dict) -> dict:
+    """
+    Sign an approve-integrator tx and decode it against the expected tx type.
+    """
     resp = lib.SignApproveIntegrator(
         fields["integrator_account_index"],
         fields["max_perps_taker_fee"],
@@ -266,16 +371,16 @@ def gen_approve_integrator(lib: ctypes.CDLL, ctx: dict, fields: dict) -> dict:
         ctx["api_key_index"],
         ctx["account_index"],
     )
-    return decode(lib, resp)
+    return decode_expected(lib, resp, TX_TYPE_L2_APPROVE_INTEGRATOR)
 
 
 def gen_auth_token(lib: ctypes.CDLL, deadline: int, api_key_index: int, account_index: int) -> str:
     """
     Drive the closed signer's `CreateAuthToken` for a single deadline.
 
-    `CreateAuthToken(deadline, api_key_index, account_index)` returns the
-    serialized `"{message}:{hex(sig)}"` string. The signer reuses the client
-    handle established by `CreateClient`, so the caller must run that first.
+    `CreateAuthToken(deadline, api_key_index, account_index)` returns the serialized
+    `"{message}:{hex(sig)}"` string. The signer reuses the client handle established by
+    `CreateClient`, so the caller must run that first.
 
     """
     resp = lib.CreateAuthToken(deadline, api_key_index, account_index)
@@ -298,14 +403,14 @@ def build_auth_vectors(
     """
     Generate auth-token vectors at fixed deadlines under the seeded signer.
 
-    Each entry pins the inputs that drove the closed signer's `CreateAuthToken`
-    plus the resulting token string. The Rust side recomputes the digest from
-    `message` and verifies the embedded signature under the public key derived
-    from `sk` to gate behavioural equivalence.
+    Each entry pins the inputs that drove the closed signer's `CreateAuthToken` plus the
+    resulting token string. The Rust side recomputes the digest from `message` and
+    verifies the embedded signature under the public key derived from `sk` to gate
+    behavioural equivalence.
 
     The closed signer requires a `CreateClient` call for every `(api_key_index,
-    account_index)` pair before signing; the seeded key is reused for the
-    other vectors so the script does not need to re-initialise per case.
+    account_index)` pair before signing; the seeded key is reused for the other vectors
+    so the script does not need to re-initialise per case.
 
     """
     fixed_deadlines = [
@@ -366,12 +471,17 @@ def write_auth_oracle(
     seeded_api_key: int,
     out_path: Path,
 ) -> int:
+    """
+    Generate the auth-token vectors and write their JSON fixture.
+    """
     vectors = build_auth_vectors(lib, sk_hex, chain_id, account_index, seeded_api_key)
     payload = {
         "metadata": {
             "license": "Apache-2.0 (SDK repository; compiled signer binary)",
             "primitive": "lighter_auth_token",
             "source": "github.com/elliottech/lighter-python",
+            "upstream_version": UPSTREAM_VERSION,
+            "upstream_revision": UPSTREAM_REVISION,
             "note": (
                 "Sig is non-deterministic (random k); the Rust side verifies "
                 "each oracle token under the derived pubkey rather than "
@@ -389,7 +499,10 @@ def write_auth_oracle(
 
 
 def build_vector(kind: str, ctx: dict, fields: dict, sig_resp: dict) -> dict:
-    body = {
+    """
+    Assemble one fixture vector from its context, fields, and signer response.
+    """
+    return {
         "kind": kind,
         "chain_id": ctx["chain_id"],
         "sk": ctx["private_key"],
@@ -406,10 +519,12 @@ def build_vector(kind: str, ctx: dict, fields: dict, sig_resp: dict) -> dict:
         # to reconstruct the same hash preimage.
         "expired_at": sig_resp["tx_info_decoded"]["ExpiredAt"],
     }
-    return body
 
 
 def main() -> int:
+    """
+    Generate all vectors and write the fixtures.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--signer",
@@ -456,6 +571,39 @@ def main() -> int:
         "api_key_index": api_key_index,
     }
 
+    vectors = build_tx_vectors(lib, base_ctx)
+
+    payload = {
+        "metadata": {
+            "license": "Apache-2.0 (SDK repository; compiled signer binary)",
+            "primitive": "lighter_l2_tx",
+            "source": "github.com/elliottech/lighter-python",
+            "upstream_version": UPSTREAM_VERSION,
+            "upstream_revision": UPSTREAM_REVISION,
+            "note": (
+                "Sig is non-deterministic (random k); tx_hash and tx_info "
+                "carry deterministic byte equality targets."
+            ),
+        },
+        "vectors": vectors,
+    }
+
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    with args.out.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+    print(f"wrote {len(vectors)} vectors to {args.out}")
+
+    if args.auth_out is not None:
+        write_auth_oracle(lib, sk, chain_id, account_index, api_key_index, args.auth_out)
+
+    return 0
+
+
+def build_tx_vectors(lib: ctypes.CDLL, base_ctx: dict) -> list[dict]:
+    """
+    Assemble the L2 tx vectors in deterministic nonce order.
+    """
     vectors: list[dict] = []
 
     # CreateOrder: limit GTT, sell 0.1 ETH at 4050 USDC.
@@ -615,29 +763,118 @@ def main() -> int:
         ),
     )
 
-    payload = {
-        "metadata": {
-            "license": "Apache-2.0 (SDK repository; compiled signer binary)",
-            "primitive": "lighter_l2_tx",
-            "source": "github.com/elliottech/lighter-python",
-            "note": (
-                "Sig is non-deterministic (random k); tx_hash and tx_info "
-                "carry deterministic byte equality targets."
-            ),
+    # Conditional CreateOrder types 2-5. Market-trigger variants require IOC;
+    # limit-trigger variants use GTT. Each carries a non-zero trigger price.
+    conditional_orders = [
+        {
+            **create_fields,
+            "client_order_index": 202,
+            "price": 390_000,
+            "order_type": 2,  # Stop loss
+            "time_in_force": 0,
+            "trigger_price": 395_000,
         },
-        "vectors": vectors,
+        {
+            **create_fields,
+            "client_order_index": 203,
+            "price": 390_000,
+            "order_type": 3,  # Stop loss limit
+            "time_in_force": 1,
+            "trigger_price": 395_000,
+        },
+        {
+            **create_fields,
+            "client_order_index": 204,
+            "price": 420_000,
+            "is_ask": False,
+            "order_type": 4,  # Take profit
+            "time_in_force": 0,
+            "trigger_price": 415_000,
+        },
+        {
+            **create_fields,
+            "client_order_index": 205,
+            "price": 420_000,
+            "is_ask": False,
+            "order_type": 5,  # Take profit limit
+            "time_in_force": 1,
+            "trigger_price": 415_000,
+        },
+    ]
+    for nonce, fields in enumerate(conditional_orders, start=9):
+        ctx = {**base_ctx, "nonce": nonce}
+        vectors.append(
+            build_vector("create_order", ctx, fields, gen_create_order(lib, ctx, fields)),
+        )
+
+    # Account-wide immediate cancel. Market index 255 is the upstream nil
+    # sentinel, so this covers the same account-wide payload Rust emits.
+    cancel_all_fields = {
+        "time_in_force": 0,
+        "scheduled_time_ms": 0,
+        "cancel_all_market_index": 255,
+        "skip_nonce": 0,
     }
+    ctx = {**base_ctx, "nonce": 13}
+    vectors.append(
+        build_vector(
+            "cancel_all_orders",
+            ctx,
+            cancel_all_fields,
+            gen_cancel_all_orders(lib, ctx, cancel_all_fields),
+        ),
+    )
 
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    with args.out.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-        f.write("\n")
-    print(f"wrote {len(vectors)} vectors to {args.out}")
+    # UpdateLeverage: 5% initial margin (20x), isolated mode.
+    update_leverage_fields = {
+        "market_index": 3,
+        "initial_margin_fraction": 500,
+        "margin_mode": 1,
+        "skip_nonce": 0,
+    }
+    ctx = {**base_ctx, "nonce": 14}
+    vectors.append(
+        build_vector(
+            "update_leverage",
+            ctx,
+            update_leverage_fields,
+            gen_update_leverage(lib, ctx, update_leverage_fields),
+        ),
+    )
 
-    if args.auth_out is not None:
-        write_auth_oracle(lib, sk, chain_id, account_index, api_key_index, args.auth_out)
+    # Production integrator attribution uses the account index with zero fee
+    # overrides. Keep create and modify vectors for this partial map shape.
+    production_create = {
+        **create_fields,
+        "client_order_index": 206,
+        "integrator_account_index": 723_813,
+    }
+    ctx = {**base_ctx, "nonce": 15}
+    vectors.append(
+        build_vector(
+            "create_order",
+            ctx,
+            production_create,
+            gen_create_order(lib, ctx, production_create),
+        ),
+    )
 
-    return 0
+    production_modify = {
+        **modify_fields,
+        "index": 125,
+        "integrator_account_index": 723_813,
+    }
+    ctx = {**base_ctx, "nonce": 16}
+    vectors.append(
+        build_vector(
+            "modify_order",
+            ctx,
+            production_modify,
+            gen_modify_order(lib, ctx, production_modify),
+        ),
+    )
+
+    return vectors
 
 
 if __name__ == "__main__":

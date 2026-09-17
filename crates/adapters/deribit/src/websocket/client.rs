@@ -22,19 +22,20 @@
 use std::{
     fmt::Debug,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, PoisonError, RwLock, RwLockReadGuard,
         atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Duration,
 };
 
 use arc_swap::ArcSwap;
-use futures_util::Stream;
-use nautilus_common::{enums::LogColor, live::get_runtime, log_info};
+use futures_util::{FutureExt, Stream, StreamExt, stream::FuturesUnordered};
+use nautilus_common::{enums::LogColor, log_debug};
 use nautilus_core::{
     AtomicMap, AtomicSet, consts::NAUTILUS_USER_AGENT, env::get_or_env_var_opt,
     time::get_atomic_clock_realtime,
 };
+use nautilus_live::{SocketControl, task::TaskGroup};
 use nautilus_model::{
     data::BarType,
     enums::OrderSide,
@@ -46,15 +47,15 @@ use nautilus_network::{
     http::USER_AGENT,
     mode::ConnectionMode,
     websocket::{
-        AuthTracker, PingHandler, SubscriptionState, TransportBackend, WebSocketClient,
-        WebSocketConfig, channel_message_handler,
+        AuthTracker, SubscriptionState, TransportBackend, WebSocketClient, WebSocketConfig,
+        channel_message_handler,
     },
 };
 use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
 use super::{
-    auth::{AuthState, send_auth_request, spawn_token_refresh_task},
+    auth::{AuthState, refresh_token_after_delay, send_auth_request},
     enums::{DeribitUpdateInterval, DeribitWsChannel},
     error::{DeribitWsError, DeribitWsResult},
     handler::{DeribitWsFeedHandler, HandlerCommand},
@@ -77,28 +78,24 @@ use crate::common::{
 /// Authentication timeout in seconds.
 const AUTHENTICATION_TIMEOUT_SECS: u64 = 30;
 
+type CommandSender = tokio::sync::mpsc::UnboundedSender<HandlerCommand>;
+
 /// WebSocket client for connecting to Deribit.
 #[derive(Clone)]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.deribit", from_py_object)
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deribit")
-)]
 pub struct DeribitWebSocketClient {
     url: String,
     environment: DeribitEnvironment,
     heartbeat_interval: Option<u64>,
+    auth_timeout_secs: u64,
     credential: Option<Credential>,
     auth_state: Arc<tokio::sync::RwLock<Option<AuthState>>>,
     signal: Arc<AtomicBool>,
     connection_mode: Arc<ArcSwap<AtomicU8>>,
     auth_tracker: AuthTracker,
-    cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
+    cmd_tx: Arc<RwLock<CommandSender>>,
     out_rx: Option<Arc<tokio::sync::mpsc::UnboundedReceiver<NautilusWsMessage>>>,
-    task_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
+    handler_tasks: Arc<TaskGroup>,
+    connect_lock: Arc<tokio::sync::Mutex<()>>,
     subscriptions_state: SubscriptionState,
     instruments_cache: Arc<AtomicMap<Ustr, InstrumentAny>>,
     option_greeks_subs: Arc<AtomicSet<InstrumentId>>,
@@ -110,6 +107,7 @@ pub struct DeribitWebSocketClient {
     subscribe_errors: Arc<Mutex<Vec<String>>>,
     transport_backend: TransportBackend,
     proxy_url: Option<String>,
+    socket_control: Option<SocketControl>,
 }
 
 impl Debug for DeribitWebSocketClient {
@@ -136,11 +134,13 @@ impl DeribitWebSocketClient {
     /// # Errors
     ///
     /// Returns an error if only one of `api_key` or `api_secret` is provided.
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         url: Option<String>,
         api_key: Option<String>,
         api_secret: Option<String>,
         heartbeat_interval: u64,
+        auth_timeout_secs: Option<u64>,
         environment: DeribitEnvironment,
         transport_backend: TransportBackend,
         proxy_url: Option<String>,
@@ -150,6 +150,7 @@ impl DeribitWebSocketClient {
             api_key,
             api_secret,
             heartbeat_interval,
+            auth_timeout_secs,
             environment,
             true,
             transport_backend,
@@ -164,6 +165,7 @@ impl DeribitWebSocketClient {
         api_key: Option<String>,
         api_secret: Option<String>,
         heartbeat_interval: u64,
+        auth_timeout_secs: Option<u64>,
         environment: DeribitEnvironment,
         env_fallback: bool,
         transport_backend: TransportBackend,
@@ -179,7 +181,7 @@ impl DeribitWebSocketClient {
             Credential::resolve_with_env_fallback(api_key, api_secret, environment, env_fallback)?;
 
         if credential.is_some() {
-            log::info!("Credentials loaded ({environment})");
+            log::debug!("Credentials loaded ({environment})");
         } else {
             log::debug!("No credentials configured - unauthenticated mode");
         }
@@ -191,6 +193,7 @@ impl DeribitWebSocketClient {
             url,
             environment,
             heartbeat_interval: Some(heartbeat_interval),
+            auth_timeout_secs: auth_timeout_secs.unwrap_or(AUTHENTICATION_TIMEOUT_SECS),
             credential,
             auth_state: Arc::new(tokio::sync::RwLock::new(None)),
             signal,
@@ -200,10 +203,11 @@ impl DeribitWebSocketClient {
             auth_tracker: AuthTracker::new(),
             cmd_tx: {
                 let (tx, _) = tokio::sync::mpsc::unbounded_channel();
-                Arc::new(tokio::sync::RwLock::new(tx))
+                Arc::new(RwLock::new(tx))
             },
             out_rx: None,
-            task_handle: None,
+            handler_tasks: Arc::new(TaskGroup::new()),
+            connect_lock: Arc::new(tokio::sync::Mutex::new(())),
             subscriptions_state,
             instruments_cache: Arc::new(AtomicMap::new()),
             option_greeks_subs: Arc::new(AtomicSet::new()),
@@ -215,7 +219,20 @@ impl DeribitWebSocketClient {
             subscribe_errors: Arc::new(Mutex::new(Vec::new())),
             transport_backend,
             proxy_url,
+            socket_control: None,
         })
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        self.handler_tasks.begin_shutdown();
+        self.signal.store(true, Ordering::Relaxed);
+    }
+
+    /// Configures socket state reporting and reconnect control.
+    #[must_use]
+    pub fn with_socket_control(mut self, control: SocketControl) -> Self {
+        self.socket_control = Some(control);
+        self
     }
 
     /// Creates a new public (unauthenticated) client.
@@ -234,6 +251,7 @@ impl DeribitWebSocketClient {
             None,
             None,
             DERIBIT_WS_HEARTBEAT_SECS,
+            None,
             environment,
             false,
             TransportBackend::default(),
@@ -259,6 +277,7 @@ impl DeribitWebSocketClient {
             None,
             None,
             heartbeat_interval,
+            None,
             environment,
             false,
             TransportBackend::default(),
@@ -281,6 +300,7 @@ impl DeribitWebSocketClient {
         environment: DeribitEnvironment,
         api_key: Option<String>,
         api_secret: Option<String>,
+        auth_timeout_secs: Option<u64>,
         proxy_url: Option<String>,
     ) -> anyhow::Result<Self> {
         let (key_env, secret_env) = credential_env_vars(environment);
@@ -295,6 +315,7 @@ impl DeribitWebSocketClient {
             Some(api_key),
             Some(api_secret),
             DERIBIT_WS_HEARTBEAT_SECS,
+            auth_timeout_secs,
             environment,
             TransportBackend::default(),
             proxy_url,
@@ -404,6 +425,8 @@ impl DeribitWebSocketClient {
 
     /// Caches instruments for use during message parsing.
     pub fn cache_instruments(&self, instruments: &[InstrumentAny]) {
+        let tx = self.command_sender();
+
         self.instruments_cache.rcu(|m| {
             for inst in instruments {
                 m.insert(inst.raw_symbol().inner(), inst.clone());
@@ -415,35 +438,23 @@ impl DeribitWebSocketClient {
         // a full snapshot, avoiding out-of-order snapshot races.
         if self.is_active() {
             for inst in instruments {
-                let tx = self.cmd_tx.clone();
-                let boxed = Box::new(inst.clone());
-
-                get_runtime().spawn(async move {
-                    let _ = tx
-                        .read()
-                        .await
-                        .send(HandlerCommand::UpdateInstrument(boxed));
-                });
+                let _ = tx.send(HandlerCommand::UpdateInstrument(Box::new(inst.clone())));
             }
         }
     }
 
     /// Caches a single instrument.
     pub fn cache_instrument(&self, instrument: InstrumentAny) {
+        let tx = self.command_sender();
         let symbol = instrument.raw_symbol().inner();
         self.instruments_cache.insert(symbol, instrument);
 
         // If connected, send update to handler
         if self.is_active() {
-            let tx = self.cmd_tx.clone();
             let inst = self.instruments_cache.get_cloned(&symbol);
+
             if let Some(inst) = inst {
-                get_runtime().spawn(async move {
-                    let _ = tx
-                        .read()
-                        .await
-                        .send(HandlerCommand::UpdateInstrument(Box::new(inst)));
-                });
+                let _ = tx.send(HandlerCommand::UpdateInstrument(Box::new(inst)));
             }
         }
     }
@@ -499,15 +510,28 @@ impl DeribitWebSocketClient {
     ///
     /// Returns an error if the connection fails.
     pub async fn connect(&mut self) -> anyhow::Result<()> {
-        log_info!(
+        let connect_lock = Arc::clone(&self.connect_lock);
+        let _connect_guard = connect_lock.lock().await;
+
+        log_debug!(
             "Connecting to WebSocket: {}",
             self.url,
             color = LogColor::Blue
         );
 
-        if let Some(handle) = self.task_handle.take() {
-            handle.abort();
+        if !self.handler_tasks.is_open() || !self.handler_tasks.is_empty() {
+            self.handler_tasks.begin_shutdown();
+            self.signal.store(true, Ordering::Relaxed);
+            self.finish_handler()
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to stop prior WebSocket handler: {e}"))?;
+            self.handler_tasks.start_generation().map_err(|e| {
+                anyhow::anyhow!("failed to start WebSocket handler task generation: {e}")
+            })?;
         }
+        let handler_spawner = self.handler_tasks.spawner().map_err(|e| {
+            anyhow::anyhow!("failed to acquire WebSocket handler task spawner: {e}")
+        })?;
 
         // Reset stop signal and subscription state so callers can
         // resubscribe cleanly after a manual disconnect/connect cycle.
@@ -518,22 +542,22 @@ impl DeribitWebSocketClient {
         let (message_handler, raw_rx) = channel_message_handler();
 
         // No-op ping handler: handler responds to pings directly
-        let ping_handler: PingHandler = Arc::new(move |_payload: Vec<u8>| {
-            // Handler responds to pings internally
-        });
+        // Inbound Ping frames are answered by the transport, so no ping handler is needed;
+        // the reader routes them away from the message channel and the handler never sees them.
 
         // Configure WebSocket client
         let config = WebSocketConfig {
             url: self.url.clone(),
             headers: vec![(USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string())],
-            heartbeat: self.heartbeat_interval,
-            heartbeat_msg: None, // Deribit uses JSON-RPC heartbeat, not text ping
-            reconnect_timeout_ms: Some(5_000),
+            heartbeat_interval_secs: self.heartbeat_interval,
+            heartbeat_payload: None, // Deribit uses JSON-RPC heartbeat, not text ping
+            connect_timeout_ms: Some(5_000),
             reconnect_delay_initial_ms: None,
             reconnect_delay_max_ms: None,
             reconnect_backoff_factor: None,
             reconnect_jitter_ms: None,
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
@@ -549,26 +573,24 @@ impl DeribitWebSocketClient {
         ];
 
         // Connect the WebSocket
-        let ws_client = WebSocketClient::connect(
-            config,
-            Some(message_handler),
-            Some(ping_handler),
-            None, // post_reconnection
-            keyed_quotas,
-            Some(*DERIBIT_WS_SUBSCRIPTION_QUOTA), // Default quota for non-order operations
-        )
-        .await?;
+        let ws_client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(message_handler)
+            .keyed_quotas(keyed_quotas)
+            .default_quota(*DERIBIT_WS_SUBSCRIPTION_QUOTA)
+            .maybe_state_sink(self.socket_control.as_ref().map(SocketControl::sink))
+            .connect()
+            .await?;
 
         // Store connection mode
         self.connection_mode
             .store(ws_client.connection_mode_atomic());
+        let reconnect_handle = ws_client.reconnect_handle();
 
         // Create message channels
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        // Store command sender and output receiver
-        *self.cmd_tx.write().await = cmd_tx.clone();
         self.out_rx = Some(Arc::new(out_rx));
 
         if let Ok(mut errors) = self.subscribe_errors.lock() {
@@ -591,24 +613,32 @@ impl DeribitWebSocketClient {
             self.subscribe_errors.clone(),
         );
 
-        // Send client to handler
-        let _ = cmd_tx.send(HandlerCommand::SetClient(ws_client));
-
-        // Replay cached instruments
-        let instruments: Vec<InstrumentAny> =
-            self.instruments_cache.load().values().cloned().collect();
-
-        if !instruments.is_empty() {
-            log::debug!(
-                "Sending {} cached instruments to handler",
-                instruments.len()
-            );
-            let _ = cmd_tx.send(HandlerCommand::InitializeInstruments(instruments));
+        if let Some(control) = &self.socket_control {
+            control.register(move || reconnect_handle.request_reconnect());
         }
 
-        // Enable heartbeat if configured
-        if let Some(interval) = self.heartbeat_interval {
-            let _ = cmd_tx.send(HandlerCommand::SetHeartbeat { interval });
+        // Cache updates hold a read guard while mutating the central cache. Publishing the new
+        // sender under the write guard ensures later subscriptions follow this cache snapshot.
+        {
+            let mut command_sender = self.cmd_tx.write().unwrap_or_else(PoisonError::into_inner);
+            let _ = cmd_tx.send(HandlerCommand::SetClient(ws_client));
+
+            let instruments: Vec<InstrumentAny> =
+                self.instruments_cache.load().values().cloned().collect();
+
+            if !instruments.is_empty() {
+                log::debug!(
+                    "Sending {} cached instruments to handler",
+                    instruments.len()
+                );
+                let _ = cmd_tx.send(HandlerCommand::InitializeInstruments(instruments));
+            }
+
+            if let Some(interval) = self.heartbeat_interval {
+                let _ = cmd_tx.send(HandlerCommand::SetHeartbeat { interval });
+            }
+
+            *command_sender = cmd_tx.clone();
         }
 
         // Spawn handler task
@@ -616,8 +646,9 @@ impl DeribitWebSocketClient {
         let credential = self.credential.clone();
         let auth_tracker = self.auth_tracker.clone();
         let auth_state = self.auth_state.clone();
+        let heartbeat_interval = self.heartbeat_interval;
 
-        let task_handle = get_runtime().spawn(async move {
+        let handler_task = async move {
             const MAX_REAUTH_ATTEMPTS: u32 = 3;
 
             let mut pending_reauth = false;
@@ -625,9 +656,24 @@ impl DeribitWebSocketClient {
 
             let mut refresh_cancel = CancellationToken::new();
             let mut retry_cancel = CancellationToken::new();
+            let mut lifecycle_futures = FuturesUnordered::new();
 
             loop {
-                match handler.next().await {
+                let message = {
+                    // `handler.next()` can dequeue work before awaiting transport I/O, so keep the
+                    // same future alive while handler-owned lifecycle futures complete.
+                    let next = handler.next();
+                    tokio::pin!(next);
+
+                    loop {
+                        tokio::select! {
+                            message = &mut next => break message,
+                            _ = lifecycle_futures.next(), if !lifecycle_futures.is_empty() => {}
+                        }
+                    }
+                };
+
+                match message {
                     Some(msg) => match msg {
                         NautilusWsMessage::Reconnected => {
                             log::info!("Reconnected to WebSocket");
@@ -638,11 +684,14 @@ impl DeribitWebSocketClient {
                             retry_cancel.cancel();
                             retry_cancel = CancellationToken::new();
 
-                            let channels = subscriptions_state.all_topics();
-
-                            for channel in &channels {
-                                subscriptions_state.mark_failure(channel);
+                            // Deribit scopes `set_heartbeat` to the connection, so the replacement
+                            // starts with heartbeats off and the venue sends no further
+                            // `test_request` until they are re-armed.
+                            if let Some(interval) = heartbeat_interval {
+                                let _ = cmd_tx.send(HandlerCommand::SetHeartbeat { interval });
                             }
+
+                            let channels = subscriptions_state.reset_after_reconnect();
 
                             // Check if we need to re-authenticate
                             if let Some(cred) = &credential {
@@ -652,11 +701,8 @@ impl DeribitWebSocketClient {
                                 pending_reauth = true;
                                 reauth_attempts = 1;
 
-                                let previous_scope = auth_state
-                                    .read()
-                                    .await
-                                    .as_ref()
-                                    .map(|s| s.scope.clone());
+                                let previous_scope =
+                                    auth_state.read().await.as_ref().map(|s| s.scope.clone());
 
                                 send_auth_request(cred, previous_scope, &cmd_tx);
                             } else {
@@ -676,11 +722,14 @@ impl DeribitWebSocketClient {
                             retry_cancel.cancel();
                             retry_cancel = CancellationToken::new();
 
-                            spawn_token_refresh_task(
-                                result.expires_in,
-                                result.refresh_token.clone(),
-                                cmd_tx.clone(),
-                                refresh_cancel.clone(),
+                            lifecycle_futures.push(
+                                refresh_token_after_delay(
+                                    result.expires_in,
+                                    result.refresh_token.clone(),
+                                    cmd_tx.clone(),
+                                    refresh_cancel.clone(),
+                                )
+                                .boxed(),
                             );
 
                             if pending_reauth {
@@ -722,19 +771,22 @@ impl DeribitWebSocketClient {
                                     let cmd_tx = cmd_tx.clone();
                                     let cancel = retry_cancel.clone();
 
-                                    get_runtime().spawn(async move {
-                                        tokio::select! {
-                                            () = tokio::time::sleep(Duration::from_secs(delay_secs)) => {}
-                                            () = cancel.cancelled() => return,
+                                    lifecycle_futures.push(
+                                        async move {
+                                            tokio::select! {
+                                                () = tokio::time::sleep(Duration::from_secs(delay_secs)) => {}
+                                                () = cancel.cancelled() => return,
+                                            }
+                                            let _rx = auth_tracker.begin();
+                                            let previous_scope = auth_state
+                                                .read()
+                                                .await
+                                                .as_ref()
+                                                .map(|s| s.scope.clone());
+                                            send_auth_request(&cred, previous_scope, &cmd_tx);
                                         }
-                                        let _rx = auth_tracker.begin();
-                                        let previous_scope = auth_state
-                                            .read()
-                                            .await
-                                            .as_ref()
-                                            .map(|s| s.scope.clone());
-                                        send_auth_request(&cred, previous_scope, &cmd_tx);
-                                    });
+                                        .boxed(),
+                                    );
                                 }
                             } else if pending_reauth {
                                 pending_reauth = false;
@@ -777,10 +829,16 @@ impl DeribitWebSocketClient {
                     }
                 }
             }
-        });
+        };
 
-        self.task_handle = Some(Arc::new(task_handle));
-        log::info!("Connected to WebSocket");
+        if let Err(e) = handler_spawner.spawn(handler_task) {
+            if let Some(control) = &self.socket_control {
+                control.deregister();
+            }
+            self.out_rx = None;
+            anyhow::bail!("failed to register WebSocket handler task: {e}");
+        }
+        log::debug!("Connected to WebSocket");
 
         Ok(())
     }
@@ -791,26 +849,35 @@ impl DeribitWebSocketClient {
     ///
     /// Returns an error if the close operation fails.
     pub async fn close(&self) -> DeribitWsResult<()> {
-        log::info!("Closing WebSocket connection");
-        self.signal.store(true, Ordering::Relaxed);
+        self.begin_shutdown();
+        let connect_lock = Arc::clone(&self.connect_lock);
+        let _connect_guard = connect_lock.lock().await;
+        self.close_locked().await
+    }
 
-        let _ = self.cmd_tx.read().await.send(HandlerCommand::Disconnect);
+    async fn close_locked(&self) -> DeribitWsResult<()> {
+        log::debug!("Closing WebSocket connection");
+        self.begin_shutdown();
 
-        // Poll for graceful handler shutdown, abort after 2s deadline
-        if let Some(handle) = &self.task_handle {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-            while !handle.is_finished() && tokio::time::Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
+        let _ = self.command_sender().send(HandlerCommand::Disconnect);
 
-            if !handle.is_finished() {
-                handle.abort();
-            }
-        }
+        self.finish_handler().await?;
 
         self.auth_tracker.invalidate();
 
+        if let Some(control) = &self.socket_control {
+            control.deregister();
+        }
         Ok(())
+    }
+
+    async fn finish_handler(&self) -> DeribitWsResult<()> {
+        self.handler_tasks
+            .finish_shutdown(Duration::from_secs(2), Duration::from_secs(2))
+            .await
+            .map_err(|e| {
+                DeribitWsError::ClientError(format!("WebSocket handler shutdown failed: {e}"))
+            })
     }
 
     /// Returns a stream of WebSocket messages.
@@ -875,23 +942,22 @@ impl DeribitWebSocketClient {
         // Determine scope
         let scope = session_name.map(|name| format!("session:{name}"));
 
-        log::info!("Authenticating WebSocket...");
+        log::debug!("Authenticating WebSocket...");
 
         let rx = self.auth_tracker.begin();
 
         // Send authentication request
-        let cmd_tx = self.cmd_tx.read().await;
+        let cmd_tx = self.command_sender().clone();
         send_auth_request(credential, scope, &cmd_tx);
-        drop(cmd_tx);
 
         // Wait for authentication result with timeout
         match self
             .auth_tracker
-            .wait_for_result::<DeribitWsError>(Duration::from_secs(AUTHENTICATION_TIMEOUT_SECS), rx)
+            .wait_for_result::<DeribitWsError>(Duration::from_secs(self.auth_timeout_secs), rx)
             .await
         {
             Ok(()) => {
-                log::info!("WebSocket authenticated successfully");
+                log::debug!("WebSocket authenticated successfully");
                 Ok(())
             }
             Err(e) => {
@@ -957,7 +1023,7 @@ impl DeribitWebSocketClient {
             return Ok(());
         }
 
-        if let Err(e) = self.cmd_tx.read().await.send(HandlerCommand::Subscribe {
+        if let Err(e) = self.command_sender().send(HandlerCommand::Subscribe {
             channels: channels_to_subscribe.clone(),
         }) {
             // Roll back: remove reference and clear pending_subscribe
@@ -992,7 +1058,7 @@ impl DeribitWebSocketClient {
             return Ok(());
         }
 
-        if let Err(e) = self.cmd_tx.read().await.send(HandlerCommand::Unsubscribe {
+        if let Err(e) = self.command_sender().send(HandlerCommand::Unsubscribe {
             channels: channels_to_unsubscribe.clone(),
         }) {
             // Send only fails when the handler task is dead, meaning the
@@ -1004,6 +1070,7 @@ impl DeribitWebSocketClient {
             for channel in &channels_to_unsubscribe {
                 self.subscriptions_state.confirm_unsubscribe(channel);
                 self.subscriptions_state.add_reference(channel);
+                self.subscriptions_state.mark_subscribe(channel);
                 self.subscriptions_state.confirm_subscribe(channel);
             }
             return Err(DeribitWsError::Send(e.to_string()));
@@ -1544,16 +1611,9 @@ impl DeribitWebSocketClient {
                 strategy_id,
                 instrument_id,
             },
-            _ => {
-                return Err(DeribitWsError::ClientError(format!(
-                    "Invalid order side: {order_side}"
-                )));
-            }
         };
 
-        self.cmd_tx
-            .read()
-            .await
+        self.command_sender()
             .send(cmd)
             .map_err(|e| DeribitWsError::Send(e.to_string()))?;
 
@@ -1602,9 +1662,7 @@ impl DeribitWebSocketClient {
             "Sending modify order: order_id={order_id}, quantity={quantity}, price={price}, client_order_id={client_order_id}"
         );
 
-        self.cmd_tx
-            .read()
-            .await
+        self.command_sender()
             .send(HandlerCommand::Edit {
                 params,
                 client_order_id,
@@ -1648,9 +1706,7 @@ impl DeribitWebSocketClient {
 
         log::debug!("Sending cancel order: order_id={order_id}, client_order_id={client_order_id}");
 
-        self.cmd_tx
-            .read()
-            .await
+        self.command_sender()
             .send(HandlerCommand::Cancel {
                 params,
                 client_order_id,
@@ -1693,9 +1749,7 @@ impl DeribitWebSocketClient {
 
         log::debug!("Sending cancel_all_orders: instrument={instrument_name}");
 
-        self.cmd_tx
-            .read()
-            .await
+        self.command_sender()
             .send(HandlerCommand::CancelAllByInstrument {
                 params,
                 instrument_id,
@@ -1732,9 +1786,7 @@ impl DeribitWebSocketClient {
 
         log::debug!("Sending query_order: order_id={order_id}, client_order_id={client_order_id}");
 
-        self.cmd_tx
-            .read()
-            .await
+        self.command_sender()
             .send(HandlerCommand::GetOrderState {
                 order_id: order_id.to_string(),
                 client_order_id,
@@ -1745,5 +1797,96 @@ impl DeribitWebSocketClient {
             .map_err(|e| DeribitWsError::Send(e.to_string()))?;
 
         Ok(())
+    }
+
+    fn command_sender(&self) -> RwLockReadGuard<'_, CommandSender> {
+        self.cmd_tx.read().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_last_client_owner_drop_aborts_handler_task() {
+        let client = DeribitWebSocketClient::new_unauthenticated(
+            Some("ws://127.0.0.1:0/ws/api/v2".to_string()),
+            30,
+            DeribitEnvironment::Testnet,
+        )
+        .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let drop_signal = DropSignal(Arc::clone(&dropped));
+        client
+            .handler_tasks
+            .spawn(async move {
+                let _drop_signal = drop_signal;
+                started_tx.send(()).expect("started receiver");
+                std::future::pending::<()>().await;
+            })
+            .expect("handler task should register");
+        started_rx.await.expect("handler task started");
+        let clone = client.clone();
+
+        drop(client);
+        assert!(!dropped.load(Ordering::Acquire));
+        drop(clone);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("handler task aborted");
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_unsubscribe_send_failure_restores_subscription() {
+        let client = DeribitWebSocketClient::new_unauthenticated(
+            Some("ws://127.0.0.1:0/ws/api/v2".to_string()),
+            30,
+            DeribitEnvironment::Testnet,
+        )
+        .unwrap();
+        let channel = "trades.BTC-PERPETUAL.raw";
+        client.subscriptions_state.add_reference(channel);
+        client.subscriptions_state.mark_subscribe(channel);
+        client.subscriptions_state.confirm_subscribe(channel);
+
+        let error = client
+            .send_unsubscribe(vec![channel.to_string()])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, DeribitWsError::Send(_)));
+        assert_eq!(client.subscriptions_state.get_reference_count(channel), 1);
+        assert_eq!(client.subscriptions_state.len(), 1);
+        assert_eq!(client.subscriptions_state.all_topics(), [channel]);
+        assert!(
+            client
+                .subscriptions_state
+                .pending_subscribe_topics()
+                .is_empty()
+        );
+        assert!(
+            client
+                .subscriptions_state
+                .pending_unsubscribe_topics()
+                .is_empty()
+        );
     }
 }

@@ -29,12 +29,10 @@ use nautilus_core::{
         msgpack::{FromMsgPack, ToMsgPack},
     },
 };
-use pyo3::{prelude::*, pyclass::CompareOp, types::PyDict};
+use pyo3::{IntoPyObjectExt, prelude::*, pyclass::CompareOp, types::PyDict};
 
-use super::data_to_pycapsule;
 use crate::{
     data::{
-        Data,
         depth::{DEPTH10_LEN, OrderBookDepth10},
         order::BookOrder,
     },
@@ -56,6 +54,9 @@ impl OrderBookDepth10 {
     ///
     /// Note: This type is not compatible with `OrderBookDelta` or `OrderBookDeltas` due to
     /// its specialized structure and limited depth use case.
+    ///
+    /// Per-level `BookOrder.order_id` values are non-semantic for this aggregated MBP data.
+    /// Parquet catalog decoding canonicalizes them to zero.
     #[expect(clippy::too_many_arguments)]
     #[new]
     fn py_new(
@@ -255,26 +256,6 @@ impl OrderBookDepth10 {
         from_dict_pyo3(py, values)
     }
 
-    /// Creates a `PyCapsule` containing a raw pointer to a `Data::Depth10` object.
-    ///
-    /// This function takes the current object (assumed to be of a type that can be represented as
-    /// `Data::Depth10`), and encapsulates a raw pointer to it within a `PyCapsule`.
-    ///
-    /// # Safety
-    ///
-    /// This function is safe as long as the following conditions are met:
-    /// - The `Data::Depth10` object pointed to by the capsule must remain valid for the lifetime of the capsule.
-    /// - The consumer of the capsule must ensure proper handling to avoid dereferencing a dangling pointer.
-    ///
-    /// # Panics
-    ///
-    /// The function will panic if the `PyCapsule` creation fails, which can occur if the
-    /// `Data::Depth10` object cannot be converted into a raw pointer.
-    #[pyo3(name = "as_pycapsule")]
-    fn py_as_pycapsule(&self, py: Python<'_>) -> Py<PyAny> {
-        data_to_pycapsule(py, Data::from(*self))
-    }
-
     /// Return a dictionary representation of the object.
     #[pyo3(name = "to_dict")]
     fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
@@ -283,14 +264,18 @@ impl OrderBookDepth10 {
 
     /// Return JSON encoded bytes representation of the object.
     #[pyo3(name = "to_json_bytes")]
-    fn py_to_json_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        self.to_json_bytes().unwrap().into_py_any_unwrap(py)
+    fn py_to_json_bytes(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.to_json_bytes()
+            .map_err(to_pyvalue_err)?
+            .into_py_any(py)
     }
 
     /// Return `MsgPack` encoded bytes representation of the object.
     #[pyo3(name = "to_msgpack_bytes")]
-    fn py_to_msgpack_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        self.to_msgpack_bytes().unwrap().into_py_any_unwrap(py)
+    fn py_to_msgpack_bytes(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.to_msgpack_bytes()
+            .map_err(to_pyvalue_err)?
+            .into_py_any(py)
     }
 }
 

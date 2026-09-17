@@ -14,7 +14,11 @@
 // -------------------------------------------------------------------------------------------------
 
 use bytes::Bytes;
-use nautilus_common::live::get_runtime;
+use nautilus_common::{
+    cache::{CacheConfig, database::CacheDatabaseFactory},
+    live::get_runtime,
+    python::cache::get_global_cache_database_factory_registry,
+};
 use nautilus_core::{
     UUID4,
     python::{to_pyruntime_err, to_pyvalue_err},
@@ -32,8 +36,12 @@ use pyo3::{
     prelude::*,
     types::{PyBytes, PyDict},
 };
+use serde_json::Value;
 
-use crate::redis::{cache::RedisCacheDatabase, queries::DatabaseQueries};
+use crate::redis::{
+    cache::{RedisCacheConfig, RedisCacheDatabase},
+    queries::DatabaseQueries,
+};
 
 #[pymethods]
 impl RedisCacheDatabase {
@@ -46,10 +54,16 @@ impl RedisCacheDatabase {
     /// - Establishing the Redis connection fails.
     /// - The command processing task cannot be spawned.
     #[new]
-    fn py_new(trader_id: TraderId, instance_id: UUID4, config_json: &[u8]) -> PyResult<Self> {
-        let config = serde_json::from_slice(config_json).map_err(to_pyvalue_err)?;
-        let result =
-            get_runtime().block_on(async { Self::new(trader_id, instance_id, config).await });
+    #[pyo3(signature = (trader_id, instance_id, config_json, database_config_json=None))]
+    fn py_new(
+        trader_id: TraderId,
+        instance_id: UUID4,
+        config_json: &[u8],
+        database_config_json: Option<&[u8]>,
+    ) -> PyResult<Self> {
+        let (config, database) = parse_inputs(config_json, database_config_json)?;
+        let result = get_runtime()
+            .block_on(async { Self::new(trader_id, instance_id, config, database).await });
         result.map_err(to_pyruntime_err)
     }
 
@@ -279,6 +293,10 @@ impl RedisCacheDatabase {
     /// Spawns the async query on the global Nautilus runtime and blocks until
     /// the result arrives via a channel. Safe from any thread context (Python,
     /// test runtimes, plain threads).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or the reply channel is closed.
     #[pyo3(name = "load_custom_data")]
     #[expect(clippy::needless_pass_by_value)]
     fn py_load_custom_data(
@@ -287,5 +305,258 @@ impl RedisCacheDatabase {
         data_type: DataType,
     ) -> PyResult<Vec<CustomData>> {
         py.detach(|| self.load_custom_data(&data_type).map_err(to_pyvalue_err))
+    }
+}
+
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl RedisCacheConfig {
+    /// Configuration for a Redis-backed cache database.
+    ///
+    /// Redis 6.2 or higher is required for correct operation.
+    #[new]
+    #[expect(clippy::too_many_arguments)]
+    #[pyo3(signature = (host=None, port=None, username=None, password=None, ssl=None, connection_timeout=None, response_timeout=None, number_of_retries=None, exponent_base=None, max_delay=None, factor=None))]
+    fn py_new(
+        host: Option<String>,
+        port: Option<u16>,
+        username: Option<String>,
+        password: Option<String>,
+        ssl: Option<bool>,
+        connection_timeout: Option<u16>,
+        response_timeout: Option<u16>,
+        number_of_retries: Option<usize>,
+        exponent_base: Option<u64>,
+        max_delay: Option<u64>,
+        factor: Option<u64>,
+    ) -> Self {
+        let default = Self::default();
+        Self {
+            host,
+            port,
+            username,
+            password,
+            ssl: ssl.unwrap_or(default.ssl),
+            connection_timeout: connection_timeout.unwrap_or(default.connection_timeout),
+            response_timeout: response_timeout.unwrap_or(default.response_timeout),
+            number_of_retries: number_of_retries.unwrap_or(default.number_of_retries),
+            exponent_base: exponent_base.unwrap_or(default.exponent_base),
+            max_delay: max_delay.unwrap_or(default.max_delay),
+            factor: factor.unwrap_or(default.factor),
+        }
+    }
+
+    #[getter]
+    fn host(&self) -> Option<&str> {
+        self.host.as_deref()
+    }
+
+    #[getter]
+    const fn port(&self) -> Option<u16> {
+        self.port
+    }
+
+    #[getter]
+    fn username(&self) -> Option<&str> {
+        self.username.as_deref()
+    }
+
+    #[getter]
+    fn password(&self) -> Option<&str> {
+        self.password.as_deref()
+    }
+
+    #[getter]
+    const fn ssl(&self) -> bool {
+        self.ssl
+    }
+
+    #[getter]
+    const fn connection_timeout(&self) -> u16 {
+        self.connection_timeout
+    }
+
+    #[getter]
+    const fn response_timeout(&self) -> u16 {
+        self.response_timeout
+    }
+
+    #[getter]
+    const fn number_of_retries(&self) -> usize {
+        self.number_of_retries
+    }
+
+    #[getter]
+    const fn exponent_base(&self) -> u64 {
+        self.exponent_base
+    }
+
+    #[getter]
+    const fn max_delay(&self) -> u64 {
+        self.max_delay
+    }
+
+    #[getter]
+    const fn factor(&self) -> u64 {
+        self.factor
+    }
+}
+
+#[expect(clippy::needless_pass_by_value)]
+fn extract_redis_cache_database_factory(
+    py: Python<'_>,
+    factory: Py<PyAny>,
+) -> PyResult<Box<dyn CacheDatabaseFactory>> {
+    Ok(Box::new(factory.extract::<RedisCacheConfig>(py)?))
+}
+
+pub(in crate::python) fn register_redis_cache_database_factory() -> PyResult<()> {
+    get_global_cache_database_factory_registry()
+        .register(
+            stringify!(RedisCacheConfig).to_string(),
+            extract_redis_cache_database_factory,
+        )
+        .map_err(to_pyruntime_err)
+}
+
+fn parse_inputs(
+    config_json: &[u8],
+    database_config_json: Option<&[u8]>,
+) -> PyResult<(CacheConfig, RedisCacheConfig)> {
+    let mut config_value: Value = serde_json::from_slice(config_json).map_err(to_pyvalue_err)?;
+    // TODO: Remove the legacy embedded database path once Python v2 callers use database_config_json.
+    let legacy_database = config_value
+        .as_object_mut()
+        .and_then(|object| object.remove("database"));
+
+    let config = serde_json::from_value(config_value).map_err(to_pyvalue_err)?;
+    let database = match database_config_json {
+        Some(raw) => serde_json::from_slice(raw).map_err(to_pyvalue_err)?,
+        None => match legacy_database {
+            Some(value) => config_from_legacy_database(value)?,
+            None => RedisCacheConfig::default(),
+        },
+    };
+
+    Ok((config, database))
+}
+
+fn config_from_legacy_database(mut value: Value) -> PyResult<RedisCacheConfig> {
+    if value.is_null() {
+        return Ok(RedisCacheConfig::default());
+    }
+
+    remove_legacy_selector(&mut value, "cache database")?;
+    serde_json::from_value(value).map_err(to_pyvalue_err)
+}
+
+fn remove_legacy_selector(value: &mut Value, label: &str) -> PyResult<()> {
+    let Some(object) = value.as_object_mut() else {
+        return Ok(());
+    };
+
+    let selector = object
+        .remove("database_type")
+        .or_else(|| object.remove("type"));
+    let Some(selector) = selector else {
+        return Ok(());
+    };
+    let Some(selector) = selector.as_str() else {
+        return Err(to_pyvalue_err(format!(
+            "invalid {label} type selector, expected string"
+        )));
+    };
+
+    if selector != "redis" {
+        return Err(to_pyvalue_err(format!(
+            "invalid {label} type selector, expected 'redis', was '{selector}'"
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+    use serde_json::json;
+
+    use super::*;
+
+    #[rstest]
+    fn test_parse_inputs_accepts_legacy_database() {
+        let config_json = serde_json::to_vec(&json!({
+            "database": {
+                "type": "redis",
+                "host": "redis.example.com",
+                "port": 6380,
+                "password": "secret",
+                "ssl": true,
+            },
+            "encoding": "json",
+            "buffer_interval_ms": 25,
+        }))
+        .unwrap();
+
+        let (config, database) = parse_inputs(&config_json, None).unwrap();
+
+        assert_eq!(config.buffer_interval_ms, Some(25));
+        assert_eq!(database.host, Some("redis.example.com".to_string()));
+        assert_eq!(database.port, Some(6380));
+        assert_eq!(database.password, Some("secret".to_string()));
+        assert!(database.ssl);
+    }
+
+    #[rstest]
+    fn test_parse_inputs_defaults_null_legacy_database() {
+        let config_json = serde_json::to_vec(&json!({
+            "database": null,
+            "buffer_interval_ms": 50,
+        }))
+        .unwrap();
+
+        let (config, database) = parse_inputs(&config_json, None).unwrap();
+
+        assert_eq!(config.buffer_interval_ms, Some(50));
+        assert_eq!(database, RedisCacheConfig::default());
+    }
+
+    #[rstest]
+    fn test_parse_inputs_prefers_explicit_database_config() {
+        let config_json = serde_json::to_vec(&json!({
+            "database": {
+                "type": "redis",
+                "host": "legacy.example.com",
+            },
+        }))
+        .unwrap();
+        let database_config_json = serde_json::to_vec(&json!({
+            "host": "explicit.example.com",
+            "port": 6381,
+        }))
+        .unwrap();
+
+        let (_, database) = parse_inputs(&config_json, Some(&database_config_json)).unwrap();
+
+        assert_eq!(database.host, Some("explicit.example.com".to_string()));
+        assert_eq!(database.port, Some(6381));
+    }
+
+    #[rstest]
+    fn test_parse_inputs_rejects_non_redis_legacy_database() {
+        Python::initialize();
+        let config_json = serde_json::to_vec(&json!({
+            "database": {
+                "type": "postgres",
+            },
+        }))
+        .unwrap();
+
+        let error = parse_inputs(&config_json, None).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "ValueError: invalid cache database type selector, expected 'redis', was 'postgres'"
+        );
     }
 }

@@ -18,7 +18,9 @@
 use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 use arrow::{
-    array::{BinaryArray, BinaryBuilder, StringArray, StringBuilder, UInt8Array, UInt64Array},
+    array::{
+        Array, BinaryArray, BinaryBuilder, StringArray, StringBuilder, UInt8Array, UInt64Array,
+    },
     datatypes::{DataType, Field, Schema},
     error::ArrowError,
     record_batch::RecordBatch,
@@ -38,7 +40,8 @@ use ustr::Ustr;
 
 use crate::arrow::{
     ArrowSchemaProvider, EncodeToRecordBatch, EncodingError, KEY_INSTRUMENT_ID,
-    KEY_PRICE_PRECISION, KEY_SIZE_PRECISION, extract_column,
+    KEY_PRICE_PRECISION, KEY_SIZE_PRECISION, extract_column, extract_column_by_name_or_index,
+    extract_optional_string_column_by_name, optional_ustr_value,
 };
 
 // Helper function to convert AssetClass to string
@@ -88,10 +91,15 @@ impl ArrowSchemaProvider for FuturesContract {
             Field::new("lot_size", DataType::Utf8, false),
             Field::new("activation_ns", DataType::UInt64, false),
             Field::new("expiration_ns", DataType::UInt64, false),
+            Field::new("max_quantity", DataType::Utf8, true), // nullable
+            Field::new("min_quantity", DataType::Utf8, true), // nullable
+            Field::new("max_price", DataType::Utf8, true),    // nullable
+            Field::new("min_price", DataType::Utf8, true),    // nullable
             Field::new("margin_init", DataType::Utf8, false),
             Field::new("margin_maint", DataType::Utf8, false),
             Field::new("maker_fee", DataType::Utf8, false),
             Field::new("taker_fee", DataType::Utf8, false),
+            Field::new("tick_scheme", DataType::Utf8, true),
             Field::new("info", DataType::Binary, true), // nullable
             Field::new("ts_event", DataType::UInt64, false),
             Field::new("ts_init", DataType::UInt64, false),
@@ -127,10 +135,15 @@ impl EncodeToRecordBatch for FuturesContract {
         let mut lot_size_builder = StringBuilder::new();
         let mut activation_ns_builder = UInt64Array::builder(data.len());
         let mut expiration_ns_builder = UInt64Array::builder(data.len());
+        let mut max_quantity_builder = StringBuilder::new();
+        let mut min_quantity_builder = StringBuilder::new();
+        let mut max_price_builder = StringBuilder::new();
+        let mut min_price_builder = StringBuilder::new();
         let mut margin_init_builder = StringBuilder::new();
         let mut margin_maint_builder = StringBuilder::new();
         let mut maker_fee_builder = StringBuilder::new();
         let mut taker_fee_builder = StringBuilder::new();
+        let mut tick_scheme_builder = StringBuilder::new();
         let mut info_builder = BinaryBuilder::new();
         let mut ts_event_builder = UInt64Array::builder(data.len());
         let mut ts_init_builder = UInt64Array::builder(data.len());
@@ -156,10 +169,41 @@ impl EncodeToRecordBatch for FuturesContract {
             lot_size_builder.append_value(fc.lot_size.to_string());
             activation_ns_builder.append_value(fc.activation_ns.as_u64());
             expiration_ns_builder.append_value(fc.expiration_ns.as_u64());
+
+            if let Some(max_quantity) = fc.max_quantity {
+                max_quantity_builder.append_value(max_quantity.to_string());
+            } else {
+                max_quantity_builder.append_null();
+            }
+
+            if let Some(min_quantity) = fc.min_quantity {
+                min_quantity_builder.append_value(min_quantity.to_string());
+            } else {
+                min_quantity_builder.append_null();
+            }
+
+            if let Some(max_price) = fc.max_price {
+                max_price_builder.append_value(max_price.to_string());
+            } else {
+                max_price_builder.append_null();
+            }
+
+            if let Some(min_price) = fc.min_price {
+                min_price_builder.append_value(min_price.to_string());
+            } else {
+                min_price_builder.append_null();
+            }
+
             margin_init_builder.append_value(fc.margin_init.to_string());
             margin_maint_builder.append_value(fc.margin_maint.to_string());
             maker_fee_builder.append_value(fc.maker_fee.to_string());
             taker_fee_builder.append_value(fc.taker_fee.to_string());
+
+            if let Some(tick_scheme) = fc.tick_scheme {
+                tick_scheme_builder.append_value(tick_scheme);
+            } else {
+                tick_scheme_builder.append_null();
+            }
 
             // Encode info dict as JSON bytes (matching Python's msgspec.json.encode)
             if let Some(ref info) = fc.info {
@@ -201,10 +245,15 @@ impl EncodeToRecordBatch for FuturesContract {
                 Arc::new(lot_size_builder.finish()),
                 Arc::new(activation_ns_builder.finish()),
                 Arc::new(expiration_ns_builder.finish()),
+                Arc::new(max_quantity_builder.finish()),
+                Arc::new(min_quantity_builder.finish()),
+                Arc::new(max_price_builder.finish()),
+                Arc::new(min_price_builder.finish()),
                 Arc::new(margin_init_builder.finish()),
                 Arc::new(margin_maint_builder.finish()),
                 Arc::new(maker_fee_builder.finish()),
                 Arc::new(taker_fee_builder.finish()),
+                Arc::new(tick_scheme_builder.finish()),
                 Arc::new(info_builder.finish()),
                 Arc::new(ts_event_builder.finish()),
                 Arc::new(ts_init_builder.finish()),
@@ -262,17 +311,31 @@ pub fn decode_futures_contract_batch(
         extract_column::<UInt64Array>(cols, "activation_ns", 12, DataType::UInt64)?;
     let expiration_ns_values =
         extract_column::<UInt64Array>(cols, "expiration_ns", 13, DataType::UInt64)?;
+    let max_quantity_values = extract_optional_string_column_by_name(record_batch, "max_quantity")?;
+    let min_quantity_values = extract_optional_string_column_by_name(record_batch, "min_quantity")?;
+    let max_price_values = extract_optional_string_column_by_name(record_batch, "max_price")?;
+    let min_price_values = extract_optional_string_column_by_name(record_batch, "min_price")?;
     let margin_init_values =
-        extract_column::<StringArray>(cols, "margin_init", 14, DataType::Utf8)?;
+        extract_column::<StringArray>(cols, "margin_init", 18, DataType::Utf8)?;
     let margin_maint_values =
-        extract_column::<StringArray>(cols, "margin_maint", 15, DataType::Utf8)?;
-    let maker_fee_values = extract_column::<StringArray>(cols, "maker_fee", 16, DataType::Utf8)?;
-    let taker_fee_values = extract_column::<StringArray>(cols, "taker_fee", 17, DataType::Utf8)?;
-    let info_values = cols
-        .get(18)
-        .ok_or_else(|| EncodingError::MissingColumn("info", 18))?;
-    let ts_event_values = extract_column::<UInt64Array>(cols, "ts_event", 19, DataType::UInt64)?;
-    let ts_init_values = extract_column::<UInt64Array>(cols, "ts_init", 20, DataType::UInt64)?;
+        extract_column::<StringArray>(cols, "margin_maint", 19, DataType::Utf8)?;
+    let maker_fee_values = extract_column::<StringArray>(cols, "maker_fee", 20, DataType::Utf8)?;
+    let taker_fee_values = extract_column::<StringArray>(cols, "taker_fee", 21, DataType::Utf8)?;
+    let tick_scheme_values = extract_optional_string_column_by_name(record_batch, "tick_scheme")?;
+    let info_values =
+        extract_column_by_name_or_index::<BinaryArray>(record_batch, "info", 23, DataType::Binary)?;
+    let ts_event_values = extract_column_by_name_or_index::<UInt64Array>(
+        record_batch,
+        "ts_event",
+        24,
+        DataType::UInt64,
+    )?;
+    let ts_init_values = extract_column_by_name_or_index::<UInt64Array>(
+        record_batch,
+        "ts_init",
+        25,
+        DataType::UInt64,
+    )?;
 
     let mut result = Vec::with_capacity(num_rows);
 
@@ -350,31 +413,51 @@ pub fn decode_futures_contract_batch(
         let ts_event = nautilus_core::UnixNanos::from(ts_event_values.value(i));
         let ts_init = nautilus_core::UnixNanos::from(ts_init_values.value(i));
 
-        let futures_contract = FuturesContract::new(
-            id,
-            raw_symbol,
-            asset_class,
-            exchange,
-            underlying,
-            activation_ns,
-            expiration_ns,
-            currency,
-            price_prec,
-            price_increment,
-            multiplier,
-            lot_size,
-            None, // max_quantity - not in Python schema
-            None, // min_quantity - not in Python schema
-            None, // max_price - not in Python schema
-            None, // min_price - not in Python schema
-            Some(margin_init),
-            Some(margin_maint),
-            Some(maker_fee),
-            Some(taker_fee),
-            info,
-            ts_event,
-            ts_init,
-        );
+        let tick_scheme = optional_ustr_value(tick_scheme_values, i);
+
+        let futures_contract = FuturesContract::builder()
+            .instrument_id(id)
+            .raw_symbol(raw_symbol)
+            .asset_class(asset_class)
+            .maybe_exchange(exchange)
+            .underlying(underlying)
+            .activation_ns(activation_ns)
+            .expiration_ns(expiration_ns)
+            .currency(currency)
+            .price_precision(price_prec)
+            .price_increment(price_increment)
+            .multiplier(multiplier)
+            .lot_size(lot_size)
+            .maybe_max_quantity(super::optional_quantity_value(
+                max_quantity_values,
+                "max_quantity",
+                i,
+            )?)
+            .maybe_min_quantity(super::optional_quantity_value(
+                min_quantity_values,
+                "min_quantity",
+                i,
+            )?)
+            .maybe_max_price(super::optional_price_value(
+                max_price_values,
+                "max_price",
+                i,
+            )?)
+            .maybe_min_price(super::optional_price_value(
+                min_price_values,
+                "min_price",
+                i,
+            )?)
+            .margin_init(margin_init)
+            .margin_maint(margin_maint)
+            .maker_fee(maker_fee)
+            .taker_fee(taker_fee)
+            .maybe_tick_scheme(tick_scheme)
+            .maybe_info(info)
+            .ts_event(ts_event)
+            .ts_init(ts_init)
+            .build()
+            .map_err(|e| super::instrument_validation_error::<FuturesContract>(i, e))?;
 
         result.push(futures_contract);
     }

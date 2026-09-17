@@ -22,7 +22,6 @@
 //! headers built by [`crate::signing::auth`].
 
 use std::{
-    collections::HashMap,
     fmt::Debug,
     sync::{
         Arc,
@@ -34,26 +33,28 @@ use ahash::AHashMap;
 use alloy::signers::local::PrivateKeySigner;
 use nautilus_network::{
     http::{HttpClient, HttpClientError, HttpResponse},
+    ratelimiter::clock::MonotonicClock,
     retry::{RetryConfig, RetryManager},
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
+use ustr::Ustr;
 
 use crate::{
     common::{
         consts::{HEADER_LYRA_SIGNATURE, HEADER_LYRA_TIMESTAMP, HEADER_LYRA_WALLET, HTTP_TIMEOUT},
         enums::DeriveInstrumentType,
-        rate_limit::{self, DERIVE_NON_MATCHING_RATE_KEY},
+        rate_limit::{self, DeriveRateLimiter, FixedWindowLimiter},
         retry::{http_retry_config, should_retry_http_error},
     },
     http::{
         error::{DeriveHttpError, Result},
         models::{
-            DeriveEmptyResult, DeriveInstrument, DeriveOpenOrdersResult, DeriveOrder,
-            DeriveOrderResult, DeriveOrdersResult, DerivePositionsResult, DerivePublicCandle,
-            DerivePublicFundingRateHistoryResult, DerivePublicTradesResult, DeriveReplaceResult,
-            DeriveSubaccount, DeriveTickerSnapshot, DeriveTickersResult, DeriveTradesResult,
-            JsonRpcResponse,
+            DeriveCancelByLabelResult, DeriveEmptyResult, DeriveInstrument, DeriveOpenOrdersResult,
+            DeriveOrder, DeriveOrderResult, DeriveOrdersResult, DerivePositionsResult,
+            DerivePublicCandle, DerivePublicFundingRateHistoryResult, DerivePublicTradesResult,
+            DeriveReplaceOutcome, DeriveReplaceResult, DeriveSubaccount, DeriveTickerSnapshot,
+            DeriveTickersResult, DeriveTradesResult, JsonRpcResponse,
         },
         query::{
             DeriveCancelAllParams, DeriveCancelByLabelParams, DeriveCancelParams,
@@ -119,6 +120,7 @@ pub struct DeriveHttpClient {
     next_id: Arc<AtomicU64>,
     timeout_secs: u64,
     retry_manager: Arc<RetryManager<DeriveHttpError>>,
+    rate_limiter: Arc<DeriveRateLimiter>,
 }
 
 impl DeriveHttpClient {
@@ -137,7 +139,7 @@ impl DeriveHttpClient {
         retry_config: Option<RetryConfig>,
     ) -> Result<Self> {
         let timeout_secs = timeout_secs.unwrap_or_else(|| HTTP_TIMEOUT.as_secs());
-        let client = build_client(timeout_secs, proxy_url)?;
+        let (client, rate_limiter) = build_client(timeout_secs, proxy_url)?;
         let retry_config = retry_config.unwrap_or_else(|| http_retry_config(3, 100, 5_000));
         Ok(Self {
             client,
@@ -146,6 +148,7 @@ impl DeriveHttpClient {
             next_id: Arc::new(AtomicU64::new(1)),
             timeout_secs,
             retry_manager: Arc::new(RetryManager::new(retry_config)),
+            rate_limiter,
         })
     }
 
@@ -198,7 +201,7 @@ impl DeriveHttpClient {
         R: DeserializeOwned,
     {
         let id = self.next_id();
-        self.dispatch(method, params, id, false, true).await
+        self.dispatch(method, params, id, false, true, None).await
     }
 
     /// Sends an authenticated idempotent request (private reads).
@@ -223,7 +226,7 @@ impl DeriveHttpClient {
             });
         }
         let id = self.next_id();
-        self.dispatch(method, params, id, true, true).await
+        self.dispatch(method, params, id, true, true, None).await
     }
 
     /// Sends an authenticated request exactly once (no retry).
@@ -237,6 +240,12 @@ impl DeriveHttpClient {
     /// the caller would surface as `OrderRejected` even though the original
     /// is live). Callers are expected to resolve ambiguous outcomes via
     /// reconciliation rather than retry here.
+    ///
+    /// Matching-engine writes must carry their instrument so the venue's
+    /// per-instrument allowance is paced too; use the typed wrappers
+    /// ([`Self::submit_order`], [`Self::cancel_order`],
+    /// [`Self::replace_order`]) which pass it through
+    /// `Self::send_private_write`.
     ///
     /// # Errors
     ///
@@ -254,7 +263,29 @@ impl DeriveHttpClient {
             });
         }
         let id = self.next_id();
-        self.dispatch(method, params, id, true, false).await
+        self.dispatch(method, params, id, true, false, None).await
+    }
+
+    /// Sends an authenticated matching-engine write exactly once, pacing it
+    /// against both the account-wide and the per-instrument allowances.
+    async fn send_private_write<P, R>(
+        &self,
+        method: &str,
+        params: &P,
+        instrument_name: Ustr,
+    ) -> Result<R>
+    where
+        P: Serialize + ?Sized,
+        R: DeserializeOwned,
+    {
+        if self.credentials.is_none() {
+            return Err(DeriveHttpError::MissingCredentials {
+                method: method.to_owned(),
+            });
+        }
+        let id = self.next_id();
+        self.dispatch(method, params, id, true, false, Some(instrument_name))
+            .await
     }
 
     /// Fetches the venue's listed instruments.
@@ -463,7 +494,9 @@ impl DeriveHttpClient {
     /// Returns [`DeriveHttpError::MissingCredentials`] when no credentials
     /// were installed; otherwise propagates transport and venue errors.
     pub async fn submit_order(&self, params: &DeriveOrderParams) -> Result<DeriveOrder> {
-        let result: DeriveOrderResult = self.send_private_once("private/order", params).await?;
+        let result: DeriveOrderResult = self
+            .send_private_write("private/order", params, params.instrument_name)
+            .await?;
         Ok(result.order)
     }
 
@@ -474,7 +507,8 @@ impl DeriveHttpClient {
     /// Returns [`DeriveHttpError::MissingCredentials`] when no credentials
     /// were installed; otherwise propagates transport and venue errors.
     pub async fn cancel_order(&self, params: &DeriveCancelParams) -> Result<DeriveEmptyResult> {
-        self.send_private_once("private/cancel", params).await
+        self.send_private_write("private/cancel", params, params.instrument_name)
+            .await
     }
 
     /// Cancels every open order on the subaccount, optionally scoped to an
@@ -497,13 +531,13 @@ impl DeriveHttpClient {
     pub async fn cancel_by_label(
         &self,
         params: &DeriveCancelByLabelParams,
-    ) -> Result<DeriveEmptyResult> {
+    ) -> Result<DeriveCancelByLabelResult> {
         self.send_private_once("private/cancel_by_label", params)
             .await
     }
 
-    /// Submits a signed `private/replace` request that atomically cancels one
-    /// order and creates a new one.
+    /// Submits a signed `private/replace` request that cancels one order before
+    /// creating its replacement.
     ///
     /// `params` must be the fully-built typed request body.
     ///
@@ -511,9 +545,16 @@ impl DeriveHttpClient {
     ///
     /// Returns [`DeriveHttpError::MissingCredentials`] when no credentials
     /// were installed; otherwise propagates transport and venue errors.
-    pub async fn replace_order(&self, params: &DeriveReplaceParams) -> Result<DeriveOrder> {
-        let result: DeriveReplaceResult = self.send_private_once("private/replace", params).await?;
-        Ok(result.order)
+    pub async fn replace_order(
+        &self,
+        params: &DeriveReplaceParams,
+    ) -> Result<DeriveReplaceOutcome> {
+        let result: DeriveReplaceResult = self
+            .send_private_write("private/replace", params, params.order.instrument_name)
+            .await?;
+        result
+            .into_outcome(&params.order_id_to_cancel, &params.order.label)
+            .map_err(DeriveHttpError::decode)
     }
 
     /// Returns the subaccount snapshot including margin, balances, and
@@ -617,6 +658,7 @@ impl DeriveHttpClient {
         id: u64,
         authenticate: bool,
         retry: bool,
+        instrument_name: Option<Ustr>,
     ) -> Result<R>
     where
         P: Serialize + ?Sized,
@@ -626,15 +668,18 @@ impl DeriveHttpClient {
         let body_value = serde_json::to_value(params).map_err(DeriveHttpError::from)?;
         let body = serde_json::to_vec(&body_value).map_err(DeriveHttpError::from)?;
 
-        // Every REST call is a non-matching read; gate it on the shared
-        // non-matching quota. A non-empty key is required: the limiter skips
-        // requests sent with no keys even when a default quota is configured.
-        let rate_keys = vec![DERIVE_NON_MATCHING_RATE_KEY.to_string()];
+        let rate_class = rate_limit::rate_class_for_method(method);
 
         // Sign per-attempt so the venue never sees a stale `X-LYRATIMESTAMP`
         // after a long backoff window; single-shot writes still run the
-        // closure once and use freshly built headers.
+        // closure once and use freshly built headers. The fixed-window wait
+        // happens inside the closure, so pacing delays never consume the
+        // signed timestamp's validity.
         let attempt = || async {
+            self.rate_limiter
+                .await_class_ready(rate_class, instrument_name.as_ref())
+                .await;
+
             let mut headers: AHashMap<String, String> = AHashMap::with_capacity(4);
             headers.insert("Content-Type".to_string(), "application/json".to_string());
 
@@ -653,7 +698,7 @@ impl DeriveHttpClient {
                     Some(headers.into_iter().collect()),
                     Some(body.clone()),
                     Some(self.timeout_secs),
-                    Some(rate_keys.clone()),
+                    None,
                 )
                 .await
                 .map_err(DeriveHttpError::from)?;
@@ -663,8 +708,8 @@ impl DeriveHttpClient {
 
         if retry {
             self.retry_manager
-                .execute_with_retry(method, attempt, should_retry_http_error, |msg| {
-                    DeriveHttpError::transport(msg)
+                .execute_with_retry(method, attempt, should_retry_http_error, |e| {
+                    DeriveHttpError::transport(e.to_string())
                 })
                 .await
         } else {
@@ -734,18 +779,23 @@ fn ticker_request(instrument_name: &str) -> Result<TickerRequest<'_>> {
 fn build_client(
     timeout_secs: u64,
     proxy_url: Option<String>,
-) -> std::result::Result<HttpClient, HttpClientError> {
-    // Every REST endpoint this client calls is a non-matching read, so a single
-    // default quota (keyed by `DERIVE_NON_MATCHING_RATE_KEY` at the call site)
-    // covers them; no per-endpoint keyed quotas are needed.
-    HttpClient::new(
-        HashMap::new(),
-        Vec::new(),
-        Vec::new(),
-        Some(rate_limit::non_matching_quota()),
-        Some(timeout_secs),
-        proxy_url,
-    )
+) -> std::result::Result<(HttpClient, Arc<DeriveRateLimiter>), HttpClientError> {
+    // The REST limiter carries Trader-default matching allowances: execution
+    // writes travel over the WebSocket, whose client is built from the
+    // configured market-maker overrides.
+    let rate_limiter = Arc::new(FixedWindowLimiter::new(
+        rate_limit::FixedWindowLimits::rest(None, None),
+        MonotonicClock {},
+    ));
+    // Pacing runs caller-side in `dispatch` (before auth headers are built),
+    // so the network client carries no limiter of its own and never sleeps
+    // inside its request path.
+    let client = HttpClient::builder()
+        .timeout_secs(timeout_secs)
+        .maybe_proxy_url(proxy_url)
+        .rate_limiters(Vec::new())
+        .build()?;
+    Ok((client, rate_limiter))
 }
 
 fn trim_trailing_slash(url: String) -> String {
@@ -826,6 +876,8 @@ fn truncate(s: String, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use nautilus_network::http::{HttpStatus, StatusCode};
     use rstest::rstest;
 
@@ -901,6 +953,13 @@ mod tests {
         let resp = test_response(200, &serde_json::json!({"id": 1, "result": {"ok": true}}));
         let value: Value = decode_envelope("public/get_instruments", 1, resp).unwrap();
         assert_eq!(value["ok"], true);
+    }
+
+    #[rstest]
+    fn test_decode_envelope_accepts_null_empty_result() {
+        let resp = test_response(200, &serde_json::json!({"id": 1, "result": null}));
+        let result: DeriveEmptyResult = decode_envelope("private/cancel", 1, resp).unwrap();
+        assert_eq!(result, DeriveEmptyResult {});
     }
 
     #[rstest]

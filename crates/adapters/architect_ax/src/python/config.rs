@@ -13,12 +13,13 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use nautilus_model::identifiers::{AccountId, TraderId};
+use nautilus_model::identifiers::AccountId;
+use nautilus_network::websocket::TransportBackend;
 use pyo3::pymethods;
 
 use crate::{
     common::enums::AxEnvironment,
-    config::{AxDataClientConfig, AxExecClientConfig},
+    config::{AxDataClientConfig, AxExecutionClientConfig},
 };
 
 #[pymethods]
@@ -27,7 +28,7 @@ impl AxDataClientConfig {
     /// Configuration for the AX Exchange live data client.
     #[new]
     #[expect(clippy::too_many_arguments)]
-    #[pyo3(signature = (api_key=None, api_secret=None, environment=None, base_url_http=None, base_url_ws_public=None, base_url_ws_private=None, proxy_url=None, http_timeout_secs=None, max_retries=None, retry_delay_initial_ms=None, retry_delay_max_ms=None, heartbeat_interval_secs=None, recv_window_ms=None, update_instruments_interval_mins=None, funding_rate_poll_interval_mins=None))]
+    #[pyo3(signature = (api_key=None, api_secret=None, environment=None, base_url_http=None, base_url_ws_public=None, base_url_ws_private=None, proxy_url=None, http_timeout_secs=None, max_retries=None, retry_delay_initial_ms=None, retry_delay_max_ms=None, heartbeat_interval_secs=None, recv_window_ms=None, update_instruments_interval_mins=None, funding_rate_poll_interval_mins=None, transport_backend=None))]
     fn py_new(
         api_key: Option<String>,
         api_secret: Option<String>,
@@ -44,6 +45,7 @@ impl AxDataClientConfig {
         recv_window_ms: Option<u64>,
         update_instruments_interval_mins: Option<u64>,
         funding_rate_poll_interval_mins: Option<u64>,
+        transport_backend: Option<TransportBackend>,
     ) -> Self {
         let default = Self::default();
         Self {
@@ -66,28 +68,32 @@ impl AxDataClientConfig {
                 .unwrap_or(default.update_instruments_interval_mins),
             funding_rate_poll_interval_mins: funding_rate_poll_interval_mins
                 .unwrap_or(default.funding_rate_poll_interval_mins),
-            transport_backend: default.transport_backend,
+            transport_backend: transport_backend.unwrap_or(default.transport_backend),
         }
     }
 
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(AxDataClientConfig).to_string()
     }
 
     fn __str__(&self) -> String {
-        format!("{self:?}")
+        stringify!(AxDataClientConfig).to_string()
     }
 }
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl AxExecClientConfig {
+impl AxExecutionClientConfig {
     /// Configuration for the AX Exchange live execution client.
     #[new]
     #[expect(clippy::too_many_arguments)]
-    #[pyo3(signature = (trader_id=None, account_id=None, api_key=None, api_secret=None, environment=None, base_url_http=None, base_url_orders=None, base_url_ws_private=None, proxy_url=None, http_timeout_secs=None, max_retries=None, retry_delay_initial_ms=None, retry_delay_max_ms=None, heartbeat_interval_secs=None, recv_window_ms=None, cancel_on_disconnect=None))]
+    #[pyo3(signature = (account_id=None, api_key=None, api_secret=None, environment=None, base_url_http=None, base_url_orders=None, base_url_ws_private=None, proxy_url=None, http_timeout_secs=None, max_retries=None, retry_delay_initial_ms=None, retry_delay_max_ms=None, heartbeat_interval_secs=None, recv_window_ms=None, cancel_on_disconnect=None, transport_backend=None))]
     fn py_new(
-        trader_id: Option<TraderId>,
         account_id: Option<AccountId>,
         api_key: Option<String>,
         api_secret: Option<String>,
@@ -103,10 +109,10 @@ impl AxExecClientConfig {
         heartbeat_interval_secs: Option<u64>,
         recv_window_ms: Option<u64>,
         cancel_on_disconnect: Option<bool>,
+        transport_backend: Option<TransportBackend>,
     ) -> Self {
         let default = Self::default();
         Self {
-            trader_id: trader_id.unwrap_or(default.trader_id),
             account_id: account_id.unwrap_or(default.account_id),
             api_key,
             api_secret,
@@ -124,15 +130,20 @@ impl AxExecClientConfig {
                 .unwrap_or(default.heartbeat_interval_secs),
             recv_window_ms: recv_window_ms.unwrap_or(default.recv_window_ms),
             cancel_on_disconnect: cancel_on_disconnect.unwrap_or(default.cancel_on_disconnect),
-            transport_backend: default.transport_backend,
+            transport_backend: transport_backend.unwrap_or(default.transport_backend),
         }
     }
 
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(AxExecutionClientConfig).to_string()
     }
 
     fn __str__(&self) -> String {
-        format!("{self:?}")
+        stringify!(AxExecutionClientConfig).to_string()
     }
 }

@@ -29,20 +29,37 @@ pub mod cache;
 pub mod clock;
 pub mod custom;
 pub mod enums;
+pub mod factory;
 pub mod fifo;
 pub mod greeks;
 pub mod indicators;
 pub mod listener;
 pub mod logging;
 pub mod msgbus;
+pub mod order_factory;
 pub mod runtime;
 pub mod signal;
+pub mod system;
 pub mod timer;
+pub mod wrappers;
 pub mod xrate;
 
-use pyo3::prelude::*;
+use nautilus_core::python::to_pyvalue_err;
+use pyo3::{PyErr, prelude::*};
 
-/// Loaded as `nautilus_pyo3.common`.
+use crate::config::ConfigError;
+
+/// Converts a config validation failure to a Python `ValueError`.
+#[must_use]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Result::map_err passes owned errors to conversion functions"
+)]
+pub fn config_error_to_pyvalue_err(e: ConfigError) -> PyErr {
+    to_pyvalue_err(e)
+}
+
+/// Exposed through `nautilus_trader.common`.
 ///
 /// # Errors
 ///
@@ -52,19 +69,26 @@ use pyo3::prelude::*;
 pub fn common(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::custom::CustomData>()?;
     m.add_class::<crate::signal::Signal>()?;
+    m.add_class::<crate::runner::SystemChannel>()?;
+    m.add_class::<crate::messages::system::QueueCondition>()?;
+    m.add_class::<crate::messages::system::QueueState>()?;
+    m.add_class::<crate::messages::system::QueueStateChanged>()?;
+    m.add_class::<crate::messages::system::SocketState>()?;
+    m.add_class::<crate::messages::system::SocketStateChanged>()?;
+    m.add_class::<crate::messages::system::ReconnectSocket>()?;
     m.add_class::<crate::timer::TimeEvent>()?;
     m.add_class::<crate::cache::CacheConfig>()?;
     m.add_class::<crate::python::actor::PyDataActor>()?;
     m.add_class::<crate::python::cache::PyCache>()?;
     m.add_class::<crate::python::fifo::PyFifoCache>()?;
     m.add_class::<crate::python::clock::PyClock>()?;
+    m.add_class::<crate::python::order_factory::PyOrderFactory>()?;
     m.add_class::<crate::python::greeks::PyGreeksCalculator>()?;
     m.add_class::<crate::python::logging::PyLogger>()?;
     m.add_class::<crate::actor::data_actor::DataActorConfig>()?;
     m.add_class::<crate::actor::data_actor::ImportableActorConfig>()?;
     m.add_class::<crate::msgbus::BusMessage>()?;
-    m.add_class::<crate::msgbus::database::DatabaseConfig>()?;
-    m.add_class::<crate::msgbus::database::MessageBusConfig>()?;
+    m.add_class::<crate::msgbus::config::MessageBusConfig>()?;
     m.add_class::<crate::python::msgbus::PyMessageBus>()?;
     m.add_class::<crate::enums::ComponentState>()?;
     m.add_class::<crate::enums::ComponentTrigger>()?;
@@ -72,6 +96,7 @@ pub fn common(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::enums::LogColor>()?;
     m.add_class::<crate::enums::LogLevel>()?;
     m.add_class::<crate::enums::LogFormat>()?;
+    m.add_class::<crate::enums::SerializationEncoding>()?;
     m.add_class::<crate::logging::logger::LoggerConfig>()?;
     m.add_class::<crate::logging::logger::LogGuard>()?;
     m.add_class::<crate::logging::writer::FileWriterConfig>()?;
@@ -94,4 +119,38 @@ pub fn common(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::live::listener::MessageBusListener>()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Once;
+
+    use pyo3::{Python, exceptions::PyValueError};
+    use rstest::rstest;
+
+    use super::*;
+
+    fn ensure_python_initialized() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            Python::initialize();
+        });
+    }
+
+    #[rstest]
+    fn test_config_error_to_pyvalue_err_preserves_display_text() {
+        ensure_python_initialized();
+
+        let error = ConfigError::invalid_format("rate_limit", "expected 'limit/HH:MM:SS'");
+
+        Python::attach(|py| {
+            let py_err = config_error_to_pyvalue_err(error);
+
+            assert!(py_err.is_instance_of::<PyValueError>(py));
+            assert_eq!(
+                py_err.value(py).to_string(),
+                "invalid rate_limit: expected 'limit/HH:MM:SS'"
+            );
+        });
+    }
 }

@@ -13,8 +13,8 @@ enum AccountType {
 
 enum AggressorSide {
     noAggressor @0;
-    buyer @1;
-    seller @2;
+    buy @1;
+    sell @2;
 }
 
 enum AssetClass {
@@ -45,6 +45,11 @@ enum InstrumentClass {
 enum OptionKind {
     call @0;
     put @1;
+}
+
+enum GreeksConvention {
+    blackScholes @0;
+    priceAdjusted @1;
 }
 
 enum OrderSide {
@@ -80,6 +85,7 @@ enum OrderStatus {
     pendingCancel @11;
     partiallyFilled @12;
     filled @13;
+    voided @14;
 }
 
 enum TimeInForce {
@@ -136,13 +142,6 @@ enum BookType {
     topOfBookBidOffer @0;  # Level 1 Top-of-book bid and offer
     marketByPrice @1;       # Level 2 Market by price
     marketByOrder @2;       # Level 3 Market by order
-}
-
-enum OrderBookDeltaType {
-    add @0;
-    update @1;
-    delete @2;
-    clear @3;
 }
 
 enum RecordFlag {

@@ -31,7 +31,7 @@ use crate::{
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.indicators")
+    pyo3::pyclass(module = "nautilus_trader.indicators")
 )]
 #[cfg_attr(
     feature = "python",
@@ -71,8 +71,9 @@ impl Indicator for DoubleExponentialMovingAverage {
         self.initialized
     }
 
-    fn handle_quote(&mut self, quote: &QuoteTick) {
-        self.update_raw(quote.extract_price(self.price_type).into());
+    fn handle_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
+        self.update_raw(quote.extract_price(self.price_type)?.into());
+        Ok(())
     }
 
     fn handle_trade(&mut self, trade: &TradeTick) {
@@ -158,6 +159,7 @@ mod tests {
         average::dema::DoubleExponentialMovingAverage,
         indicator::{Indicator, MovingAverage},
         stubs::*,
+        testing::assert_approx_equal,
     };
 
     #[rstest]
@@ -180,7 +182,7 @@ mod tests {
         indicator_dema_10.update_raw(1.0);
         indicator_dema_10.update_raw(2.0);
         indicator_dema_10.update_raw(3.0);
-        assert_eq!(indicator_dema_10.value, 1.904_583_020_285_499_4);
+        assert_approx_equal(indicator_dema_10.value, 1.90458302029);
     }
 
     #[rstest]
@@ -198,7 +200,7 @@ mod tests {
         mut indicator_dema_10: DoubleExponentialMovingAverage,
         stub_quote: QuoteTick,
     ) {
-        indicator_dema_10.handle_quote(&stub_quote);
+        indicator_dema_10.handle_quote(&stub_quote).unwrap();
         assert_eq!(indicator_dema_10.value, 1501.0);
     }
 
@@ -260,7 +262,7 @@ mod tests {
     #[rstest]
     fn test_counters_are_in_sync(mut indicator_dema_10: DoubleExponentialMovingAverage) {
         for i in 1..=indicator_dema_10.period {
-            indicator_dema_10.update_raw(i as f64); // ← FIX ❷
+            indicator_dema_10.update_raw(i as f64);
             assert_eq!(
                 indicator_dema_10.count(),
                 i,
@@ -305,7 +307,7 @@ mod tests {
     ) {
         assert_eq!(indicator_dema_10.count(), 0);
 
-        indicator_dema_10.handle_quote(&stub_quote);
+        indicator_dema_10.handle_quote(&stub_quote).unwrap();
         assert_eq!(indicator_dema_10.count(), 1);
         assert_eq!(indicator_dema_10.ema1.count(), 1);
         assert_eq!(indicator_dema_10.ema2.count(), 1);

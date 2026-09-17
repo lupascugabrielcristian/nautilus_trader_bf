@@ -74,37 +74,32 @@ fn make_btc_option(strike: &str, kind: OptionKind) -> InstrumentAny {
     };
     let symbol_str = format!("BTC-20240101-{strike}-{kind_char}.DERIBIT");
     let raw_symbol_str = symbol_str.split('.').next().unwrap();
-    InstrumentAny::CryptoOption(CryptoOption::new(
-        InstrumentId::from(symbol_str.as_str()),
-        Symbol::from(raw_symbol_str),
-        Currency::from("BTC"),
-        Currency::USD(),
-        Currency::from("BTC"),
-        false,
-        kind,
-        Price::from(strike),
-        UnixNanos::from(1_671_696_000_000_000_000u64),
-        UnixNanos::from(EXPIRATION_NS),
-        3,
-        1,
-        Price::from("0.001"),
-        Quantity::from("0.1"),
-        Some(Quantity::from(1)),
-        Some(Quantity::from(1)),
-        Some(Quantity::from("9000.0")),
-        Some(Quantity::from("0.1")),
-        None,
-        Some(Money::new(10.00, Currency::USD())),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        0.into(),
-        0.into(),
-    ))
+    InstrumentAny::CryptoOption(
+        CryptoOption::builder()
+            .instrument_id(InstrumentId::from(symbol_str.as_str()))
+            .raw_symbol(Symbol::from(raw_symbol_str))
+            .underlying(Currency::from("BTC"))
+            .quote_currency(Currency::USD())
+            .settlement_currency(Currency::from("BTC"))
+            .is_inverse(false)
+            .option_kind(kind)
+            .strike_price(Price::from(strike))
+            .activation_ns(UnixNanos::from(1_671_696_000_000_000_000u64))
+            .expiration_ns(UnixNanos::from(EXPIRATION_NS))
+            .price_precision(3)
+            .size_precision(1)
+            .price_increment(Price::from("0.001"))
+            .size_increment(Quantity::from("0.1"))
+            .multiplier(Quantity::from(1))
+            .lot_size(Quantity::from(1))
+            .max_quantity(Quantity::from("9000.0"))
+            .min_quantity(Quantity::from("0.1"))
+            .min_notional(Money::new(10.00, Currency::USD()))
+            .ts_event(0.into())
+            .ts_init(0.into())
+            .build()
+            .unwrap(),
+    )
 }
 
 fn deribit_venue_config() -> BacktestVenueConfig {
@@ -115,6 +110,7 @@ fn deribit_venue_config() -> BacktestVenueConfig {
         .book_type(BookType::L1_MBP)
         .starting_balances(vec!["10 BTC".to_string()])
         .build()
+        .unwrap()
 }
 
 fn series_id() -> OptionSeriesId {
@@ -226,29 +222,22 @@ fn build_catalog() -> (
     // metadata), so each instrument must be written separately or the put rows would be relabelled
     // as calls. Per-instrument batches stay ascending in `ts_init` and land in disjoint directories.
     for id in [call_id, put_id] {
+        let quotes_for_instrument = quotes
+            .iter()
+            .filter(|q| q.instrument_id == id)
+            .copied()
+            .collect::<Vec<_>>();
         catalog
-            .write_to_parquet(
-                quotes
-                    .iter()
-                    .filter(|q| q.instrument_id == id)
-                    .copied()
-                    .collect(),
-                None,
-                None,
-                None,
-            )
+            .write_to_parquet(&quotes_for_instrument, None, None, None)
             .unwrap();
+
+        let greeks_for_instrument = greeks
+            .iter()
+            .filter(|g| g.instrument_id == id)
+            .copied()
+            .collect::<Vec<_>>();
         catalog
-            .write_to_parquet(
-                greeks
-                    .iter()
-                    .filter(|g| g.instrument_id == id)
-                    .copied()
-                    .collect(),
-                None,
-                None,
-                None,
-            )
+            .write_to_parquet(&greeks_for_instrument, None, None, None)
             .unwrap();
     }
 
@@ -319,18 +308,21 @@ fn run_chain_backtest(
         .data_type(NautilusDataType::QuoteTick)
         .catalog_path(catalog_path.to_string())
         .instrument_ids(instrument_ids.clone())
-        .build();
+        .build()
+        .unwrap();
     let greeks_data = BacktestDataConfig::builder()
         .data_type(NautilusDataType::OptionGreeks)
         .catalog_path(catalog_path.to_string())
         .instrument_ids(instrument_ids)
-        .build();
+        .build()
+        .unwrap();
 
     let config = BacktestRunConfig::builder()
         .venues(vec![deribit_venue_config()])
         .data(vec![quote_data, greeks_data])
         .maybe_chunk_size(chunk_size)
-        .build();
+        .build()
+        .unwrap();
     let config_id = config.id().to_string();
 
     let mut node = BacktestNode::new(vec![config]).unwrap();

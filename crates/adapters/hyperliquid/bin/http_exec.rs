@@ -13,20 +13,20 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{env, str::FromStr};
+use std::env;
 
 use nautilus_hyperliquid::{
     common::{credential::Secrets, enums::HyperliquidEnvironment},
     http::{
         client::HyperliquidHttpClient,
         models::{
-            Cloid, HyperliquidExecAction, HyperliquidExecGrouping, HyperliquidExecLimitParams,
-            HyperliquidExecOrderKind, HyperliquidExecPlaceOrderRequest, HyperliquidExecTif,
+            Cloid, HyperliquidExchangeAction, HyperliquidExchangeGrouping,
+            HyperliquidExchangeLimitParams, HyperliquidExchangeOrderKind,
+            HyperliquidExchangePlaceOrderRequest, HyperliquidExchangeTif,
         },
     },
 };
 use nautilus_model::identifiers::ClientOrderId;
-use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 #[tokio::main]
@@ -102,8 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Fetching BTC order book...");
     let book = client.info_l2_book("BTC").await?;
 
-    let best_bid_str = &book.levels[0][0].px;
-    let best_bid = Decimal::from_str(best_bid_str)?;
+    let best_bid = book.levels[0][0].px;
 
     log::info!("Best bid: ${best_bid}");
 
@@ -117,15 +116,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cloid_hex = cloid.to_hex();
     log::info!("Cloid: {cloid_hex}");
 
-    let order = HyperliquidExecPlaceOrderRequest {
+    let order = HyperliquidExchangePlaceOrderRequest {
         asset: btc_asset_id as u32,
         is_buy: true,
         price: limit_price,
         size: dec!(0.001),
         reduce_only: false,
-        kind: HyperliquidExecOrderKind::Limit {
-            limit: HyperliquidExecLimitParams {
-                tif: HyperliquidExecTif::Gtc,
+        kind: HyperliquidExchangeOrderKind::Limit {
+            limit: HyperliquidExchangeLimitParams {
+                tif: HyperliquidExchangeTif::Gtc,
             },
         },
         cloid: Some(cloid),
@@ -141,10 +140,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     log::info!("Placing order...");
 
-    // Create the action using the typed HyperliquidExecAction enum
-    let action = HyperliquidExecAction::Order {
+    // Create the action using the typed HyperliquidExchangeAction enum
+    let action = HyperliquidExchangeAction::Order {
         orders: vec![order],
-        grouping: HyperliquidExecGrouping::Na,
+        grouping: HyperliquidExchangeGrouping::Na,
         builder: None,
     };
 

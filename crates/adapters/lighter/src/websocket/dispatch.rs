@@ -23,15 +23,15 @@
 
 use std::{
     collections::VecDeque,
-    hash::{BuildHasher, Hash, Hasher},
+    hash::{BuildHasher, Hasher},
     sync::{
         Arc, LazyLock, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
-use ahash::{AHashMap, RandomState};
+use ahash::{AHashMap, AHashSet, RandomState};
 use anyhow::Context;
 use dashmap::{DashMap, DashSet};
 use nautilus_core::{AtomicTime, MUTEX_POISONED, UnixNanos};
@@ -40,7 +40,7 @@ use nautilus_model::{
     events::AccountState,
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TradeId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
-    orders::OrderAny,
+    orders::{Order, OrderAny},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{Price, Quantity},
 };
@@ -48,7 +48,7 @@ use rust_decimal::{Decimal, prelude::ToPrimitive};
 
 use crate::{
     common::{
-        credential::{Credential, scrub_auth},
+        credential::Credential,
         enums::{LighterOrderType, LighterTimeInForce},
         symbol::MarketRegistry,
     },
@@ -67,10 +67,19 @@ use crate::{
 /// (matches the upstream venue convention).
 pub(crate) const ORDER_EXPIRY_DEFAULT_GTC_MS: i64 = 28 * 24 * 60 * 60 * 1_000;
 
+/// Venue minimum GTD lifetime plus one second for signing and transport.
+pub(crate) const ORDER_EXPIRY_MIN_GTD_MS: i64 = 5 * 60 * 1_000 + 1_000;
+
+/// Venue maximum GTD lifetime.
+pub(crate) const ORDER_EXPIRY_MAX_GTD_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+
 /// Sentinel used in `OrderInfo.order_expiry` for IOC orders, per the Lighter
 /// Go signer's documented contract: `0` means "no expiry tracking, IOC
 /// semantics".
 pub(crate) const ORDER_EXPIRY_IOC: i64 = 0;
+
+/// Defensive cap for authenticated reconciliation pagination.
+pub(crate) const MAX_RECONCILIATION_PAGES: usize = 1_000;
 
 /// Order identity context captured at submit time.
 ///
@@ -83,6 +92,168 @@ pub(crate) struct OrderIdentity {
     pub(crate) strategy_id: StrategyId,
     pub(crate) order_side: OrderSide,
     pub(crate) order_type: OrderType,
+    pub(crate) client_order_index: i64,
+    binding: Arc<Mutex<OrderIdentityBinding>>,
+    accepted_emitted: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Default)]
+struct OrderIdentityBinding {
+    venue_order_id: Option<VenueOrderId>,
+    submission_nonce: Option<i64>,
+    external_venue_ids: AHashSet<VenueOrderId>,
+    create_resolution: CreateResolution,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+enum CreateResolution {
+    #[default]
+    Pending,
+    Confirmed,
+    Rejected,
+}
+
+impl OrderIdentity {
+    pub(crate) fn new(
+        instrument_id: InstrumentId,
+        strategy_id: StrategyId,
+        order_side: OrderSide,
+        order_type: OrderType,
+        client_order_index: i64,
+    ) -> Self {
+        Self {
+            instrument_id,
+            strategy_id,
+            order_side,
+            order_type,
+            client_order_index,
+            binding: Arc::new(Mutex::new(OrderIdentityBinding::default())),
+            accepted_emitted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn restored(order: &OrderAny, client_order_index: i64, venue_order_id: VenueOrderId) -> Self {
+        let identity = Self::new(
+            order.instrument_id(),
+            order.strategy_id(),
+            order.order_side(),
+            order.order_type(),
+            client_order_index,
+        );
+        let mut binding = identity.binding.lock().expect(MUTEX_POISONED);
+        binding.venue_order_id = Some(venue_order_id);
+        binding.create_resolution = CreateResolution::Confirmed;
+        drop(binding);
+        identity.accepted_emitted.store(true, Ordering::Release);
+        identity
+    }
+
+    fn mark_submission(&self, nonce: i64) {
+        self.binding.lock().expect(MUTEX_POISONED).submission_nonce = Some(nonce);
+    }
+
+    fn bind_venue_order_id(&self, venue_order_id: VenueOrderId) -> bool {
+        let mut binding = self.binding.lock().expect(MUTEX_POISONED);
+        if binding.create_resolution == CreateResolution::Rejected {
+            return false;
+        }
+
+        match binding.venue_order_id {
+            Some(existing) => {
+                if existing == venue_order_id {
+                    binding.create_resolution = CreateResolution::Confirmed;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => {
+                if binding.external_venue_ids.contains(&venue_order_id)
+                    || binding.submission_nonce.is_none()
+                {
+                    binding.external_venue_ids.insert(venue_order_id);
+                    return false;
+                }
+                binding.venue_order_id = Some(venue_order_id);
+                binding.create_resolution = CreateResolution::Confirmed;
+                true
+            }
+        }
+    }
+
+    fn matches_venue_order_id(&self, venue_order_id: VenueOrderId) -> bool {
+        self.binding.lock().expect(MUTEX_POISONED).venue_order_id == Some(venue_order_id)
+    }
+
+    fn venue_order_id(&self) -> Option<VenueOrderId> {
+        self.binding.lock().expect(MUTEX_POISONED).venue_order_id
+    }
+
+    fn accepted_was_emitted(&self) -> bool {
+        self.accepted_emitted.load(Ordering::Acquire)
+    }
+
+    fn claim_accepted_emission(&self) -> bool {
+        let mut binding = self.binding.lock().expect(MUTEX_POISONED);
+        if binding.create_resolution == CreateResolution::Rejected {
+            return false;
+        }
+        binding.create_resolution = CreateResolution::Confirmed;
+        drop(binding);
+        !self.accepted_emitted.swap(true, Ordering::AcqRel)
+    }
+
+    fn submission_is_pending(&self, client_order_index: i64, nonce: i64) -> bool {
+        if self.client_order_index != client_order_index {
+            return false;
+        }
+
+        let binding = self.binding.lock().expect(MUTEX_POISONED);
+        binding.submission_nonce == Some(nonce)
+            && binding.create_resolution == CreateResolution::Pending
+    }
+
+    fn confirm_submission(&self, client_order_index: i64, nonce: i64) -> bool {
+        if self.client_order_index != client_order_index {
+            return false;
+        }
+
+        let mut binding = self.binding.lock().expect(MUTEX_POISONED);
+        if binding.submission_nonce != Some(nonce)
+            || binding.create_resolution == CreateResolution::Rejected
+        {
+            return false;
+        }
+        binding.create_resolution = CreateResolution::Confirmed;
+        true
+    }
+
+    fn reject_submission(
+        &self,
+        client_order_index: i64,
+        nonce: i64,
+        connection_epoch: Option<(&AtomicU64, u64)>,
+    ) -> bool {
+        if self.client_order_index != client_order_index {
+            return false;
+        }
+
+        let mut binding = self.binding.lock().expect(MUTEX_POISONED);
+        if binding.submission_nonce != Some(nonce)
+            || binding.create_resolution != CreateResolution::Pending
+        {
+            return false;
+        }
+        binding.create_resolution = CreateResolution::Rejected;
+
+        if connection_epoch
+            .is_some_and(|(current, expected)| current.load(Ordering::Acquire) != expected)
+        {
+            binding.create_resolution = CreateResolution::Pending;
+            return false;
+        }
+        true
+    }
 }
 
 /// In-flight sendTx awaiting a venue response.
@@ -96,6 +267,7 @@ pub(crate) struct OrderIdentity {
 /// order event on a venue rejection.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingSendTx {
+    pub(crate) connection_epoch: u64,
     pub(crate) kind: PendingSendTxKind,
     pub(crate) submitted_at: UnixNanos,
     pub(crate) nonce: i64,
@@ -136,35 +308,39 @@ pub(crate) enum PendingSendTxKind {
 /// collision on the derived `client_order_index`. The 31-bit space makes a
 /// collision improbable at session scale; bounding the probe ensures that a
 /// degenerate seed never spins indefinitely while still leaving headroom.
-const CLOID_INDEX_PROBE_LIMIT: usize = 16;
+pub(crate) const CLOID_INDEX_PROBE_LIMIT: usize = 16;
 
-/// Maximum entries held by lifecycle dedup caches before the oldest marker is
-/// evicted.
-const DEDUP_CAPACITY: usize = 10_000;
+const CLOID_INDEX_MAX: u32 = 0x7FFF_FFFF;
 
-/// Bounded deduplication set with FIFO eviction.
+/// Maximum terminal orders and trade ids retained for reconnect replay.
+const REPLAY_CACHE_CAPACITY: usize = 100_000;
+
+#[derive(Debug, Clone)]
+struct RetiredOrderIdentity {
+    cloid: ClientOrderId,
+    identity: OrderIdentity,
+}
+
 #[derive(Debug)]
-pub(crate) struct BoundedDedup<K> {
-    inner: Mutex<BoundedDedupInner<K>>,
+pub(crate) struct RetiredOrderCache {
+    inner: Mutex<RetiredOrderCacheInner>,
     capacity: usize,
 }
 
 #[derive(Debug)]
-struct BoundedDedupInner<K> {
-    set: AHashMap<K, u64>,
-    queue: VecDeque<(K, u64)>,
+struct RetiredOrderCacheInner {
+    by_index: AHashMap<i64, AHashMap<Option<VenueOrderId>, (RetiredOrderIdentity, u64)>>,
+    by_cloid: AHashMap<ClientOrderId, (i64, Option<VenueOrderId>)>,
+    queue: VecDeque<(i64, Option<VenueOrderId>, u64)>,
     next_seq: u64,
 }
 
-impl<K> BoundedDedup<K>
-where
-    K: Eq + Hash + Clone,
-{
-    /// Creates a new dedup set with the given maximum capacity.
-    pub(crate) fn new(capacity: usize) -> Self {
+impl RetiredOrderCache {
+    fn new(capacity: usize) -> Self {
         Self {
-            inner: Mutex::new(BoundedDedupInner {
-                set: AHashMap::with_capacity(capacity),
+            inner: Mutex::new(RetiredOrderCacheInner {
+                by_index: AHashMap::with_capacity(capacity),
+                by_cloid: AHashMap::with_capacity(capacity),
                 queue: VecDeque::with_capacity(capacity),
                 next_seq: 0,
             }),
@@ -172,40 +348,183 @@ where
         }
     }
 
-    /// Returns `true` when the key is present.
-    pub(crate) fn contains(&self, key: &K) -> bool {
-        self.inner
-            .lock()
-            .expect(MUTEX_POISONED)
-            .set
-            .contains_key(key)
-    }
-
-    /// Inserts the key and evicts old markers when the cache is full.
-    pub(crate) fn insert(&self, key: K) {
+    fn insert(&self, cloid: ClientOrderId, identity: OrderIdentity) {
+        let index = identity.client_order_index;
+        let venue_order_id = identity.venue_order_id();
+        let binding = (index, venue_order_id);
         let mut inner = self.inner.lock().expect(MUTEX_POISONED);
-        if inner.set.contains_key(&key) {
-            return;
-        }
-
         let seq = inner.next_seq;
         inner.next_seq = inner.next_seq.wrapping_add(1);
-        inner.set.insert(key.clone(), seq);
-        inner.queue.push_back((key, seq));
+
+        if let Some((old_index, old_venue_order_id)) = inner.by_cloid.get(&cloid).copied()
+            && (old_index, old_venue_order_id) != binding
+        {
+            let remove_index = inner.by_index.get_mut(&old_index).is_some_and(|bindings| {
+                bindings.remove(&old_venue_order_id);
+                bindings.is_empty()
+            });
+
+            if remove_index {
+                inner.by_index.remove(&old_index);
+            }
+        }
+
+        let replaced = inner.by_index.entry(index).or_default().insert(
+            venue_order_id,
+            (RetiredOrderIdentity { cloid, identity }, seq),
+        );
+
+        if let Some((old, _)) = replaced
+            && old.cloid != cloid
+        {
+            inner.by_cloid.remove(&old.cloid);
+        }
+        inner.by_cloid.insert(cloid, binding);
+        inner.queue.push_back((index, venue_order_id, seq));
 
         while inner.queue.len() > self.capacity
-            && let Some((old_key, old_seq)) = inner.queue.pop_front()
+            && let Some((old_index, old_venue_order_id, old_seq)) = inner.queue.pop_front()
         {
-            if inner.set.get(&old_key) == Some(&old_seq) {
-                inner.set.remove(&old_key);
+            let removed = inner.by_index.get_mut(&old_index).and_then(|bindings| {
+                if bindings.get(&old_venue_order_id).map(|(_, seq)| *seq) != Some(old_seq) {
+                    return None;
+                }
+                let (old, _) = bindings.remove(&old_venue_order_id)?;
+                Some((old.cloid, bindings.is_empty()))
+            });
+
+            if let Some((old_cloid, remove_index)) = removed {
+                inner.by_cloid.remove(&old_cloid);
+                if remove_index {
+                    inner.by_index.remove(&old_index);
+                }
+                log::warn!(
+                    "Evicting retired Lighter order identity at replay-cache capacity: cloid={old_cloid}, client_order_index={old_index}",
+                );
             }
         }
     }
 
-    /// Removes the key when present.
-    pub(crate) fn remove(&self, key: &K) {
-        self.inner.lock().expect(MUTEX_POISONED).set.remove(key);
+    fn cloid_for_index(&self, index: i64) -> Option<ClientOrderId> {
+        let inner = self.inner.lock().expect(MUTEX_POISONED);
+        let bindings = inner.by_index.get(&index)?;
+        if bindings.len() != 1 {
+            return None;
+        }
+        bindings.values().next().map(|(retired, _)| retired.cloid)
     }
+
+    fn cloid_for_venue(&self, index: i64, venue_order_id: VenueOrderId) -> Option<ClientOrderId> {
+        self.inner
+            .lock()
+            .expect(MUTEX_POISONED)
+            .by_index
+            .get(&index)?
+            .get(&Some(venue_order_id))
+            .map(|(retired, _)| retired.cloid)
+    }
+
+    fn identity_for_cloid(&self, cloid: &ClientOrderId) -> Option<OrderIdentity> {
+        let inner = self.inner.lock().expect(MUTEX_POISONED);
+        let (index, venue_order_id) = inner.by_cloid.get(cloid)?;
+        inner
+            .by_index
+            .get(index)
+            .and_then(|bindings| bindings.get(venue_order_id))
+            .map(|(retired, _)| retired.identity.clone())
+    }
+
+    fn contains_index(&self, index: i64) -> bool {
+        self.inner
+            .lock()
+            .expect(MUTEX_POISONED)
+            .by_index
+            .contains_key(&index)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TradeDedupSource {
+    Live,
+    Reconciliation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingOrderAction {
+    Modify,
+    Cancel,
+}
+
+#[derive(Debug)]
+pub(crate) struct TradeDedupCache {
+    inner: Mutex<TradeDedupCacheInner>,
+    capacity: usize,
+}
+
+#[derive(Debug)]
+struct TradeDedupCacheInner {
+    entries: AHashMap<TradeId, (TradeDedupSource, u64)>,
+    queue: VecDeque<(TradeId, u64)>,
+    next_seq: u64,
+}
+
+impl TradeDedupCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(TradeDedupCacheInner {
+                entries: AHashMap::with_capacity(capacity),
+                queue: VecDeque::with_capacity(capacity),
+                next_seq: 0,
+            }),
+            capacity,
+        }
+    }
+
+    fn insert(&self, trade_id: TradeId, source: TradeDedupSource) -> Option<TradeDedupSource> {
+        let mut inner = self.inner.lock().expect(MUTEX_POISONED);
+        if let Some((existing, _)) = inner.entries.get(&trade_id) {
+            return Some(*existing);
+        }
+
+        let seq = inner.next_seq;
+        inner.next_seq = inner.next_seq.wrapping_add(1);
+        inner.entries.insert(trade_id, (source, seq));
+        inner.queue.push_back((trade_id, seq));
+        while inner.queue.len() > self.capacity
+            && let Some((old_trade_id, old_seq)) = inner.queue.pop_front()
+        {
+            if inner.entries.get(&old_trade_id).map(|(_, seq)| *seq) == Some(old_seq) {
+                inner.entries.remove(&old_trade_id);
+                log::warn!(
+                    "Evicting Lighter trade id at replay-cache capacity: trade_id={old_trade_id}",
+                );
+            }
+        }
+        None
+    }
+
+    fn remove(&self, trade_id: &TradeId) {
+        self.inner
+            .lock()
+            .expect(MUTEX_POISONED)
+            .entries
+            .remove(trade_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains(&self, trade_id: &TradeId) -> bool {
+        self.inner
+            .lock()
+            .expect(MUTEX_POISONED)
+            .entries
+            .contains_key(trade_id)
+    }
+}
+
+#[derive(Debug, Default)]
+struct PositionSnapshot {
+    reports: AHashMap<InstrumentId, PositionStatusReport>,
+    skipped_market_ids: Option<AHashSet<i16>>,
 }
 
 /// Per-client WebSocket dispatch state.
@@ -219,6 +538,10 @@ pub(crate) struct WsDispatchState {
     /// echoes the index on `account_*` order frames; the consumption loop
     /// uses this map to substitute the original cloid before forwarding.
     pub(crate) cloid_map: Arc<DashMap<i64, ClientOrderId>>,
+    /// Terminal identity retained for late account-trade frames and reconnect
+    /// replay. Active indices are never reused while their retired entry is
+    /// inside this bounded process replay horizon.
+    pub(crate) retired_orders: Arc<RetiredOrderCache>,
     /// Maps Nautilus [`ClientOrderId`] to the venue-assigned
     /// [`VenueOrderId`]. Populated by the consumption loop on the first
     /// `OrderStatusReport` and consumed by `cancel_order` / `modify_order`.
@@ -235,30 +558,24 @@ pub(crate) struct WsDispatchState {
     /// per-market and the venue's REST quota would make a full-market
     /// fan-out prohibitively slow.
     pub(crate) active_markets: Arc<DashSet<i16>>,
-    /// WS-driven position cache backing `generate_position_status_reports`
-    /// (Lighter has no REST equivalent). `Mutex` not `DashMap` so a reader
-    /// never lands between `replace_positions`' clear and repopulate.
-    pub(crate) last_positions: Arc<Mutex<AHashMap<InstrumentId, PositionStatusReport>>>,
+    /// WS-driven position reports and their coverage state. Lighter has no REST
+    /// equivalent, so both values share one lock to keep reconciliation from
+    /// pairing reports from one frame with completeness from another.
+    position_snapshot: Arc<Mutex<PositionSnapshot>>,
     /// Identity context for orders this client submitted. Keyed on the
     /// originating [`ClientOrderId`]; populated by the execution client at
     /// submit time, consumed by the consumption loop to decide whether an
     /// inbound venue frame should produce a typed `OrderEventAny` or fall
     /// back to a report for an externally-managed order.
     pub(crate) order_identities: Arc<DashMap<ClientOrderId, OrderIdentity>>,
-    /// Cloids for which an `OrderAccepted` event has already been emitted on
-    /// the live path. Drives the modify-as-restate branch: a subsequent
-    /// venue `Open` for the same cloid emits `OrderUpdated` rather than
-    /// re-emitting `OrderAccepted`. Also lets `ensure_accepted_emitted`
-    /// synthesise an `OrderAccepted` for fast-filling orders that skip the
-    /// `Open` state. Report generation also seeds this marker when
-    /// reconciliation can accept a submitted tracked order before the typed
-    /// WebSocket path sees it.
-    pub(crate) accepted_emitted: Arc<BoundedDedup<ClientOrderId>>,
+    /// Serializes create identity replacement against generation-checked
+    /// sequencer-rejection cleanup.
+    create_registry: Arc<Mutex<()>>,
     /// Trade ids already routed to `OrderFilled` / `FillReport`. The venue
     /// can re-emit the same `account_all_trades` payload across reconnects
-    /// and HTTP reconciliation does not backfill the dedup state, so a
-    /// process-lifetime set keeps duplicate fills from double-booking.
-    pub(crate) seen_trade_ids: Arc<DashSet<TradeId>>,
+    /// and HTTP reconciliation seeds this bounded source-aware cache so a
+    /// later live replay cannot double-book a reported fill.
+    pub(crate) seen_trade_ids: Arc<TradeDedupCache>,
     /// Cloids for which `OrderTriggered` has already been emitted. The
     /// venue keeps surfacing `trigger_status = Ready` on every subsequent
     /// `Open` frame for a conditional order once the trigger fires; the
@@ -271,6 +588,9 @@ pub(crate) struct WsDispatchState {
     /// is initialised on the first emitted `OrderAccepted` and refreshed
     /// on every emitted `OrderUpdated`.
     pub(crate) order_snapshots: Arc<DashMap<ClientOrderId, OrderShapeSnapshot>>,
+    /// Local lifecycle action that a venue frame or reconciliation report
+    /// must not bypass before its confirming event or rejection arrives.
+    pending_order_actions: Arc<DashMap<ClientOrderId, PendingOrderAction>>,
     /// FIFO queue of submits awaiting a venue response. The consumption loop
     /// pops on every `SendTxAck` / `SendTxRejected` so it can attribute a
     /// rejection back to the originating order (sendTx error frames carry no
@@ -479,16 +799,18 @@ impl WsDispatchState {
     pub(crate) fn new() -> Self {
         Self {
             cloid_map: Arc::new(DashMap::new()),
+            retired_orders: Arc::new(RetiredOrderCache::new(REPLAY_CACHE_CAPACITY)),
             venue_id_map: Arc::new(DashMap::new()),
             nonce_manager: Arc::new(NonceManager::default()),
             last_account_state: Arc::new(Mutex::new(None)),
             active_markets: Arc::new(DashSet::new()),
-            last_positions: Arc::new(Mutex::new(AHashMap::new())),
+            position_snapshot: Arc::new(Mutex::new(PositionSnapshot::default())),
             order_identities: Arc::new(DashMap::new()),
-            accepted_emitted: Arc::new(BoundedDedup::new(DEDUP_CAPACITY)),
-            seen_trade_ids: Arc::new(DashSet::new()),
+            create_registry: Arc::new(Mutex::new(())),
+            seen_trade_ids: Arc::new(TradeDedupCache::new(REPLAY_CACHE_CAPACITY)),
             triggered_emitted: Arc::new(DashSet::new()),
             order_snapshots: Arc::new(DashMap::new()),
+            pending_order_actions: Arc::new(DashMap::new()),
             pending_sendtx: Arc::new(Mutex::new(VecDeque::new())),
             account_streams_ready: Arc::new(AccountStreamsReady::new()),
         }
@@ -500,15 +822,24 @@ impl WsDispatchState {
     /// a late venue ACK to the next-head. In normal operation ACKs arrive in
     /// milliseconds; sustained queue growth indicates a stuck WS read loop.
     pub(crate) fn enqueue_pending_sendtx(&self, pending: PendingSendTx) {
+        if let PendingSendTxKind::Create {
+            order,
+            client_order_index: _,
+        } = &pending.kind
+        {
+            self.mark_order_submission(&order.client_order_id(), pending.nonce);
+        }
         self.pending_sendtx
             .lock()
             .expect(MUTEX_POISONED)
             .push_back(pending);
     }
 
-    /// Pop the oldest pending entry unconditionally. Fallback for direct
-    /// sendTx responses that carry no `tx_hash` to correlate on; the head is
-    /// the best guess because queue order matches send order.
+    /// Pop the oldest pending entry unconditionally.
+    ///
+    /// Tests and reconnect cleanup use this directly. Live hashless response
+    /// attribution must use [`Self::pop_pending_sendtx_if_only`].
+    #[cfg(test)]
     pub(crate) fn pop_pending_sendtx_head(&self) -> Option<PendingSendTx> {
         self.pending_sendtx
             .lock()
@@ -516,28 +847,59 @@ impl WsDispatchState {
             .pop_front()
     }
 
-    /// Pop the head only if its submitted_at is within `max_age_ms` of `now`.
-    /// Used for bare-error frames: an error arriving long after the head was
-    /// submitted is unlikely to belong to it; let the submit-timeout handle.
-    pub(crate) fn pop_pending_sendtx_within(
+    /// Pop a pending entry only when it is the sole possible match.
+    ///
+    /// Lighter does not always echo `tx_hash`. With two or more transactions
+    /// in flight, FIFO attribution is unsafe because responses may arrive out
+    /// of order.
+    pub(crate) fn pop_pending_sendtx_if_only(
         &self,
+        connection_epoch: u64,
+    ) -> Option<PendingSendTx> {
+        let mut queue = self.pending_sendtx.lock().expect(MUTEX_POISONED);
+        let mut matches = queue
+            .iter()
+            .enumerate()
+            .filter(|(_, pending)| pending.connection_epoch == connection_epoch);
+        let (position, _) = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        queue.remove(position)
+    }
+
+    /// Pop the sole pending entry only if its `submitted_at` is within
+    /// `max_age_ms` of `now`.
+    pub(crate) fn pop_pending_sendtx_if_only_within(
+        &self,
+        connection_epoch: u64,
         now: UnixNanos,
         max_age_ms: u64,
     ) -> Option<PendingSendTx> {
         let cutoff_ns = now.as_u64().saturating_sub(max_age_ms * 1_000_000);
-        let mut q = self.pending_sendtx.lock().expect(MUTEX_POISONED);
-        match q.front() {
-            Some(front) if front.submitted_at.as_u64() >= cutoff_ns => q.pop_front(),
-            _ => None,
+        let mut queue = self.pending_sendtx.lock().expect(MUTEX_POISONED);
+        let mut matches = queue
+            .iter()
+            .enumerate()
+            .filter(|(_, pending)| pending.connection_epoch == connection_epoch);
+        let (position, pending) = matches.next()?;
+        let fresh = pending.submitted_at.as_u64() >= cutoff_ns;
+        if matches.next().is_some() || !fresh {
+            return None;
         }
+        queue.remove(position)
     }
 
-    /// Remove a pending entry by nonce. Used by the spawn-failure path when
-    /// `send_tx` errors locally before the venue ever sees the message; the
-    /// nonce is unique per submit and reachable from every dispatch path.
-    pub(crate) fn remove_pending_sendtx_by_nonce(&self, nonce: i64) -> Option<PendingSendTx> {
+    /// Remove a pending entry by connection epoch and nonce.
+    pub(crate) fn remove_pending_sendtx_by_nonce(
+        &self,
+        connection_epoch: u64,
+        nonce: i64,
+    ) -> Option<PendingSendTx> {
         let mut q = self.pending_sendtx.lock().expect(MUTEX_POISONED);
-        let pos = q.iter().position(|p| p.nonce == nonce)?;
+        let pos = q
+            .iter()
+            .position(|p| p.connection_epoch == connection_epoch && p.nonce == nonce)?;
         q.remove(pos)
     }
 
@@ -545,27 +907,34 @@ impl WsDispatchState {
     /// (case-insensitive hex comparison, optional `0x` prefix tolerated).
     /// The venue echoes the hash the client computed at signing time, so a
     /// match is exact attribution regardless of queue position.
-    pub(crate) fn remove_pending_sendtx_by_hash(&self, tx_hash: &str) -> Option<PendingSendTx> {
+    pub(crate) fn remove_pending_sendtx_by_hash(
+        &self,
+        connection_epoch: u64,
+        tx_hash: &str,
+    ) -> Option<PendingSendTx> {
         let tx_hash = tx_hash
             .strip_prefix("0x")
             .or_else(|| tx_hash.strip_prefix("0X"))
             .unwrap_or(tx_hash);
         let mut q = self.pending_sendtx.lock().expect(MUTEX_POISONED);
-        let pos = q
-            .iter()
-            .position(|p| p.tx_hash.eq_ignore_ascii_case(tx_hash))?;
+        let pos = q.iter().position(|p| {
+            p.connection_epoch == connection_epoch && p.tx_hash.eq_ignore_ascii_case(tx_hash)
+        })?;
         q.remove(pos)
     }
 
-    /// Drain every pending entry. Used on reconnect: responses to txs sent
-    /// on the previous connection are lost, so retained entries would only
-    /// misattribute responses arriving on the new connection.
-    pub(crate) fn drain_pending_sendtx(&self) -> Vec<PendingSendTx> {
-        self.pending_sendtx
-            .lock()
-            .expect(MUTEX_POISONED)
-            .drain(..)
-            .collect()
+    /// Drain pending entries owned by one disconnected connection.
+    pub(crate) fn drain_pending_sendtx(&self, connection_epoch: u64) -> Vec<PendingSendTx> {
+        let mut queue = self.pending_sendtx.lock().expect(MUTEX_POISONED);
+        let (drained, retained) = std::mem::take(&mut *queue)
+            .into_iter()
+            .partition(|pending| pending.connection_epoch == connection_epoch);
+        *queue = retained;
+        drained.into()
+    }
+
+    pub(crate) fn take_pending_sendtx(&self) -> Vec<PendingSendTx> {
+        std::mem::take(&mut *self.pending_sendtx.lock().expect(MUTEX_POISONED)).into()
     }
 
     /// Returns the current pending-sendTx queue length. Test-only helper.
@@ -595,31 +964,200 @@ impl WsDispatchState {
         self.order_snapshots.insert(cloid, snapshot);
     }
 
+    pub(crate) fn set_pending_order_action(
+        &self,
+        cloid: ClientOrderId,
+        action: PendingOrderAction,
+    ) {
+        self.pending_order_actions.insert(cloid, action);
+    }
+
+    pub(crate) fn pending_order_action(&self, cloid: &ClientOrderId) -> Option<PendingOrderAction> {
+        self.pending_order_actions
+            .get(cloid)
+            .map(|entry| *entry.value())
+    }
+
+    pub(crate) fn clear_pending_order_action_if(
+        &self,
+        cloid: &ClientOrderId,
+        action: PendingOrderAction,
+    ) -> bool {
+        self.pending_order_actions
+            .remove_if(cloid, |_, current| *current == action)
+            .is_some()
+    }
+
+    pub(crate) fn clear_pending_order_action(&self, cloid: &ClientOrderId) {
+        self.pending_order_actions.remove(cloid);
+    }
+
     /// Register identity context for an order the client just dispatched.
     /// The consumption loop reads this to decide whether to emit typed events.
     pub(crate) fn register_order_identity(&self, cloid: ClientOrderId, identity: OrderIdentity) {
         self.order_identities.insert(cloid, identity);
     }
 
+    /// Register the client index and identity for one create as one registry operation.
+    pub(crate) fn register_create_identity(&self, order: &OrderAny) -> anyhow::Result<i64> {
+        let _guard = self.create_registry.lock().expect(MUTEX_POISONED);
+        let cloid = order.client_order_id();
+        let client_order_index =
+            self.register_cloid(self.derive_client_order_index(&cloid), cloid)?;
+        self.register_order_identity(
+            cloid,
+            OrderIdentity::new(
+                order.instrument_id(),
+                order.strategy_id(),
+                order.order_side(),
+                order.order_type(),
+                client_order_index,
+            ),
+        );
+        Ok(client_order_index)
+    }
+
+    pub(crate) fn mark_order_submission(&self, cloid: &ClientOrderId, nonce: i64) {
+        if let Some(identity) = self.order_identities.get(cloid) {
+            identity.mark_submission(nonce);
+        }
+    }
+
+    pub(crate) fn create_submission_is_pending(
+        &self,
+        cloid: &ClientOrderId,
+        client_order_index: i64,
+        nonce: i64,
+    ) -> bool {
+        self.order_identities
+            .get(cloid)
+            .is_some_and(|identity| identity.submission_is_pending(client_order_index, nonce))
+    }
+
+    pub(crate) fn confirm_create_submission(
+        &self,
+        cloid: &ClientOrderId,
+        client_order_index: i64,
+        nonce: i64,
+    ) -> bool {
+        let _guard = self.create_registry.lock().expect(MUTEX_POISONED);
+        self.order_identities
+            .get(cloid)
+            .is_some_and(|identity| identity.confirm_submission(client_order_index, nonce))
+    }
+
+    pub(crate) fn observe_create_submission(
+        &self,
+        cloid: &ClientOrderId,
+        client_order_index: i64,
+        nonce: i64,
+        venue_order_id: VenueOrderId,
+    ) -> bool {
+        let _guard = self.create_registry.lock().expect(MUTEX_POISONED);
+        let Some(identity) = self
+            .order_identities
+            .get(cloid)
+            .map(|entry| entry.value().clone())
+        else {
+            return false;
+        };
+
+        if !identity.confirm_submission(client_order_index, nonce)
+            || !identity.bind_venue_order_id(venue_order_id)
+        {
+            return false;
+        }
+        self.venue_id_map.insert(*cloid, venue_order_id);
+        true
+    }
+
+    /// Atomically claim and remove the exact submitted create generation.
+    pub(crate) fn reject_create_submission(
+        &self,
+        cloid: &ClientOrderId,
+        client_order_index: i64,
+        nonce: i64,
+        connection_epoch: Option<(&AtomicU64, u64)>,
+    ) -> bool {
+        let _guard = self.create_registry.lock().expect(MUTEX_POISONED);
+        let Some(identity) = self
+            .order_identities
+            .get(cloid)
+            .map(|entry| entry.value().clone())
+        else {
+            return false;
+        };
+
+        if !identity.reject_submission(client_order_index, nonce, connection_epoch) {
+            return false;
+        }
+
+        let removed = self
+            .order_identities
+            .remove_if(cloid, |_, current| {
+                Arc::ptr_eq(&current.binding, &identity.binding)
+            })
+            .is_some();
+
+        if !removed {
+            return false;
+        }
+
+        self.cloid_map
+            .remove_if(&client_order_index, |_, current| current == cloid);
+        self.venue_id_map.remove(cloid);
+        self.triggered_emitted.remove(cloid);
+        self.order_snapshots.remove(cloid);
+        self.clear_pending_order_action(cloid);
+        true
+    }
+
     /// Drop the identity entry for `cloid` after a terminal event or
     /// failed dispatch.
     pub(crate) fn forget_order_identity(&self, cloid: &ClientOrderId) {
         self.order_identities.remove(cloid);
-        self.accepted_emitted.remove(cloid);
         self.triggered_emitted.remove(cloid);
         self.order_snapshots.remove(cloid);
+        self.clear_pending_order_action(cloid);
+    }
+
+    /// Move a terminal order from active maps into the bounded replay cache.
+    pub(crate) fn retire_order_identity(&self, cloid: &ClientOrderId) {
+        self.clear_pending_order_action(cloid);
+        let Some((_, identity)) = self.order_identities.remove(cloid) else {
+            return;
+        };
+        self.cloid_map.remove(&identity.client_order_index);
+        self.retired_orders.insert(*cloid, identity);
+        self.triggered_emitted.remove(cloid);
+        self.order_snapshots.remove(cloid);
+    }
+
+    /// Resolve active first, then terminal replay identity.
+    pub(crate) fn order_identity(&self, cloid: &ClientOrderId) -> Option<OrderIdentity> {
+        self.order_identities
+            .get(cloid)
+            .map(|entry| entry.value().clone())
+            .or_else(|| self.retired_orders.identity_for_cloid(cloid))
     }
 
     /// Returns `true` if an `OrderAccepted` has already been emitted for
     /// `cloid` on the live path. Drives the modify-as-restate branch and
     /// the `ensure_accepted_emitted` synthesis.
     pub(crate) fn accepted_was_emitted(&self, cloid: &ClientOrderId) -> bool {
-        self.accepted_emitted.contains(cloid)
+        self.order_identity(cloid)
+            .is_some_and(|identity| identity.accepted_was_emitted())
+    }
+
+    /// Atomically claim the right to emit `OrderAccepted` for `cloid`.
+    pub(crate) fn claim_accepted_emission(&self, cloid: &ClientOrderId) -> bool {
+        self.order_identity(cloid)
+            .is_some_and(|identity| identity.claim_accepted_emission())
     }
 
     /// Record that an `OrderAccepted` has been emitted for `cloid`.
     pub(crate) fn mark_accepted_emitted(&self, cloid: ClientOrderId) {
-        self.accepted_emitted.insert(cloid);
+        let _ = self.claim_accepted_emission(&cloid);
     }
 
     /// Seed the live accepted marker from a tracked order report.
@@ -648,15 +1186,28 @@ impl WsDispatchState {
             return;
         };
 
-        if self.order_identities.contains_key(&cloid) {
-            self.mark_accepted_emitted(cloid);
-        }
+        self.mark_accepted_emitted(cloid);
     }
 
     /// First-time check for a trade id: returns `true` if `trade_id` is new
     /// and inserts it, returns `false` if it was already routed.
     pub(crate) fn mark_trade_seen(&self, trade_id: TradeId) -> bool {
-        self.seen_trade_ids.insert(trade_id)
+        self.seen_trade_ids
+            .insert(trade_id, TradeDedupSource::Live)
+            .is_none()
+    }
+
+    /// Record a reconciliation fill and return its prior delivery source.
+    pub(crate) fn mark_trade_reconciled(&self, trade_id: TradeId) -> Option<TradeDedupSource> {
+        self.seen_trade_ids
+            .insert(trade_id, TradeDedupSource::Reconciliation)
+    }
+
+    /// Roll back a [`Self::mark_trade_seen`] marker when the trade could not be
+    /// parsed, so a later replay of the same `trade_id` is retried instead of
+    /// being permanently suppressed by the dedup set.
+    pub(crate) fn unmark_trade_seen(&self, trade_id: &TradeId) {
+        self.seen_trade_ids.remove(trade_id);
     }
 
     /// Record a market_index as having reported account activity.
@@ -692,11 +1243,37 @@ impl WsDispatchState {
     /// The 31-bit space is large enough that collisions are improbable at
     /// session scale; the probe protects against rare collisions without
     /// silently re-routing a later order's fill to a prior cloid.
-    pub(crate) fn register_cloid(&self, index: i64, cloid: ClientOrderId) -> i64 {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when every bounded probe candidate is occupied. No
+    /// existing mapping is changed on failure.
+    pub(crate) fn register_cloid(&self, index: i64, cloid: ClientOrderId) -> anyhow::Result<i64> {
         let mut candidate = index;
         for attempt in 0..=CLOID_INDEX_PROBE_LIMIT {
+            if self.resolve_client_order_index(candidate).is_some() {
+                if self
+                    .cloid_map
+                    .get(&candidate)
+                    .is_some_and(|entry| *entry.value() == cloid)
+                {
+                    return Ok(candidate);
+                }
+                candidate = next_probe_index(candidate);
+                continue;
+            }
+
+            if self.retired_orders.contains_index(candidate) {
+                candidate = next_probe_index(candidate);
+                continue;
+            }
+
             match self.cloid_map.entry(candidate) {
                 dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    if self.retired_orders.contains_index(candidate) {
+                        candidate = next_probe_index(candidate);
+                        continue;
+                    }
                     entry.insert(cloid);
 
                     if attempt > 0 {
@@ -705,32 +1282,243 @@ impl WsDispatchState {
                              cloid {cloid} re-derived to {candidate} after {attempt} probe(s)",
                         );
                     }
-                    return candidate;
+                    return Ok(candidate);
                 }
                 dashmap::mapref::entry::Entry::Occupied(entry) => {
                     if *entry.get() == cloid {
-                        return candidate;
+                        return Ok(candidate);
                     }
                     candidate = next_probe_index(candidate);
                 }
             }
         }
-        // Probing exhausted: the venue-safe window has many free slots but
-        // we have hit a degenerate pile-up. Overwrite the slot rather than
-        // dropping the submit, and surface a loud warn so a real incident
-        // is investigable.
-        log::warn!(
-            "Lighter client_order_index probe exhausted after {CLOID_INDEX_PROBE_LIMIT} attempts: \
-             overwriting slot {candidate} with cloid {cloid}",
+        anyhow::bail!(
+            "Lighter client_order_index probe exhausted after {} attempts for cloid {cloid}",
+            CLOID_INDEX_PROBE_LIMIT + 1,
+        )
+    }
+
+    /// Restore an exact order identity observed during reconciliation.
+    ///
+    /// `terminal` reflects the current venue report because the cached order can be stale after a
+    /// restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cached order does not carry the same venue order ID, the client
+    /// index is outside the venue-safe range, or the binding conflicts with existing local state.
+    pub(crate) fn restore_reconciled_order(
+        &self,
+        order: &OrderAny,
+        client_order_index: i64,
+        venue_order_id: VenueOrderId,
+        terminal: bool,
+    ) -> anyhow::Result<()> {
+        let cloid = order.client_order_id();
+        anyhow::ensure!(
+            order.venue_order_id() == Some(venue_order_id),
+            "cached Lighter order {cloid} does not match venue order ID {venue_order_id}",
         );
-        self.cloid_map.insert(candidate, cloid);
-        candidate
+        anyhow::ensure!(
+            (0..=i64::from(CLOID_INDEX_MAX)).contains(&client_order_index),
+            "Lighter client_order_index {client_order_index} is outside the venue-safe range",
+        );
+
+        if let Some(existing) = self
+            .order_identities
+            .get(&cloid)
+            .map(|entry| entry.value().clone())
+        {
+            anyhow::ensure!(
+                existing.client_order_index == client_order_index
+                    && existing.matches_venue_order_id(venue_order_id),
+                "active Lighter order {cloid} conflicts with reconciliation binding",
+            );
+
+            if terminal {
+                self.retire_order_identity(&cloid);
+            } else if order.is_triggered() == Some(true) {
+                self.mark_triggered_emitted(cloid);
+            }
+            return Ok(());
+        }
+
+        if let Some(existing) = self.retired_orders.identity_for_cloid(&cloid) {
+            anyhow::ensure!(
+                terminal
+                    && existing.client_order_index == client_order_index
+                    && existing.matches_venue_order_id(venue_order_id),
+                "retired Lighter order {cloid} conflicts with reconciliation binding",
+            );
+            return Ok(());
+        }
+
+        let identity = OrderIdentity::restored(order, client_order_index, venue_order_id);
+
+        if terminal {
+            anyhow::ensure!(
+                self.retired_orders
+                    .cloid_for_venue(client_order_index, venue_order_id)
+                    .is_none(),
+                "retired Lighter binding conflicts at client_order_index {client_order_index} and venue order ID {venue_order_id}",
+            );
+            self.retired_orders.insert(cloid, identity);
+        } else {
+            if let Some(existing) = self.venue_id_map.get(&cloid) {
+                anyhow::ensure!(
+                    *existing.value() == venue_order_id,
+                    "active Lighter order {cloid} conflicts with venue order ID {venue_order_id}",
+                );
+            }
+
+            match self.cloid_map.entry(client_order_index) {
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    self.venue_id_map.insert(cloid, venue_order_id);
+                    self.order_identities.insert(cloid, identity);
+                    entry.insert(cloid);
+                    if order.is_triggered() == Some(true) {
+                        self.mark_triggered_emitted(cloid);
+                    }
+                }
+                dashmap::mapref::entry::Entry::Occupied(_) => {
+                    anyhow::bail!(
+                        "active Lighter binding conflicts at client_order_index {client_order_index}",
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Drop a cloid registration (called from the spawn's error branch when
     /// the tx never reaches the wire).
     pub(crate) fn forget_cloid(&self, index: i64) {
         self.cloid_map.remove(&index);
+    }
+
+    /// Resolve a venue client-order index across active and replay caches.
+    pub(crate) fn resolve_client_order_index(&self, index: i64) -> Option<ClientOrderId> {
+        self.cloid_map
+            .get(&index)
+            .map(|entry| *entry.value())
+            .or_else(|| self.retired_orders.cloid_for_index(index))
+    }
+
+    /// Resolve and bind a live venue client id across active and replay caches.
+    pub(crate) fn resolve_live_order_cloid(
+        &self,
+        raw_client_id: &str,
+        venue_order_id: VenueOrderId,
+    ) -> Option<ClientOrderId> {
+        if raw_client_id.is_empty() || raw_client_id == "0" {
+            return None;
+        }
+
+        let index = raw_client_id.parse::<i64>().ok()?;
+
+        if let Some(cloid) = self.cloid_map.get(&index).map(|entry| *entry.value())
+            && let Some(identity) = self.order_identity(&cloid)
+        {
+            if identity.matches_venue_order_id(venue_order_id) {
+                return Some(cloid);
+            }
+
+            if let Some(retired) = self.retired_orders.cloid_for_venue(index, venue_order_id) {
+                return Some(retired);
+            }
+
+            return identity
+                .bind_venue_order_id(venue_order_id)
+                .then_some(cloid);
+        }
+
+        self.retired_orders.cloid_for_venue(index, venue_order_id)
+    }
+
+    pub(crate) fn resolve_live_trade_cloid(
+        &self,
+        raw_client_id: &str,
+        venue_order_id: VenueOrderId,
+    ) -> Option<ClientOrderId> {
+        self.resolve_live_order_cloid(raw_client_id, venue_order_id)
+    }
+
+    fn resolve_client_order_index_for_venue(
+        &self,
+        index: i64,
+        venue_order_id: VenueOrderId,
+    ) -> Option<ClientOrderId> {
+        if let Some(cloid) = self.cloid_map.get(&index).map(|entry| *entry.value())
+            && self
+                .order_identity(&cloid)
+                .is_some_and(|identity| identity.matches_venue_order_id(venue_order_id))
+        {
+            return Some(cloid);
+        }
+
+        self.retired_orders.cloid_for_venue(index, venue_order_id)
+    }
+
+    /// Substitute a numeric venue cloid only when its venue order is bound.
+    pub(crate) fn translate_order_cloid(&self, mut report: OrderStatusReport) -> OrderStatusReport {
+        if let Some(cloid) = report.client_order_id
+            && let Ok(index) = cloid.as_str().parse::<i64>()
+        {
+            let resolved = self
+                .resolve_client_order_index_for_venue(index, report.venue_order_id)
+                .unwrap_or_else(|| ClientOrderId::new(report.venue_order_id.as_str()));
+            report = report.with_client_order_id(resolved);
+        }
+        report
+    }
+
+    /// Preserve an unresolved local modify or cancel across a non-terminal
+    /// working report. Confirming shape and terminal events clear the marker.
+    pub(crate) fn preserve_pending_order_status(
+        &self,
+        mut report: OrderStatusReport,
+    ) -> OrderStatusReport {
+        let Some(cloid) = report.client_order_id else {
+            return report;
+        };
+
+        if report.order_status.is_closed() {
+            self.clear_pending_order_action(&cloid);
+            return report;
+        }
+
+        if !matches!(
+            report.order_status,
+            OrderStatus::Accepted | OrderStatus::Triggered | OrderStatus::PartiallyFilled,
+        ) {
+            return report;
+        }
+
+        report.order_status = match self.pending_order_action(&cloid) {
+            Some(PendingOrderAction::Modify) => OrderStatus::PendingUpdate,
+            Some(PendingOrderAction::Cancel) => OrderStatus::PendingCancel,
+            None => return report,
+        };
+        report
+    }
+
+    /// Substitute a numeric venue cloid only when its venue order is bound.
+    pub(crate) fn translate_fill_cloid(&self, mut report: FillReport) -> FillReport {
+        if let Some(cloid) = report.client_order_id
+            && let Ok(index) = cloid.as_str().parse::<i64>()
+        {
+            report.client_order_id = Some(
+                self.resolve_client_order_index_for_venue(index, report.venue_order_id)
+                    .unwrap_or_else(|| ClientOrderId::new(report.venue_order_id.as_str())),
+            );
+        }
+        report
+    }
+
+    /// Return the actual collision-probed index used for `cloid`.
+    pub(crate) fn client_order_index(&self, cloid: &ClientOrderId) -> Option<i64> {
+        self.order_identity(cloid)
+            .map(|identity| identity.client_order_index)
     }
 
     /// Look up the venue-assigned [`VenueOrderId`] for a Nautilus cloid.
@@ -766,43 +1554,104 @@ impl WsDispatchState {
     /// the strict-await gate before the next `account_all_positions` frame
     /// replaces the cache.
     pub(crate) fn clear_position_cache(&self) {
-        self.last_positions.lock().expect(MUTEX_POISONED).clear();
+        let mut snapshot = self.position_snapshot.lock().expect(MUTEX_POISONED);
+        snapshot.reports.clear();
+        snapshot.skipped_market_ids = None;
     }
 
-    /// Replace the cache from a complete `account_all_positions` snapshot
+    pub(crate) fn invalidate_position_snapshot(&self) {
+        self.position_snapshot
+            .lock()
+            .expect(MUTEX_POISONED)
+            .skipped_market_ids = None;
+    }
+
+    /// Replace the cache and coverage from an `account_all_positions` snapshot
     /// and return the instrument ids that were present before but absent
     /// after. The caller is expected to emit a flat
     /// [`PositionStatusReport`] for each removed instrument; otherwise the
     /// execution engine won't observe externally-closed positions.
-    /// Instruments absent from `snapshot` are evicted; an empty input
-    /// clears the cache entirely.
-    pub(crate) fn replace_positions(&self, snapshot: &[PositionStatusReport]) -> Vec<InstrumentId> {
-        let mut guard = self.last_positions.lock().expect(MUTEX_POISONED);
-        let new_ids: ahash::AHashSet<InstrumentId> =
-            snapshot.iter().map(|r| r.instrument_id).collect();
-        let removed: Vec<InstrumentId> = guard
-            .keys()
-            .filter(|id| !new_ids.contains(id))
-            .copied()
-            .collect();
-        guard.clear();
-        for report in snapshot {
-            guard.insert(report.instrument_id, report.clone());
+    /// Instruments absent from `reports` are evicted unless retained because
+    /// their venue rows were skipped. An empty report set clears the cache
+    /// when no instrument is retained.
+    pub(crate) fn replace_position_snapshot(
+        &self,
+        reports: &[PositionStatusReport],
+        retained: &[InstrumentId],
+        skipped_market_ids: &[i16],
+    ) -> Vec<InstrumentId> {
+        let mut snapshot = self.position_snapshot.lock().expect(MUTEX_POISONED);
+        let removed = replace_position_reports(&mut snapshot.reports, reports, retained);
+        snapshot.skipped_market_ids = Some(skipped_market_ids.iter().copied().collect());
+        removed
+    }
+
+    /// Apply live position updates without evicting instruments omitted from the frame.
+    /// The caller must emit a flat report for every returned removed instrument.
+    pub(crate) fn apply_position_update(
+        &self,
+        reports: &[PositionStatusReport],
+        closed: &[InstrumentId],
+        covered_market_ids: &[i16],
+        skipped_market_ids: &[i16],
+    ) -> Vec<InstrumentId> {
+        let mut snapshot = self.position_snapshot.lock().expect(MUTEX_POISONED);
+        let removed = update_position_reports(&mut snapshot.reports, reports, closed);
+        if let Some(skipped) = snapshot.skipped_market_ids.as_mut() {
+            for market_id in covered_market_ids {
+                skipped.remove(market_id);
+            }
+            skipped.extend(skipped_market_ids.iter().copied());
         }
         removed
     }
 
-    /// Snapshot the cached positions, optionally filtered by instrument.
-    pub(crate) fn snapshot_positions(
+    /// Snapshot cached position reports and their coverage under one lock.
+    pub(crate) fn snapshot_positions_with_coverage(
         &self,
-        instrument_id: Option<InstrumentId>,
-    ) -> Vec<PositionStatusReport> {
-        let guard = self.last_positions.lock().expect(MUTEX_POISONED);
-        match instrument_id {
-            Some(id) => guard.get(&id).cloned().map(|r| vec![r]).unwrap_or_default(),
-            None => guard.values().cloned().collect(),
-        }
+    ) -> (Vec<PositionStatusReport>, Option<AHashSet<i16>>) {
+        let snapshot = self.position_snapshot.lock().expect(MUTEX_POISONED);
+        (
+            snapshot.reports.values().cloned().collect(),
+            snapshot.skipped_market_ids.clone(),
+        )
     }
+}
+
+fn replace_position_reports(
+    current: &mut AHashMap<InstrumentId, PositionStatusReport>,
+    snapshot: &[PositionStatusReport],
+    retained: &[InstrumentId],
+) -> Vec<InstrumentId> {
+    let new_ids: AHashSet<InstrumentId> = snapshot.iter().map(|r| r.instrument_id).collect();
+    let retained_ids: AHashSet<InstrumentId> = retained.iter().copied().collect();
+    let removed: Vec<InstrumentId> = current
+        .keys()
+        .filter(|id| !new_ids.contains(id) && !retained_ids.contains(id))
+        .copied()
+        .collect();
+
+    current.retain(|id, _| retained_ids.contains(id));
+    for report in snapshot {
+        current.insert(report.instrument_id, report.clone());
+    }
+    removed
+}
+
+fn update_position_reports(
+    current: &mut AHashMap<InstrumentId, PositionStatusReport>,
+    updates: &[PositionStatusReport],
+    closed: &[InstrumentId],
+) -> Vec<InstrumentId> {
+    let removed = closed
+        .iter()
+        .filter_map(|instrument_id| current.remove(instrument_id).map(|_| *instrument_id))
+        .collect();
+
+    for report in updates {
+        current.insert(report.instrument_id, report.clone());
+    }
+    removed
 }
 
 /// Standalone derivation so the fixed-seed contract is testable without
@@ -815,7 +1664,7 @@ pub(crate) fn derive_client_order_index_static(cloid: &ClientOrderId) -> i64 {
     // with `21727 invalid client order index`; the venue's accepted range
     // is not documented but observed empirically. Using a smaller window
     // also keeps collision risk negligible at session scale.
-    i64::from(h as u32 & 0x7FFF_FFFF)
+    i64::from(h as u32 & CLOID_INDEX_MAX)
 }
 
 /// Linear probe: advance the candidate index by 1, wrapping inside the
@@ -823,85 +1672,19 @@ pub(crate) fn derive_client_order_index_static(cloid: &ClientOrderId) -> i64 {
 /// when the derived index collides with another in-flight cloid.
 fn next_probe_index(candidate: i64) -> i64 {
     let next = candidate.wrapping_add(1);
-    if (0..=0x7FFF_FFFF).contains(&next) {
+    if (0..=i64::from(CLOID_INDEX_MAX)).contains(&next) {
         next
     } else {
         0
     }
 }
 
-/// Translate the venue's i64-string echo back to the originating Nautilus
-/// cloid, when the index is one we registered at submit time.
-pub(crate) fn translate_order_cloid(
-    mut report: OrderStatusReport,
-    cloid_map: &Arc<DashMap<i64, ClientOrderId>>,
-) -> OrderStatusReport {
-    if let Some(cloid_str) = report.client_order_id.as_ref()
-        && let Ok(index) = cloid_str.as_str().parse::<i64>()
-        && let Some(entry) = cloid_map.get(&index)
-    {
-        report = report.with_client_order_id(*entry.value());
-    }
-    report
-}
-
-/// Resolve the originating Nautilus [`ClientOrderId`] for a venue-echoed
-/// client id string, applying the `cloid_map` reverse-translation.
-///
-/// Returns `None` for empty / sentinel `"0"` values (the venue's placeholder
-/// for an external order that did not carry a `client_order_index`).
-/// Returns the mapped Nautilus cloid when the string parses to an `i64`
-/// known to [`WsDispatchState::cloid_map`]. Otherwise wraps the raw string
-/// as a [`ClientOrderId`] so untracked / externally-managed orders still
-/// surface a stable identifier on the report.
-pub(crate) fn resolve_cloid(
-    raw: &str,
-    cloid_map: &Arc<DashMap<i64, ClientOrderId>>,
-) -> Option<ClientOrderId> {
-    if raw.is_empty() || raw == "0" {
-        return None;
-    }
-
-    if let Ok(index) = raw.parse::<i64>()
-        && let Some(entry) = cloid_map.get(&index)
-    {
-        return Some(*entry.value());
-    }
-
-    Some(ClientOrderId::new(raw))
-}
-
-/// Translate the venue-side `client_order_index` echo on a [`FillReport`]
-/// back to the originating Nautilus cloid, mirroring [`translate_order_cloid`].
-///
-/// Lighter exposes the same numeric `client_order_index` in the trade
-/// payload's bid/ask client ids that order reports expose. Without
-/// translation, a fill that races ahead of the matching order accept is
-/// reconciled against the numeric id and would surface as an external order
-/// rather than the original [`ClientOrderId`].
-pub(crate) fn translate_fill_cloid(
-    mut report: FillReport,
-    cloid_map: &Arc<DashMap<i64, ClientOrderId>>,
-) -> FillReport {
-    if let Some(cloid_str) = report.client_order_id.as_ref()
-        && let Ok(index) = cloid_str.as_str().parse::<i64>()
-        && let Some(entry) = cloid_map.get(&index)
-    {
-        report.client_order_id = Some(*entry.value());
-    }
-    report
-}
-
 /// Drops the `ClientOrderId → VenueOrderId` mapping for an order that has
 /// reached a terminal status, since cancel/modify can no longer act on it.
 ///
-/// `cloid_map` is intentionally NOT evicted here. A terminal-status frame
-/// (`Filled` in particular) can land before the matching `account_all_trades`
-/// frame; if we drop the cloid → numeric-index mapping at terminal time, the
-/// trailing fill loses its Nautilus cloid and surfaces as an external order.
-/// The `cloid_map` continues to grow with one entry per submitted order; for
-/// long-running sessions that is bounded by submission rate × session
-/// length and can be capped by an LRU policy in a follow-up.
+/// The dispatch path separately moves terminal identity into the bounded
+/// replay cache. That cache keeps the probed client index available when a
+/// terminal status arrives before its trailing `account_all_trades` frame.
 pub(crate) fn evict_terminal_mappings(
     report: &OrderStatusReport,
     venue_id_map: &Arc<DashMap<ClientOrderId, VenueOrderId>>,
@@ -927,7 +1710,8 @@ pub(crate) fn cache_instruments_for_reports(instruments: &[InstrumentAny]) {
 
 /// Convert a Lighter HTTP `LighterOrder` into a Nautilus
 /// [`OrderStatusReport`], reusing the WS-side parser once the instrument has
-/// been resolved out of the process-global cache.
+/// been resolved out of the process-global cache. Order timestamps are
+/// normalized inside the parser for either seconds or milliseconds input.
 ///
 /// Translates the venue's numeric `client_order_index` echo back to the
 /// originating Nautilus [`ClientOrderId`] when available, so HTTP-driven
@@ -937,7 +1721,6 @@ pub(crate) fn parse_http_order_to_report(
     registry: &Arc<MarketRegistry>,
     account_id: AccountId,
     ts_init: UnixNanos,
-    cloid_map: &Arc<DashMap<i64, ClientOrderId>>,
 ) -> Option<OrderStatusReport> {
     let instrument_id = registry.instrument_id(order.market_index)?;
     let instrument = match LIGHTER_INSTRUMENT_CACHE.get(&instrument_id) {
@@ -949,7 +1732,7 @@ pub(crate) fn parse_http_order_to_report(
     };
 
     match parse_ws_order_status_report(order, &instrument, account_id, ts_init) {
-        Ok(report) => Some(translate_order_cloid(report, cloid_map)),
+        Ok(report) => Some(report),
         Err(e) => {
             log::warn!(
                 "parse_http_order_to_report: parse failed for order_index={}: {e}",
@@ -960,13 +1743,70 @@ pub(crate) fn parse_http_order_to_report(
     }
 }
 
-/// Look up a single order via the active+inactive HTTP endpoints, returning
+/// Look up an acknowledged create by its exact client index and submission nonce.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "exact create identity and report context cross the REST translation boundary"
+)]
+pub(crate) async fn lookup_create_order_status_report(
+    http_client: &LighterHttpClient,
+    registry: &Arc<MarketRegistry>,
+    credential: &Credential,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    client_order_index: i64,
+    nonce: i64,
+    dispatch: &WsDispatchState,
+    clock: &'static AtomicTime,
+) -> anyhow::Result<Option<OrderStatusReport>> {
+    let market_index = registry
+        .market_index(&instrument_id)
+        .ok_or_else(|| anyhow::anyhow!("no Lighter market_index for instrument {instrument_id}"))?;
+    let auth = mint_auth_token(credential)?;
+    let active = http_client
+        .get_account_active_orders(&LighterAccountActiveOrdersQuery {
+            authorization: None,
+            auth: Some(auth),
+            account_index: credential.account_index(),
+            market_id: market_index,
+        })
+        .await
+        .context("failed to fetch Lighter active orders")?;
+
+    let mut matches = active
+        .orders
+        .iter()
+        .filter(|order| order.client_order_index == client_order_index && order.nonce == nonce);
+    let Some(order) = matches.next() else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        matches.next().is_none(),
+        "ambiguous Lighter active-order lookup for client_order_index {client_order_index} and nonce {nonce}",
+    );
+
+    let report = parse_http_order_to_report(order, registry, account_id, clock.get_time_ns())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to parse Lighter active order {} for acknowledged create",
+                order.order_index,
+            )
+        })?;
+    let report = dispatch
+        .translate_order_cloid(report)
+        .with_client_order_id(client_order_id);
+    Ok(Some(dispatch.preserve_pending_order_status(report)))
+}
+
+/// Look up a single order via the active and inactive HTTP endpoints, returning
 /// the corresponding [`OrderStatusReport`] if found.
 ///
 /// Resolution order: explicit `venue_order_id` > cached `venue_id_map` >
 /// derived `client_order_index` from `dispatch.derive_client_order_index`.
-/// The third path is what makes `query_order` work between submission and
-/// the venue's first `account_*` ack (when `venue_id_map` is still empty).
+/// The third path is active-order only. It makes `query_order` work between
+/// submission and the venue's first `account_*` ack, while avoiding ambiguous
+/// terminal history where Lighter can reuse client indexes.
 #[expect(
     clippy::too_many_arguments,
     reason = "translation helper that threads context to the parser without a wrapper struct"
@@ -997,23 +1837,19 @@ pub(crate) async fn lookup_order_status_report(
                 .and_then(|cloid| dispatch.lookup_venue_order_id(cloid))
                 .and_then(|voi| voi.as_str().parse::<i64>().ok())
         });
-    let target_client_index: Option<i64> =
-        client_order_id.map(|cloid| dispatch.derive_client_order_index(cloid));
+    let target_client_index: Option<i64> = client_order_id.map(|cloid| {
+        dispatch
+            .client_order_index(cloid)
+            .unwrap_or_else(|| dispatch.derive_client_order_index(cloid))
+    });
 
-    let matches_order = |o: &LighterOrder| -> bool {
-        if let Some(voi) = target_venue_index
-            && o.order_index == voi
-        {
-            return true;
-        }
-
-        if let Some(client_index) = target_client_index
-            && o.client_order_index == client_index
-        {
-            return true;
-        }
-
-        false
+    let matches_order = |o: &LighterOrder| {
+        order_matches_lookup(
+            o.order_index,
+            o.client_order_index,
+            target_venue_index,
+            target_client_index,
+        )
     };
 
     let auth = mint_auth_token(credential)?;
@@ -1030,9 +1866,15 @@ pub(crate) async fn lookup_order_status_report(
     let ts_init = clock.get_time_ns();
     let supplied_cloid = client_order_id.copied();
 
-    let finalize = |order: &LighterOrder| -> Option<OrderStatusReport> {
-        let mut report =
-            parse_http_order_to_report(order, registry, account_id, ts_init, &dispatch.cloid_map)?;
+    let finalize = |order: &LighterOrder| -> anyhow::Result<OrderStatusReport> {
+        let report =
+            parse_http_order_to_report(order, registry, account_id, ts_init).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "failed to parse matching Lighter order {} for market_index={market_index}",
+                    order.order_id,
+                )
+            })?;
+        let mut report = dispatch.translate_order_cloid(report);
         // Substitute the caller-supplied cloid whenever it positively
         // identifies this order: when the order's
         // `client_order_index` equals the deterministic derivation from
@@ -1051,23 +1893,41 @@ pub(crate) async fn lookup_order_status_report(
         {
             report = report.with_client_order_id(cloid);
         }
-        Some(report)
+        Ok(dispatch.preserve_pending_order_status(report))
     };
 
-    for order in &active.orders {
-        if matches_order(order)
-            && let Some(report) = finalize(order)
-        {
-            return Ok(Some(report));
-        }
+    let mut active_matches = active.orders.iter().filter(|order| matches_order(order));
+    let active_match = active_matches.next();
+
+    if target_venue_index.is_none() {
+        anyhow::ensure!(
+            active_matches.next().is_none(),
+            "ambiguous Lighter active-order lookup for client_order_index {}",
+            target_client_index.unwrap_or_default(),
+        );
+    }
+
+    if let Some(order) = active_match {
+        return finalize(order).map(Some);
+    }
+
+    if target_venue_index.is_none() {
+        return Ok(None);
     }
 
     // Fall back to inactive orders (filled / canceled). Pagination is followed
     // because a single market can hold more than 200 historical inactive
     // orders for a long-running account.
     let mut cursor: Option<String> = None;
+    let mut seen_cursors = AHashSet::new();
+    let mut pages = 0_usize;
 
     loop {
+        pages += 1;
+        anyhow::ensure!(
+            pages <= MAX_RECONCILIATION_PAGES,
+            "Lighter inactive-order lookup exceeded {MAX_RECONCILIATION_PAGES} pages",
+        );
         let inactive = http_client
             .get_account_inactive_orders(&LighterAccountInactiveOrdersQuery {
                 authorization: None,
@@ -1083,20 +1943,36 @@ pub(crate) async fn lookup_order_status_report(
             .context("failed to fetch Lighter inactive orders")?;
 
         for order in &inactive.orders {
-            if matches_order(order)
-                && let Some(report) = finalize(order)
-            {
-                return Ok(Some(report));
+            if matches_order(order) {
+                return finalize(order).map(Some);
             }
         }
 
         match inactive.next_cursor {
-            Some(next) if !next.is_empty() => cursor = Some(next),
+            Some(next) if !next.is_empty() => {
+                anyhow::ensure!(
+                    seen_cursors.insert(next.clone()),
+                    "Lighter inactive-order lookup repeated cursor `{next}`",
+                );
+                cursor = Some(next);
+            }
             _ => break,
         }
     }
 
     Ok(None)
+}
+
+fn order_matches_lookup(
+    order_index: i64,
+    client_order_index: i64,
+    target_venue_index: Option<i64>,
+    target_client_index: Option<i64>,
+) -> bool {
+    match target_venue_index {
+        Some(target) => order_index == target,
+        None => target_client_index == Some(client_order_index),
+    }
 }
 
 fn mint_auth_token(credential: &Credential) -> anyhow::Result<String> {
@@ -1187,7 +2063,8 @@ pub(crate) fn nautilus_to_lighter_order_type(
 /// - Conditional orders: positive expiry from `GTD` or the default GTC window.
 ///   Lighter uses `TimeInForce` as the post-trigger execution instruction,
 ///   while `OrderExpiry` controls how long the trigger can rest.
-/// - `Gtd` with an explicit expire_time: the millisecond timestamp.
+/// - `Gtd` with an explicit expire_time: the millisecond timestamp, provided
+///   it is within the venue's 5-minute to 30-day lifetime range.
 /// - `Ioc` / `Fok`: `ORDER_EXPIRY_IOC` (`0`): Lighter requires this exact
 ///   value for IOC semantics; any other value is rejected by the sequencer.
 /// - `Gtc` / `Day` / `Gtd` without expiry: `now_ms + ORDER_EXPIRY_DEFAULT_GTC_MS`.
@@ -1197,26 +2074,37 @@ pub(crate) fn order_expiry_for(
     tif: &TimeInForce,
     expire_time: Option<UnixNanos>,
     now_ms: i64,
-) -> i64 {
+) -> anyhow::Result<i64> {
     if order_type == OrderType::Market {
-        return ORDER_EXPIRY_IOC;
+        return Ok(ORDER_EXPIRY_IOC);
     }
 
     if matches!(tif, TimeInForce::Gtd)
         && let Some(ts) = expire_time
     {
-        return (ts.as_u64() / 1_000_000) as i64;
+        let expiry_ms = (ts.as_u64() / 1_000_000) as i64;
+        let min_expiry_ms = now_ms.saturating_add(ORDER_EXPIRY_MIN_GTD_MS);
+        let max_expiry_ms = now_ms.saturating_add(ORDER_EXPIRY_MAX_GTD_MS);
+        anyhow::ensure!(
+            expiry_ms >= min_expiry_ms,
+            "Lighter GTD expire_time must be at least 5 minutes from now (plus 1 second transport margin)",
+        );
+        anyhow::ensure!(
+            expiry_ms <= max_expiry_ms,
+            "Lighter GTD expire_time must be no more than 30 days from now",
+        );
+        return Ok(expiry_ms);
     }
 
     if is_conditional_order(order_type) && matches!(tif, TimeInForce::Ioc) {
-        return now_ms.saturating_add(ORDER_EXPIRY_DEFAULT_GTC_MS);
+        return Ok(now_ms.saturating_add(ORDER_EXPIRY_DEFAULT_GTC_MS));
     }
 
     if matches!(tif, TimeInForce::Ioc | TimeInForce::Fok) {
-        return ORDER_EXPIRY_IOC;
+        return Ok(ORDER_EXPIRY_IOC);
     }
 
-    now_ms.saturating_add(ORDER_EXPIRY_DEFAULT_GTC_MS)
+    Ok(now_ms.saturating_add(ORDER_EXPIRY_DEFAULT_GTC_MS))
 }
 
 fn is_conditional_market_order(order_type: OrderType) -> bool {
@@ -1304,32 +2192,13 @@ pub(crate) fn derive_market_order_price_ticks(
     })
 }
 
-/// Degrade an `Err` sub-report to an empty `Vec` after logging the full
-/// chain at WARN. Deliberate: a transient REST failure on one category
-/// must not blank out the others. Visibility comes from the `{e:#}` log,
-/// not from the returned `ExecutionMassStatus`.
-pub(crate) fn unwrap_reports_or_warn<T>(label: &str, result: anyhow::Result<Vec<T>>) -> Vec<T> {
-    match result {
-        Ok(reports) => reports,
-        Err(e) => {
-            log::warn!(
-                "Lighter mass-status: {label} reports failed: {}",
-                scrub_auth(&format!("{e:#}")),
-            );
-            Vec::new()
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
 
     use nautilus_core::UUID4;
     use nautilus_model::{
-        enums::{
-            AccountType, LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSideSpecified,
-        },
+        enums::{AccountType, LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide},
         identifiers::{AccountId, StrategyId, TradeId},
         orders::Order,
         reports::FillReport,
@@ -1353,7 +2222,7 @@ mod tests {
             InstrumentId::from("ETH-PERP.LIGHTER"),
             Some(ClientOrderId::new(client_order_id_str)),
             VenueOrderId::new("281476929510110"),
-            OrderSide::Sell,
+            OrderSide::Sell.into(),
             OrderType::Limit,
             TimeInForce::Gtc,
             OrderStatus::Accepted,
@@ -1376,7 +2245,7 @@ mod tests {
         PositionStatusReport::new(
             AccountId::from("LIGHTER-TEST"),
             InstrumentId::from(instrument),
-            PositionSideSpecified::Long,
+            PositionSide::Long,
             Quantity::from(qty),
             UnixNanos::from(1),
             UnixNanos::from(2),
@@ -1447,10 +2316,13 @@ mod tests {
                 .into_iter()
                 .map(|(instrument, qty)| stub_position_report(instrument, qty))
                 .collect();
-            state.replace_positions(&frame);
+            state.replace_position_snapshot(&frame, &[], &[]);
         }
 
-        let result = state.snapshot_positions(filter.map(InstrumentId::from));
+        let (mut result, _) = state.snapshot_positions_with_coverage();
+        if let Some(instrument_id) = filter.map(InstrumentId::from) {
+            result.retain(|report| report.instrument_id == instrument_id);
+        }
 
         let mut actual: Vec<(String, String)> = result
             .into_iter()
@@ -1470,25 +2342,106 @@ mod tests {
         // Anchors the contract the consumption loop relies on for the
         // `Reconnected` and `connect()` cache-drop paths.
         let state = WsDispatchState::new();
-        state.replace_positions(&[stub_position_report("ETH-PERP.LIGHTER", "1.0")]);
-        assert_eq!(state.snapshot_positions(None).len(), 1);
+        state.replace_position_snapshot(
+            &[stub_position_report("ETH-PERP.LIGHTER", "1.0")],
+            &[],
+            &[],
+        );
+        assert_eq!(state.snapshot_positions_with_coverage().0.len(), 1);
 
-        state.replace_positions(&[]);
+        state.replace_position_snapshot(&[], &[], &[]);
 
-        assert!(state.snapshot_positions(None).is_empty());
+        assert!(state.snapshot_positions_with_coverage().0.is_empty());
     }
 
     #[rstest]
-    fn unwrap_reports_or_warn_returns_inner_on_ok() {
-        let result: anyhow::Result<Vec<i32>> = Ok(vec![1, 2, 3]);
-        assert_eq!(unwrap_reports_or_warn("orders", result), vec![1, 2, 3]);
+    fn replace_positions_except_keeps_only_retained_absent_positions() {
+        let state = WsDispatchState::new();
+        state.replace_position_snapshot(
+            &[
+                stub_position_report("ETH-PERP.LIGHTER", "1.0"),
+                stub_position_report("BTC-PERP.LIGHTER", "2.0"),
+                stub_position_report("DOGE-PERP.LIGHTER", "4.0"),
+            ],
+            &[],
+            &[],
+        );
+
+        let removed = state.replace_position_snapshot(
+            &[stub_position_report("ETH-PERP.LIGHTER", "3.0")],
+            &[InstrumentId::from("BTC-PERP.LIGHTER")],
+            &[],
+        );
+
+        let mut actual: Vec<(String, String)> = state
+            .snapshot_positions_with_coverage()
+            .0
+            .into_iter()
+            .map(|r| (r.instrument_id.to_string(), r.quantity.to_string()))
+            .collect();
+        actual.sort();
+
+        assert_eq!(removed, vec![InstrumentId::from("DOGE-PERP.LIGHTER")]);
+        assert_eq!(
+            actual,
+            vec![
+                ("BTC-PERP.LIGHTER".to_string(), "2.0".to_string()),
+                ("ETH-PERP.LIGHTER".to_string(), "3.0".to_string()),
+            ],
+        );
     }
 
     #[rstest]
-    fn unwrap_reports_or_warn_returns_empty_on_err() {
-        let result: anyhow::Result<Vec<i32>> = Err(anyhow::anyhow!("boom"));
-        let out: Vec<i32> = unwrap_reports_or_warn("orders", result);
-        assert!(out.is_empty());
+    fn update_positions_merges_rows_and_removes_only_explicit_closures() {
+        let state = WsDispatchState::new();
+        state.replace_position_snapshot(
+            &[
+                stub_position_report("ETH-PERP.LIGHTER", "1.0"),
+                stub_position_report("BTC-PERP.LIGHTER", "2.0"),
+            ],
+            &[],
+            &[],
+        );
+
+        let removed = state.apply_position_update(
+            &[stub_position_report("ETH-PERP.LIGHTER", "3.0")],
+            &[InstrumentId::from("DOGE-PERP.LIGHTER")],
+            &[],
+            &[],
+        );
+
+        assert!(removed.is_empty());
+        let mut actual: Vec<(String, String)> = state
+            .snapshot_positions_with_coverage()
+            .0
+            .into_iter()
+            .map(|report| {
+                (
+                    report.instrument_id.to_string(),
+                    report.quantity.to_string(),
+                )
+            })
+            .collect();
+        actual.sort();
+        assert_eq!(
+            actual,
+            vec![
+                ("BTC-PERP.LIGHTER".to_string(), "2.0".to_string()),
+                ("ETH-PERP.LIGHTER".to_string(), "3.0".to_string()),
+            ],
+        );
+
+        let removed =
+            state.apply_position_update(&[], &[InstrumentId::from("BTC-PERP.LIGHTER")], &[], &[]);
+
+        assert_eq!(removed, vec![InstrumentId::from("BTC-PERP.LIGHTER")]);
+        let positions = state.snapshot_positions_with_coverage().0;
+        assert_eq!(positions.len(), 1);
+        assert_eq!(
+            positions[0].instrument_id,
+            InstrumentId::from("ETH-PERP.LIGHTER")
+        );
+        assert_eq!(positions[0].quantity, Quantity::from("3.0"));
     }
 
     #[rstest]
@@ -1527,7 +2480,7 @@ mod tests {
         let cid = cloid("ORDER-A");
         let derived = state.derive_client_order_index(&cid);
 
-        let chosen = state.register_cloid(derived, cid);
+        let chosen = state.register_cloid(derived, cid).unwrap();
 
         assert_eq!(chosen, derived);
         assert_eq!(state.cloid_map.get(&chosen).map(|e| *e.value()), Some(cid));
@@ -1542,8 +2495,8 @@ mod tests {
         let cid = cloid("ORDER-A");
         let derived = state.derive_client_order_index(&cid);
 
-        let first = state.register_cloid(derived, cid);
-        let second = state.register_cloid(derived, cid);
+        let first = state.register_cloid(derived, cid).unwrap();
+        let second = state.register_cloid(derived, cid).unwrap();
 
         assert_eq!(first, second);
         assert_eq!(state.cloid_map.len(), 1);
@@ -1561,7 +2514,7 @@ mod tests {
         let collision_index = 42;
         state.cloid_map.insert(collision_index, first_cid);
 
-        let chosen = state.register_cloid(collision_index, second_cid);
+        let chosen = state.register_cloid(collision_index, second_cid).unwrap();
 
         assert_ne!(
             chosen, collision_index,
@@ -1578,39 +2531,28 @@ mod tests {
     }
 
     #[rstest]
-    fn resolve_cloid_returns_mapped_cloid_for_known_index() {
-        let map: Arc<DashMap<i64, ClientOrderId>> = Arc::new(DashMap::new());
-        let original = cloid("MY-ORDER-001");
-        map.insert(42, original);
+    fn register_cloid_probe_exhaustion_preserves_existing_mappings() {
+        let state = WsDispatchState::new();
+        let initial_index = 42;
+        let existing: Vec<_> = (0..=CLOID_INDEX_PROBE_LIMIT)
+            .map(|attempt| {
+                let index = initial_index + i64::try_from(attempt).unwrap();
+                let cid = cloid(&format!("EXISTING-{attempt}"));
+                state.cloid_map.insert(index, cid);
+                (index, cid)
+            })
+            .collect();
 
-        let resolved = resolve_cloid("42", &map);
+        let result = state.register_cloid(initial_index, cloid("NEW-ORDER"));
 
-        assert_eq!(resolved, Some(original));
-    }
-
-    #[rstest]
-    fn resolve_cloid_returns_none_for_empty_or_zero() {
-        let map: Arc<DashMap<i64, ClientOrderId>> = Arc::new(DashMap::new());
-
-        assert_eq!(resolve_cloid("", &map), None);
-        assert_eq!(resolve_cloid("0", &map), None);
-    }
-
-    #[rstest]
-    fn resolve_cloid_wraps_unmapped_string_as_external_cloid() {
-        // An external order (numeric index we don't recognise, or a
-        // non-numeric cloid from a third party) should still surface a
-        // ClientOrderId so reconciliation can route it.
-        let map: Arc<DashMap<i64, ClientOrderId>> = Arc::new(DashMap::new());
-
-        assert_eq!(
-            resolve_cloid("9999", &map),
-            Some(ClientOrderId::new("9999"))
-        );
-        assert_eq!(
-            resolve_cloid("ext-order", &map),
-            Some(ClientOrderId::new("ext-order")),
-        );
+        assert!(result.is_err());
+        assert_eq!(state.cloid_map.len(), existing.len());
+        for (index, cid) in existing {
+            assert_eq!(
+                state.cloid_map.get(&index).map(|entry| *entry.value()),
+                Some(cid),
+            );
+        }
     }
 
     #[rstest]
@@ -1666,16 +2608,77 @@ mod tests {
     }
 
     #[rstest]
-    fn bounded_dedup_evicts_oldest_marker() {
-        let dedup = BoundedDedup::new(2);
+    fn trade_dedup_cache_evicts_oldest_marker() {
+        let dedup = TradeDedupCache::new(2);
+        let first = TradeId::new("1");
+        let second = TradeId::new("2");
+        let third = TradeId::new("3");
 
-        dedup.insert(1);
-        dedup.insert(2);
-        dedup.insert(3);
+        dedup.insert(first, TradeDedupSource::Live);
+        dedup.insert(second, TradeDedupSource::Live);
+        dedup.insert(third, TradeDedupSource::Live);
 
-        assert!(!dedup.contains(&1));
-        assert!(dedup.contains(&2));
-        assert!(dedup.contains(&3));
+        assert!(!dedup.contains(&first));
+        assert!(dedup.contains(&second));
+        assert!(dedup.contains(&third));
+    }
+
+    #[rstest]
+    fn retired_order_cache_evicts_oldest_identity_and_index() {
+        let cache = RetiredOrderCache::new(2);
+        let identities = [
+            (cloid("RETIRED-1"), 1),
+            (cloid("RETIRED-2"), 2),
+            (cloid("RETIRED-3"), 3),
+        ];
+
+        for (cid, index) in identities {
+            cache.insert(
+                cid,
+                OrderIdentity::new(
+                    InstrumentId::from("ETH-PERP.LIGHTER"),
+                    StrategyId::new("S-T"),
+                    OrderSide::Buy,
+                    OrderType::Limit,
+                    index,
+                ),
+            );
+        }
+
+        assert_eq!(cache.cloid_for_index(1), None);
+        assert!(cache.identity_for_cloid(&cloid("RETIRED-1")).is_none());
+        assert_eq!(cache.cloid_for_index(2), Some(cloid("RETIRED-2")));
+        assert_eq!(cache.cloid_for_index(3), Some(cloid("RETIRED-3")));
+    }
+
+    #[rstest]
+    fn register_cloid_does_not_reuse_retired_index() {
+        let state = WsDispatchState::new();
+        let retired = cloid("RETIRED");
+        let replacement = cloid("REPLACEMENT");
+        let retired_index = 42;
+
+        state.register_cloid(retired_index, retired).unwrap();
+        state.register_order_identity(
+            retired,
+            OrderIdentity::new(
+                InstrumentId::from("ETH-PERP.LIGHTER"),
+                StrategyId::new("S-T"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                retired_index,
+            ),
+        );
+        state.retire_order_identity(&retired);
+
+        let chosen = state.register_cloid(retired_index, replacement).unwrap();
+
+        assert_ne!(chosen, retired_index);
+        assert_eq!(
+            state.resolve_client_order_index(retired_index),
+            Some(retired)
+        );
+        assert_eq!(state.resolve_client_order_index(chosen), Some(replacement));
     }
 
     #[rstest]
@@ -1689,12 +2692,13 @@ mod tests {
 
         state.register_order_identity(
             cid,
-            OrderIdentity {
-                instrument_id: InstrumentId::from("ETH-PERP.LIGHTER"),
-                strategy_id: StrategyId::new("S-T"),
-                order_side: OrderSide::Buy,
-                order_type: OrderType::Limit,
-            },
+            OrderIdentity::new(
+                InstrumentId::from("ETH-PERP.LIGHTER"),
+                StrategyId::new("S-T"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                1,
+            ),
         );
         state.seed_accepted_from_report(&report);
 
@@ -1716,12 +2720,13 @@ mod tests {
         let cid = ClientOrderId::new(format!("REPORT-{status:?}"));
         state.register_order_identity(
             cid,
-            OrderIdentity {
-                instrument_id: InstrumentId::from("ETH-PERP.LIGHTER"),
-                strategy_id: StrategyId::new("S-T"),
-                order_side: OrderSide::Buy,
-                order_type: OrderType::Limit,
-            },
+            OrderIdentity::new(
+                InstrumentId::from("ETH-PERP.LIGHTER"),
+                StrategyId::new("S-T"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                1,
+            ),
         );
 
         let mut report = stub_open_order_status_report(cid.as_str());
@@ -1737,12 +2742,13 @@ mod tests {
         let cid = cloid("REPORT-REJECTED");
         state.register_order_identity(
             cid,
-            OrderIdentity {
-                instrument_id: InstrumentId::from("ETH-PERP.LIGHTER"),
-                strategy_id: StrategyId::new("S-T"),
-                order_side: OrderSide::Buy,
-                order_type: OrderType::Limit,
-            },
+            OrderIdentity::new(
+                InstrumentId::from("ETH-PERP.LIGHTER"),
+                StrategyId::new("S-T"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                1,
+            ),
         );
 
         let mut report = stub_open_order_status_report(cid.as_str());
@@ -1753,17 +2759,56 @@ mod tests {
     }
 
     #[rstest]
+    fn accepted_state_survives_more_than_ten_thousand_newer_orders() {
+        let state = WsDispatchState::new();
+        let early = cloid("EARLY-RESTING-ORDER");
+        state.register_order_identity(
+            early,
+            OrderIdentity::new(
+                InstrumentId::from("ETH-PERP.LIGHTER"),
+                StrategyId::new("S-T"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                1,
+            ),
+        );
+        assert!(state.claim_accepted_emission(&early));
+
+        for index in 2..=10_002 {
+            let newer = ClientOrderId::new(format!("NEWER-{index}"));
+            state.register_order_identity(
+                newer,
+                OrderIdentity::new(
+                    InstrumentId::from("ETH-PERP.LIGHTER"),
+                    StrategyId::new("S-T"),
+                    OrderSide::Buy,
+                    OrderType::Limit,
+                    index,
+                ),
+            );
+            assert!(state.claim_accepted_emission(&newer));
+        }
+
+        assert!(state.accepted_was_emitted(&early));
+        assert!(
+            !state.claim_accepted_emission(&early),
+            "the still-active early order must not emit a second OrderAccepted",
+        );
+    }
+
+    #[rstest]
     fn seed_accepted_from_report_marks_submitted_report() {
         let state = WsDispatchState::new();
         let cid = cloid("REPORT-SUBMITTED");
         state.register_order_identity(
             cid,
-            OrderIdentity {
-                instrument_id: InstrumentId::from("ETH-PERP.LIGHTER"),
-                strategy_id: StrategyId::new("S-T"),
-                order_side: OrderSide::Buy,
-                order_type: OrderType::Limit,
-            },
+            OrderIdentity::new(
+                InstrumentId::from("ETH-PERP.LIGHTER"),
+                StrategyId::new("S-T"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                1,
+            ),
         );
 
         let mut report = stub_open_order_status_report(cid.as_str());
@@ -1775,17 +2820,18 @@ mod tests {
 
     #[rstest]
     fn forget_order_identity_clears_snapshot_and_triggered() {
-        // A terminal event must clear the snapshot and the triggered
-        // dedup. The accepted marker is live-order state and leaves the
-        // bounded cache at terminal cleanup.
+        // Failed dispatch cleanup clears all per-order state. Terminal venue
+        // events use `retire_order_identity` instead so trailing fills retain
+        // their identity and accepted marker.
         let state = WsDispatchState::new();
         let cid = cloid("TERMINAL-CLEANUP");
-        let identity = OrderIdentity {
-            instrument_id: InstrumentId::from("ETH-PERP.LIGHTER"),
-            strategy_id: StrategyId::new("S-T"),
-            order_side: OrderSide::Buy,
-            order_type: OrderType::Limit,
-        };
+        let identity = OrderIdentity::new(
+            InstrumentId::from("ETH-PERP.LIGHTER"),
+            StrategyId::new("S-T"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            1,
+        );
 
         state.register_order_identity(cid, identity);
         state.mark_accepted_emitted(cid);
@@ -1822,12 +2868,13 @@ mod tests {
     fn order_identity_lifecycle_register_then_forget() {
         let state = WsDispatchState::new();
         let cid = cloid("ORDER-LIFECYCLE");
-        let identity = OrderIdentity {
-            instrument_id: InstrumentId::from("ETH-PERP.LIGHTER"),
-            strategy_id: StrategyId::new("S-T"),
-            order_side: OrderSide::Buy,
-            order_type: OrderType::Limit,
-        };
+        let identity = OrderIdentity::new(
+            InstrumentId::from("ETH-PERP.LIGHTER"),
+            StrategyId::new("S-T"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            1,
+        );
 
         state.register_order_identity(cid, identity);
         assert!(state.order_identities.contains_key(&cid));
@@ -1841,38 +2888,183 @@ mod tests {
     }
 
     #[rstest]
+    fn stale_create_rejection_preserves_replacement_generation() {
+        let state = WsDispatchState::new();
+        let cid = cloid("CREATE-GENERATION");
+        let index = 42;
+        state.register_cloid(index, cid).unwrap();
+        state.register_order_identity(
+            cid,
+            OrderIdentity::new(
+                InstrumentId::from("ETH-PERP.LIGHTER"),
+                StrategyId::new("S-T"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                index,
+            ),
+        );
+        state.mark_order_submission(&cid, 10);
+
+        state.register_order_identity(
+            cid,
+            OrderIdentity::new(
+                InstrumentId::from("ETH-PERP.LIGHTER"),
+                StrategyId::new("S-T"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                index,
+            ),
+        );
+        state.mark_order_submission(&cid, 11);
+
+        assert!(!state.observe_create_submission(&cid, index, 10, voi("281476929510110")));
+        assert!(state.lookup_venue_order_id(&cid).is_none());
+        assert!(!state.reject_create_submission(&cid, index, 10, None));
+        assert!(state.cloid_map.contains_key(&index));
+        assert!(state.create_submission_is_pending(&cid, index, 11));
+        let reconnected_epoch = AtomicU64::new(1);
+        assert!(!state.reject_create_submission(&cid, index, 11, Some((&reconnected_epoch, 0)),));
+        assert!(state.create_submission_is_pending(&cid, index, 11));
+        assert!(state.reject_create_submission(&cid, index, 11, None));
+        assert!(!state.cloid_map.contains_key(&index));
+        assert!(state.order_identity(&cid).is_none());
+    }
+
+    #[rstest]
     fn translate_order_cloid_substitutes_known_index() {
-        let map: Arc<DashMap<i64, ClientOrderId>> = Arc::new(DashMap::new());
+        let state = WsDispatchState::new();
         let original = cloid("MY-ORDER-001");
-        map.insert(42, original);
+        state.register_cloid(42, original).unwrap();
+        state.register_order_identity(
+            original,
+            OrderIdentity::new(
+                InstrumentId::from("ETH-PERP.LIGHTER"),
+                StrategyId::new("S-T"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                42,
+            ),
+        );
+        state.mark_order_submission(&original, 9);
 
         let report = stub_open_order_status_report("42");
-        let translated = translate_order_cloid(report, &map);
+        assert_eq!(
+            state.resolve_live_order_cloid("42", report.venue_order_id),
+            Some(original),
+        );
+        let translated = state.translate_order_cloid(report);
 
         assert_eq!(translated.client_order_id, Some(original));
     }
 
     #[rstest]
-    fn translate_order_cloid_passes_through_unknown_index() {
-        let map: Arc<DashMap<i64, ClientOrderId>> = Arc::new(DashMap::new());
+    fn translate_order_cloid_uses_venue_id_for_unknown_index() {
+        let state = WsDispatchState::new();
         let report = stub_open_order_status_report("99");
-        let translated = translate_order_cloid(report, &map);
+        let translated = state.translate_order_cloid(report);
 
         assert_eq!(
             translated.client_order_id.map(|c| c.to_string()),
-            Some("99".to_string()),
+            Some("281476929510110".to_string()),
         );
     }
 
     #[rstest]
     fn translate_order_cloid_passes_through_non_integer_cloid() {
-        let map: Arc<DashMap<i64, ClientOrderId>> = Arc::new(DashMap::new());
+        let state = WsDispatchState::new();
         let report = stub_open_order_status_report("not-an-int");
-        let translated = translate_order_cloid(report, &map);
+        let translated = state.translate_order_cloid(report);
 
         assert_eq!(
             translated.client_order_id.map(|c| c.to_string()),
             Some("not-an-int".to_string()),
+        );
+    }
+
+    #[rstest]
+    #[case(
+        PendingOrderAction::Modify,
+        OrderStatus::Accepted,
+        OrderStatus::PendingUpdate
+    )]
+    #[case(
+        PendingOrderAction::Modify,
+        OrderStatus::Triggered,
+        OrderStatus::PendingUpdate
+    )]
+    #[case(
+        PendingOrderAction::Modify,
+        OrderStatus::PartiallyFilled,
+        OrderStatus::PendingUpdate
+    )]
+    #[case(
+        PendingOrderAction::Cancel,
+        OrderStatus::Accepted,
+        OrderStatus::PendingCancel
+    )]
+    #[case(
+        PendingOrderAction::Cancel,
+        OrderStatus::Triggered,
+        OrderStatus::PendingCancel
+    )]
+    #[case(
+        PendingOrderAction::Cancel,
+        OrderStatus::PartiallyFilled,
+        OrderStatus::PendingCancel
+    )]
+    fn preserve_pending_order_status_maps_working_report(
+        #[case] action: PendingOrderAction,
+        #[case] venue_status: OrderStatus,
+        #[case] expected: OrderStatus,
+    ) {
+        let state = WsDispatchState::new();
+        let cid = ClientOrderId::new(format!("PENDING-{action:?}-{venue_status:?}"));
+        state.set_pending_order_action(cid, action);
+        let mut report = stub_open_order_status_report(cid.as_str());
+        report.order_status = venue_status;
+
+        let preserved = state.preserve_pending_order_status(report);
+
+        assert_eq!(preserved.client_order_id, Some(cid));
+        assert_eq!(
+            preserved.venue_order_id,
+            VenueOrderId::new("281476929510110"),
+        );
+        assert_eq!(preserved.order_status, expected);
+        assert_eq!(preserved.quantity, Quantity::from("0.01"));
+        assert_eq!(preserved.price, None);
+        assert_eq!(preserved.trigger_price, None);
+        assert_eq!(state.pending_order_action(&cid), Some(action));
+    }
+
+    #[rstest]
+    fn preserve_pending_order_status_clears_terminal_action() {
+        let state = WsDispatchState::new();
+        let cid = cloid("PENDING-TERMINAL");
+        state.set_pending_order_action(cid, PendingOrderAction::Modify);
+        let mut report = stub_open_order_status_report(cid.as_str());
+        report.order_status = OrderStatus::Filled;
+
+        let preserved = state.preserve_pending_order_status(report);
+
+        assert_eq!(preserved.client_order_id, Some(cid));
+        assert_eq!(preserved.order_status, OrderStatus::Filled);
+        assert_eq!(preserved.quantity, Quantity::from("0.01"));
+        assert_eq!(preserved.price, None);
+        assert_eq!(preserved.trigger_price, None);
+        assert_eq!(state.pending_order_action(&cid), None);
+    }
+
+    #[rstest]
+    fn clear_pending_order_action_if_keeps_different_action() {
+        let state = WsDispatchState::new();
+        let cid = cloid("PENDING-DIFFERENT");
+        state.set_pending_order_action(cid, PendingOrderAction::Cancel);
+
+        assert!(!state.clear_pending_order_action_if(&cid, PendingOrderAction::Modify));
+        assert_eq!(
+            state.pending_order_action(&cid),
+            Some(PendingOrderAction::Cancel),
         );
     }
 
@@ -1896,45 +3088,113 @@ mod tests {
     }
 
     // Fill-side cloid translation mirrors the order-side path: a numeric
-    // client id that maps in `cloid_map` substitutes to the originating
-    // Nautilus cloid; unmapped numerics and non-integer ids pass through.
-    // Without these guards a fill that races ahead of the order accept
-    // would surface the venue's numeric `client_order_index` rather than
-    // the engine's `ClientOrderId`.
+    // client id substitutes to the originating Nautilus cloid only when the
+    // venue order id matches its bound identity. Unknown numerics use the
+    // venue order id because Lighter can reuse client indexes over time.
     #[rstest]
     fn translate_fill_cloid_substitutes_known_index() {
-        let map: Arc<DashMap<i64, ClientOrderId>> = Arc::new(DashMap::new());
+        let state = WsDispatchState::new();
         let original = cloid("MY-ORDER-001");
-        map.insert(42, original);
+        state.register_cloid(42, original).unwrap();
+        state.register_order_identity(
+            original,
+            OrderIdentity::new(
+                InstrumentId::from("ETH-PERP.LIGHTER"),
+                StrategyId::new("S-T"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                42,
+            ),
+        );
+        state.mark_order_submission(&original, 9);
 
         let report = stub_fill_report("42");
-        let translated = translate_fill_cloid(report, &map);
+        assert_eq!(
+            state.resolve_live_trade_cloid("42", report.venue_order_id),
+            Some(original),
+        );
+        let translated = state.translate_fill_cloid(report);
 
         assert_eq!(translated.client_order_id, Some(original));
     }
 
     #[rstest]
-    fn translate_fill_cloid_passes_through_unknown_index() {
-        let map: Arc<DashMap<i64, ClientOrderId>> = Arc::new(DashMap::new());
+    fn translate_fill_cloid_uses_venue_id_for_unknown_index() {
+        let state = WsDispatchState::new();
         let report = stub_fill_report("99");
-        let translated = translate_fill_cloid(report, &map);
+        let translated = state.translate_fill_cloid(report);
 
         assert_eq!(
             translated.client_order_id.map(|c| c.to_string()),
-            Some("99".to_string()),
+            Some("281476929510102".to_string()),
         );
     }
 
     #[rstest]
     fn translate_fill_cloid_passes_through_non_integer_cloid() {
-        let map: Arc<DashMap<i64, ClientOrderId>> = Arc::new(DashMap::new());
+        let state = WsDispatchState::new();
         let report = stub_fill_report("not-an-int");
-        let translated = translate_fill_cloid(report, &map);
+        let translated = state.translate_fill_cloid(report);
 
         assert_eq!(
             translated.client_order_id.map(|c| c.to_string()),
             Some("not-an-int".to_string()),
         );
+    }
+
+    #[rstest]
+    fn reused_unknown_index_produces_distinct_external_cloids() {
+        let state = WsDispatchState::new();
+        let first = state.translate_order_cloid(stub_open_order_status_report("99"));
+        let mut second_report = stub_open_order_status_report("99");
+        second_report.venue_order_id = VenueOrderId::new("281476929510111");
+        let second = state.translate_order_cloid(second_report);
+
+        assert_eq!(
+            first.client_order_id,
+            Some(ClientOrderId::new("281476929510110")),
+        );
+        assert_eq!(
+            second.client_order_id,
+            Some(ClientOrderId::new("281476929510111")),
+        );
+        assert_ne!(first.client_order_id, second.client_order_id);
+    }
+
+    #[rstest]
+    fn known_index_with_wrong_venue_id_uses_external_cloid() {
+        let state = WsDispatchState::new();
+        let original = cloid("MY-ORDER-001");
+        state.register_cloid(42, original).unwrap();
+        state.register_order_identity(
+            original,
+            OrderIdentity::new(
+                InstrumentId::from("ETH-PERP.LIGHTER"),
+                StrategyId::new("S-T"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                42,
+            ),
+        );
+        state.mark_order_submission(&original, 9);
+        assert_eq!(
+            state.resolve_live_order_cloid("42", VenueOrderId::new("281476929510109")),
+            Some(original),
+        );
+
+        let translated = state.translate_order_cloid(stub_open_order_status_report("42"));
+
+        assert_eq!(
+            translated.client_order_id,
+            Some(ClientOrderId::new("281476929510110")),
+        );
+    }
+
+    #[rstest]
+    fn explicit_venue_lookup_does_not_fall_through_to_client_index() {
+        assert!(!order_matches_lookup(100, 42, Some(101), Some(42)));
+        assert!(order_matches_lookup(101, 99, Some(101), Some(42)));
+        assert!(order_matches_lookup(100, 42, None, Some(42)));
     }
 
     #[rstest]
@@ -2068,11 +3328,26 @@ mod tests {
 
     #[rstest]
     fn order_expiry_for_gtd_with_expiry_returns_millis() {
-        let ts = UnixNanos::from(1_700_000_000_123_000_000u64);
+        let expiry_ms = NOW_MS + ORDER_EXPIRY_MIN_GTD_MS + 123;
+        let ts = UnixNanos::from((expiry_ms as u64) * 1_000_000);
         assert_eq!(
-            order_expiry_for(OrderType::Limit, &TimeInForce::Gtd, Some(ts), NOW_MS),
-            1_700_000_000_123
+            order_expiry_for(OrderType::Limit, &TimeInForce::Gtd, Some(ts), NOW_MS).unwrap(),
+            expiry_ms,
         );
+    }
+
+    #[rstest]
+    #[case::too_short(ORDER_EXPIRY_MIN_GTD_MS - 1, "at least 5 minutes")]
+    #[case::too_long(ORDER_EXPIRY_MAX_GTD_MS + 1, "no more than 30 days")]
+    fn order_expiry_for_rejects_gtd_outside_venue_range(
+        #[case] offset_ms: i64,
+        #[case] expected: &str,
+    ) {
+        let ts = UnixNanos::from(((NOW_MS + offset_ms) as u64) * 1_000_000);
+        let error =
+            order_expiry_for(OrderType::Limit, &TimeInForce::Gtd, Some(ts), NOW_MS).unwrap_err();
+
+        assert!(error.to_string().contains(expected));
     }
 
     #[rstest]
@@ -2084,7 +3359,7 @@ mod tests {
         #[case] expire: Option<UnixNanos>,
     ) {
         assert_eq!(
-            order_expiry_for(OrderType::Limit, &tif, expire, NOW_MS),
+            order_expiry_for(OrderType::Limit, &tif, expire, NOW_MS).unwrap(),
             NOW_MS + ORDER_EXPIRY_DEFAULT_GTC_MS,
         );
     }
@@ -2096,7 +3371,7 @@ mod tests {
         // Lighter requires `0` for IOC semantics; -1 is rejected as an
         // invalid expiry timestamp by the sequencer.
         assert_eq!(
-            order_expiry_for(OrderType::Limit, &tif, None, NOW_MS),
+            order_expiry_for(OrderType::Limit, &tif, None, NOW_MS).unwrap(),
             ORDER_EXPIRY_IOC
         );
     }
@@ -2104,7 +3379,7 @@ mod tests {
     #[rstest]
     fn order_expiry_for_market_orders_returns_zero() {
         assert_eq!(
-            order_expiry_for(OrderType::Market, &TimeInForce::Gtc, None, NOW_MS),
+            order_expiry_for(OrderType::Market, &TimeInForce::Gtc, None, NOW_MS).unwrap(),
             ORDER_EXPIRY_IOC
         );
     }
@@ -2116,7 +3391,7 @@ mod tests {
         #[case] order_type: OrderType,
     ) {
         assert_eq!(
-            order_expiry_for(order_type, &TimeInForce::Gtc, None, NOW_MS),
+            order_expiry_for(order_type, &TimeInForce::Gtc, None, NOW_MS).unwrap(),
             NOW_MS + ORDER_EXPIRY_DEFAULT_GTC_MS,
         );
     }
@@ -2127,10 +3402,11 @@ mod tests {
     fn order_expiry_for_conditional_market_gtd_with_expiry_returns_millis(
         #[case] order_type: OrderType,
     ) {
-        let ts = UnixNanos::from(1_700_000_000_456_000_000u64);
+        let expiry_ms = NOW_MS + ORDER_EXPIRY_MIN_GTD_MS + 456;
+        let ts = UnixNanos::from((expiry_ms as u64) * 1_000_000);
         assert_eq!(
-            order_expiry_for(order_type, &TimeInForce::Gtd, Some(ts), NOW_MS),
-            1_700_000_000_456,
+            order_expiry_for(order_type, &TimeInForce::Gtd, Some(ts), NOW_MS).unwrap(),
+            expiry_ms,
         );
     }
 
@@ -2139,7 +3415,7 @@ mod tests {
     #[case(OrderType::LimitIfTouched)]
     fn order_expiry_for_conditional_limit_ioc_uses_positive_expiry(#[case] order_type: OrderType) {
         assert_eq!(
-            order_expiry_for(order_type, &TimeInForce::Ioc, None, NOW_MS),
+            order_expiry_for(order_type, &TimeInForce::Ioc, None, NOW_MS).unwrap(),
             NOW_MS + ORDER_EXPIRY_DEFAULT_GTC_MS,
         );
     }
@@ -2177,10 +3453,10 @@ mod tests {
         let state = WsDispatchState::new();
         let prior_reports: Vec<PositionStatusReport> =
             prior.iter().map(|i| position_at(i)).collect();
-        state.replace_positions(&prior_reports);
+        state.replace_position_snapshot(&prior_reports, &[], &[]);
 
         let next_reports: Vec<PositionStatusReport> = next.iter().map(|i| position_at(i)).collect();
-        let mut removed = state.replace_positions(&next_reports);
+        let mut removed = state.replace_position_snapshot(&next_reports, &[], &[]);
         removed.sort();
         let mut expected: Vec<InstrumentId> = expected_removed
             .iter()
@@ -2221,7 +3497,7 @@ mod tests {
     // pushes well past i64::MAX so `decimal_trunc_to_i64` short-circuits.
     // A precision-0 quantity at 1e10 is well inside the Nautilus
     // `Quantity` raw cap (~3.4e29 with high-precision), but scaling by
-    // `10^16` pushes it to 1e26 — far past i64::MAX (~9.22e18). The
+    // `10^16` pushes it to 1e26 - far past i64::MAX (~9.22e18). The
     // wrapping `with_context` must surface the typed overflow message
     // rather than silently truncating.
     #[rstest]
@@ -2317,6 +3593,7 @@ mod tests {
             .quantity(Quantity::from("0.01"))
             .build();
         PendingSendTx {
+            connection_epoch: 0,
             kind: PendingSendTxKind::Create {
                 order: Box::new(order),
                 client_order_index: nonce,
@@ -2330,6 +3607,7 @@ mod tests {
 
     fn stub_pending_other(nonce: i64, submitted_at_ns: u64) -> PendingSendTx {
         PendingSendTx {
+            connection_epoch: 0,
             kind: PendingSendTxKind::Other,
             submitted_at: UnixNanos::from(submitted_at_ns),
             nonce,
@@ -2380,12 +3658,18 @@ mod tests {
         state.enqueue_pending_sendtx(stub_pending_create("A", 1, submitted_ns));
 
         let within = UnixNanos::from(submitted_ns + 500 * 1_000_000);
-        assert!(state.pop_pending_sendtx_within(within, 1_000).is_some());
+        assert!(
+            state
+                .pop_pending_sendtx_if_only_within(0, within, 1_000)
+                .is_some(),
+        );
 
         state.enqueue_pending_sendtx(stub_pending_create("B", 2, submitted_ns));
         let outside = UnixNanos::from(submitted_ns + 1_500 * 1_000_000);
         assert!(
-            state.pop_pending_sendtx_within(outside, 1_000).is_none(),
+            state
+                .pop_pending_sendtx_if_only_within(0, outside, 1_000)
+                .is_none(),
             "outside the attribution window the head must not pop",
         );
         assert_eq!(state.pending_sendtx_len(), 1, "head must remain queued");
@@ -2418,7 +3702,7 @@ mod tests {
         state.enqueue_pending_sendtx(stub_pending_other(11, now.as_u64() + 1));
 
         let removed = state
-            .remove_pending_sendtx_by_nonce(11)
+            .remove_pending_sendtx_by_nonce(0, 11)
             .expect("nonce 11 removed");
         assert!(matches!(removed.kind, PendingSendTxKind::Other));
         assert_eq!(removed.nonce, 11);
@@ -2439,18 +3723,18 @@ mod tests {
         state.enqueue_pending_sendtx(stub_pending_create("B", 12, now.as_u64() + 2));
 
         let removed = state
-            .remove_pending_sendtx_by_hash("hash0b")
+            .remove_pending_sendtx_by_hash(0, "hash0b")
             .expect("hash for nonce 11 removed");
         assert_eq!(removed.nonce, 11);
         assert_eq!(state.pending_sendtx_len(), 2);
 
         assert!(
-            state.remove_pending_sendtx_by_hash("hash0b").is_none(),
+            state.remove_pending_sendtx_by_hash(0, "hash0b").is_none(),
             "removed hash must not match again",
         );
 
         let upper = state
-            .remove_pending_sendtx_by_hash("0xHASH0C")
+            .remove_pending_sendtx_by_hash(0, "0xHASH0C")
             .expect("hash comparison is case-insensitive and prefix-tolerant");
         assert_eq!(pending_cloid(&upper), Some(cloid("B")));
 
@@ -2465,13 +3749,55 @@ mod tests {
         state.enqueue_pending_sendtx(stub_pending_create("A", 10, now.as_u64()));
         state.enqueue_pending_sendtx(stub_pending_other(11, now.as_u64() + 1));
 
-        let drained = state.drain_pending_sendtx();
+        let drained = state.drain_pending_sendtx(0);
 
         assert_eq!(drained.len(), 2);
         assert_eq!(drained[0].nonce, 10);
         assert_eq!(drained[1].nonce, 11);
         assert_eq!(state.pending_sendtx_len(), 0);
-        assert!(state.drain_pending_sendtx().is_empty());
+        assert!(state.drain_pending_sendtx(0).is_empty());
+    }
+
+    #[rstest]
+    fn reconnect_drain_keeps_replacement_epoch_enqueues_on_both_sides_of_cleanup() {
+        let state = WsDispatchState::new();
+        let mut disconnected = stub_pending_create("OLD", 10, 10);
+        disconnected.connection_epoch = 4;
+        let mut replacement_before_cleanup = stub_pending_other(11, 11);
+        replacement_before_cleanup.connection_epoch = 5;
+
+        state.enqueue_pending_sendtx(disconnected);
+        state.enqueue_pending_sendtx(replacement_before_cleanup);
+
+        let drained = state.drain_pending_sendtx(4);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].connection_epoch, 4);
+        assert_eq!(drained[0].nonce, 10);
+        assert_eq!(pending_cloid(&drained[0]), Some(cloid("OLD")));
+
+        {
+            let queue = state.pending_sendtx.lock().expect(MUTEX_POISONED);
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].connection_epoch, 5);
+            assert_eq!(queue[0].nonce, 11);
+            assert!(matches!(queue[0].kind, PendingSendTxKind::Other));
+        }
+
+        let mut replacement_after_cleanup = stub_pending_create("NEW", 12, 12);
+        replacement_after_cleanup.connection_epoch = 5;
+        state.enqueue_pending_sendtx(replacement_after_cleanup);
+
+        let queue = state.pending_sendtx.lock().expect(MUTEX_POISONED);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(
+            queue
+                .iter()
+                .map(|pending| (pending.connection_epoch, pending.nonce))
+                .collect::<Vec<_>>(),
+            vec![(5, 11), (5, 12)],
+        );
+        assert!(matches!(queue[0].kind, PendingSendTxKind::Other));
+        assert_eq!(pending_cloid(&queue[1]), Some(cloid("NEW")));
     }
 
     #[rstest]
@@ -2576,12 +3902,76 @@ mod tests {
         // positions from leaking past the strict-await gate when the
         // venue's initial `account_all_positions` frame is empty.
         let state = WsDispatchState::new();
-        state.replace_positions(&[stub_position_report("ETH-PERP.LIGHTER", "1.0")]);
-        assert!(!state.snapshot_positions(None).is_empty());
+        state.replace_position_snapshot(
+            &[stub_position_report("ETH-PERP.LIGHTER", "1.0")],
+            &[],
+            &[],
+        );
+        assert!(!state.snapshot_positions_with_coverage().0.is_empty());
 
         state.clear_position_cache();
 
-        assert!(state.snapshot_positions(None).is_empty());
+        let (reports, coverage) = state.snapshot_positions_with_coverage();
+        assert!(reports.is_empty());
+        assert_eq!(coverage, None);
+    }
+
+    #[rstest]
+    fn position_snapshot_coverage_requires_current_complete_market_row() {
+        let state = WsDispatchState::new();
+
+        assert_eq!(state.snapshot_positions_with_coverage().1, None);
+
+        state.replace_position_snapshot(&[], &[], &[]);
+        assert_eq!(
+            state.snapshot_positions_with_coverage().1,
+            Some(AHashSet::new()),
+        );
+
+        state.replace_position_snapshot(&[], &[], &[0]);
+        assert_eq!(
+            state.snapshot_positions_with_coverage().1,
+            Some(AHashSet::from_iter([0])),
+        );
+
+        state.apply_position_update(&[], &[], &[0], &[1]);
+        assert_eq!(
+            state.snapshot_positions_with_coverage().1,
+            Some(AHashSet::from_iter([1])),
+        );
+
+        state.apply_position_update(&[], &[], &[1], &[]);
+        assert_eq!(
+            state.snapshot_positions_with_coverage().1,
+            Some(AHashSet::new()),
+        );
+
+        state.invalidate_position_snapshot();
+        state.apply_position_update(&[], &[], &[0], &[]);
+        assert_eq!(state.snapshot_positions_with_coverage().1, None);
+    }
+
+    #[rstest]
+    fn position_snapshot_updates_reports_and_coverage_together() {
+        let state = WsDispatchState::new();
+        let initial = stub_position_report("ETH-PERP.LIGHTER", "1.0");
+
+        state.replace_position_snapshot(std::slice::from_ref(&initial), &[], &[1]);
+        let (reports, coverage) = state.snapshot_positions_with_coverage();
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].instrument_id, initial.instrument_id);
+        assert_eq!(reports[0].quantity, initial.quantity);
+        assert_eq!(coverage, Some(AHashSet::from_iter([1])));
+
+        let updated = stub_position_report("ETH-PERP.LIGHTER", "2.0");
+        state.apply_position_update(std::slice::from_ref(&updated), &[], &[1], &[2]);
+        let (reports, coverage) = state.snapshot_positions_with_coverage();
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].instrument_id, updated.instrument_id);
+        assert_eq!(reports[0].quantity, updated.quantity);
+        assert_eq!(coverage, Some(AHashSet::from_iter([2])));
     }
 
     #[rstest]

@@ -15,13 +15,14 @@
 
 //! Python bindings for execution engine and order emulator configuration.
 
+use nautilus_core::python::to_pyvalue_err;
 use nautilus_model::identifiers::ClientId;
-use pyo3::pymethods;
+use pyo3::{PyResult, pymethods};
 
 use crate::{engine::config::ExecutionEngineConfig, order_emulator::config::OrderEmulatorConfig};
 
-#[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
+#[pymethods]
 impl ExecutionEngineConfig {
     /// Configuration for `ExecutionEngine` instances.
     #[new]
@@ -32,6 +33,7 @@ impl ExecutionEngineConfig {
         snapshot_orders = None,
         snapshot_positions = None,
         snapshot_positions_interval_secs = None,
+        carry_replay_events_on_reopen = None,
         allow_overfills = None,
         external_clients = None,
         purge_closed_orders_interval_mins = None,
@@ -49,6 +51,7 @@ impl ExecutionEngineConfig {
         snapshot_orders: Option<bool>,
         snapshot_positions: Option<bool>,
         snapshot_positions_interval_secs: Option<f64>,
+        carry_replay_events_on_reopen: Option<bool>,
         allow_overfills: Option<bool>,
         external_clients: Option<Vec<ClientId>>,
         purge_closed_orders_interval_mins: Option<u32>,
@@ -59,13 +62,14 @@ impl ExecutionEngineConfig {
         purge_account_events_lookback_mins: Option<u32>,
         purge_from_database: Option<bool>,
         debug: Option<bool>,
-    ) -> Self {
+    ) -> PyResult<Self> {
         Self::builder()
             .maybe_load_cache(load_cache)
             .maybe_manage_own_order_books(manage_own_order_books)
             .maybe_snapshot_orders(snapshot_orders)
             .maybe_snapshot_positions(snapshot_positions)
             .maybe_snapshot_positions_interval_secs(snapshot_positions_interval_secs)
+            .maybe_carry_replay_events_on_reopen(carry_replay_events_on_reopen)
             .maybe_allow_overfills(allow_overfills)
             .maybe_external_clients(external_clients)
             .maybe_purge_closed_orders_interval_mins(purge_closed_orders_interval_mins)
@@ -77,6 +81,7 @@ impl ExecutionEngineConfig {
             .maybe_purge_from_database(purge_from_database)
             .maybe_debug(debug)
             .build()
+            .map_err(to_pyvalue_err)
     }
 
     #[getter]
@@ -110,9 +115,57 @@ impl ExecutionEngineConfig {
     }
 
     #[getter]
+    #[pyo3(name = "carry_replay_events_on_reopen")]
+    const fn py_carry_replay_events_on_reopen(&self) -> bool {
+        self.carry_replay_events_on_reopen
+    }
+
+    #[getter]
     #[pyo3(name = "allow_overfills")]
     const fn py_allow_overfills(&self) -> bool {
         self.allow_overfills
+    }
+
+    #[getter]
+    #[pyo3(name = "external_clients")]
+    fn py_external_clients(&self) -> Option<Vec<ClientId>> {
+        self.external_clients.clone()
+    }
+
+    #[getter]
+    #[pyo3(name = "purge_closed_orders_interval_mins")]
+    const fn py_purge_closed_orders_interval_mins(&self) -> Option<u32> {
+        self.purge_closed_orders_interval_mins
+    }
+
+    #[getter]
+    #[pyo3(name = "purge_closed_orders_buffer_mins")]
+    const fn py_purge_closed_orders_buffer_mins(&self) -> Option<u32> {
+        self.purge_closed_orders_buffer_mins
+    }
+
+    #[getter]
+    #[pyo3(name = "purge_closed_positions_interval_mins")]
+    const fn py_purge_closed_positions_interval_mins(&self) -> Option<u32> {
+        self.purge_closed_positions_interval_mins
+    }
+
+    #[getter]
+    #[pyo3(name = "purge_closed_positions_buffer_mins")]
+    const fn py_purge_closed_positions_buffer_mins(&self) -> Option<u32> {
+        self.purge_closed_positions_buffer_mins
+    }
+
+    #[getter]
+    #[pyo3(name = "purge_account_events_interval_mins")]
+    const fn py_purge_account_events_interval_mins(&self) -> Option<u32> {
+        self.purge_account_events_interval_mins
+    }
+
+    #[getter]
+    #[pyo3(name = "purge_account_events_lookback_mins")]
+    const fn py_purge_account_events_lookback_mins(&self) -> Option<u32> {
+        self.purge_account_events_lookback_mins
     }
 
     #[getter]

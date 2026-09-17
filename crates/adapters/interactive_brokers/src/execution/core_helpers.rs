@@ -45,7 +45,7 @@ impl InteractiveBrokersExecutionClient {
             return Ok(());
         }
 
-        tracing::info!(
+        tracing::debug!(
             "Preloading {} cached Interactive Brokers spread instrument(s) before reconciliation",
             spread_ids.len()
         );
@@ -154,11 +154,15 @@ impl InteractiveBrokersExecutionClient {
         instrument_id: InstrumentId,
         trader_id: TraderId,
         strategy_id: StrategyId,
+        order_side: OrderSide,
+        order_type: OrderType,
         order_id_map: &Arc<Mutex<AHashMap<ClientOrderId, i32>>>,
         venue_order_id_map: &Arc<Mutex<AHashMap<i32, ClientOrderId>>>,
         instrument_id_map: &Arc<Mutex<AHashMap<i32, InstrumentId>>>,
         trader_id_map: &Arc<Mutex<AHashMap<i32, TraderId>>>,
         strategy_id_map: &Arc<Mutex<AHashMap<i32, StrategyId>>>,
+        active_order_contexts: &Arc<Mutex<AHashMap<i32, TrackedOrderContext>>>,
+        terminal_order_contexts: &Arc<Mutex<FifoCacheMap<i32, TrackedOrderContext, 10_000>>>,
     ) -> anyhow::Result<()> {
         {
             let mut order_map = order_id_map
@@ -194,6 +198,218 @@ impl InteractiveBrokersExecutionClient {
                 .map_err(|_| anyhow::anyhow!("Failed to lock strategy_id map"))?;
             strategy_map.insert(ib_order_id, strategy_id);
         }
+
+        terminal_order_contexts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock terminal order contexts"))?
+            .remove(&ib_order_id);
+        active_order_contexts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock active order contexts"))?
+            .insert(
+                ib_order_id,
+                TrackedOrderContext {
+                    client_order_id,
+                    trader_id,
+                    strategy_id,
+                    instrument_id,
+                    order_side,
+                    order_type,
+                    accepted: false,
+                    avg_px: None,
+                },
+            );
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn cache_cancel_order_tracking(
+        ib_order_id: i32,
+        cmd: &CancelOrder,
+        target_order: &OrderAny,
+        order_id_map: &Arc<Mutex<AHashMap<ClientOrderId, i32>>>,
+        venue_order_id_map: &Arc<Mutex<AHashMap<i32, ClientOrderId>>>,
+        instrument_id_map: &Arc<Mutex<AHashMap<i32, InstrumentId>>>,
+        trader_id_map: &Arc<Mutex<AHashMap<i32, TraderId>>>,
+        strategy_id_map: &Arc<Mutex<AHashMap<i32, StrategyId>>>,
+    ) -> anyhow::Result<()> {
+        // Order-status callbacks first map the IB order ID to a client order ID, then read
+        // its instrument, trader, and strategy IDs. Hold this lock while updating all maps
+        // so a callback sees either the complete identity or no route at all.
+        let mut venue_map = venue_order_id_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock venue order ID map"))?;
+        if let Some(existing_client_order_id) = venue_map.get(&ib_order_id) {
+            anyhow::ensure!(
+                *existing_client_order_id == cmd.client_order_id,
+                "IB order ID {ib_order_id} is already mapped to client order {existing_client_order_id}"
+            );
+        }
+        venue_map.remove(&ib_order_id);
+
+        order_id_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock order ID map"))?
+            .insert(cmd.client_order_id, ib_order_id);
+        instrument_id_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock instrument ID map"))?
+            .insert(ib_order_id, target_order.instrument_id());
+        trader_id_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock trader ID map"))?
+            .insert(ib_order_id, target_order.trader_id());
+        strategy_id_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock strategy ID map"))?
+            .insert(ib_order_id, target_order.strategy_id());
+        venue_map.insert(ib_order_id, cmd.client_order_id);
+
+        Ok(())
+    }
+
+    pub(super) fn get_tracked_order_context(
+        ib_order_id: i32,
+        active_order_contexts: &Arc<Mutex<AHashMap<i32, TrackedOrderContext>>>,
+        terminal_order_contexts: &Arc<Mutex<FifoCacheMap<i32, TrackedOrderContext, 10_000>>>,
+    ) -> anyhow::Result<Option<TrackedOrderContext>> {
+        if let Some(context) = active_order_contexts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock active order contexts"))?
+            .get(&ib_order_id)
+            .cloned()
+        {
+            return Ok(Some(context));
+        }
+
+        Ok(terminal_order_contexts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock terminal order contexts"))?
+            .get(&ib_order_id)
+            .cloned())
+    }
+
+    pub(super) fn emit_order_accepted_if_needed(
+        ib_order_id: i32,
+        venue_order_id: VenueOrderId,
+        account_id: AccountId,
+        ts_event: UnixNanos,
+        active_order_contexts: &Arc<Mutex<AHashMap<i32, TrackedOrderContext>>>,
+        exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+    ) -> anyhow::Result<bool> {
+        let mut contexts = active_order_contexts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock active order contexts"))?;
+        let Some(context) = contexts.get_mut(&ib_order_id) else {
+            return Ok(false);
+        };
+
+        Self::emit_order_accepted(context, venue_order_id, account_id, ts_event, exec_sender)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn emit_order_accepted_for_fill_if_needed(
+        ib_order_id: i32,
+        venue_order_id: VenueOrderId,
+        account_id: AccountId,
+        ts_event: UnixNanos,
+        active_order_contexts: &Arc<Mutex<AHashMap<i32, TrackedOrderContext>>>,
+        terminal_order_contexts: &Arc<Mutex<FifoCacheMap<i32, TrackedOrderContext, 10_000>>>,
+        exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+    ) -> anyhow::Result<bool> {
+        if Self::emit_order_accepted_if_needed(
+            ib_order_id,
+            venue_order_id,
+            account_id,
+            ts_event,
+            active_order_contexts,
+            exec_sender,
+        )? {
+            return Ok(true);
+        }
+
+        let mut contexts = terminal_order_contexts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock terminal order contexts"))?;
+        let Some(context) = contexts.get_mut(&ib_order_id) else {
+            return Ok(false);
+        };
+
+        Self::emit_order_accepted(context, venue_order_id, account_id, ts_event, exec_sender)
+    }
+
+    fn emit_order_accepted(
+        context: &mut TrackedOrderContext,
+        venue_order_id: VenueOrderId,
+        account_id: AccountId,
+        ts_event: UnixNanos,
+        exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+    ) -> anyhow::Result<bool> {
+        if context.accepted {
+            return Ok(false);
+        }
+
+        let event = OrderAccepted::new(
+            context.trader_id,
+            context.strategy_id,
+            context.instrument_id,
+            context.client_order_id,
+            venue_order_id,
+            account_id,
+            UUID4::new(),
+            ts_event,
+            ts_event,
+            false,
+        );
+        exec_sender
+            .send(ExecutionEvent::Order(OrderEventAny::Accepted(event)))
+            .map_err(|e| anyhow::anyhow!("Failed to send order accepted event: {e}"))?;
+        context.accepted = true;
+
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn remove_order_tracking(
+        ib_order_id: i32,
+        client_order_id: ClientOrderId,
+        order_id_map: &Arc<Mutex<AHashMap<ClientOrderId, i32>>>,
+        venue_order_id_map: &Arc<Mutex<AHashMap<i32, ClientOrderId>>>,
+        instrument_id_map: &Arc<Mutex<AHashMap<i32, InstrumentId>>>,
+        trader_id_map: &Arc<Mutex<AHashMap<i32, TraderId>>>,
+        strategy_id_map: &Arc<Mutex<AHashMap<i32, StrategyId>>>,
+        active_order_contexts: &Arc<Mutex<AHashMap<i32, TrackedOrderContext>>>,
+        terminal_order_contexts: &Arc<Mutex<FifoCacheMap<i32, TrackedOrderContext, 10_000>>>,
+    ) -> anyhow::Result<()> {
+        order_id_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock order ID map"))?
+            .remove(&client_order_id);
+        venue_order_id_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock venue order ID map"))?
+            .remove(&ib_order_id);
+        instrument_id_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock instrument ID map"))?
+            .remove(&ib_order_id);
+        trader_id_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock trader ID map"))?
+            .remove(&ib_order_id);
+        strategy_id_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock strategy ID map"))?
+            .remove(&ib_order_id);
+        active_order_contexts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock active order contexts"))?
+            .remove(&ib_order_id);
+        terminal_order_contexts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock terminal order contexts"))?
+            .remove(&ib_order_id);
 
         Ok(())
     }

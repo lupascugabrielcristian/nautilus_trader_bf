@@ -132,7 +132,7 @@ impl<'a> PoolDiscoveryService<'a> {
 
         // Skip sync if already up to date
         if effective_from_block > to_block {
-            log::info!(
+            log::debug!(
                 "DEX {} already synced to block {} (current: {}), skipping sync",
                 dex.dex.name,
                 last_synced_block.unwrap_or(0).separate_with_commas(),
@@ -142,7 +142,7 @@ impl<'a> PoolDiscoveryService<'a> {
         }
 
         let total_blocks = to_block.saturating_sub(effective_from_block) + 1;
-        log::info!(
+        log::debug!(
             "Syncing DEX exchange pools from {} to {} (total: {} blocks){}",
             effective_from_block.separate_with_commas(),
             to_block.separate_with_commas(),
@@ -156,7 +156,7 @@ impl<'a> PoolDiscoveryService<'a> {
                 String::new()
             },
         );
-        log::info!(
+        log::debug!(
             "Syncing {} pool creation events from factory contract {} on chain {}",
             dex.dex.name,
             dex.factory,
@@ -209,7 +209,7 @@ impl<'a> PoolDiscoveryService<'a> {
         let cancellation_token = self.cancellation_token.clone();
         let sync_result = tokio::select! {
             () = cancellation_token.cancelled() => {
-                log::info!("Exchange pool sync cancelled");
+                log::debug!("Exchange pool sync cancelled");
                 Err(anyhow::anyhow!("Sync cancelled"))
             }
 
@@ -217,7 +217,7 @@ impl<'a> PoolDiscoveryService<'a> {
                 while let Some(item) = pools_stream.next().await {
                     let log = match item {
                         PoolEventStreamItem::Block(block) => {
-                            self.cache.cache_block_timestamp(block.number, block.timestamp);
+                            self.cache.cache_block_metadata(&block);
                             block_db_buffer.push(block);
                             if block_db_buffer.len() >= POOL_EVENT_BLOCK_DB_BATCH_SIZE {
                                 self.flush_pool_event_blocks(&mut block_db_buffer).await?;
@@ -335,7 +335,7 @@ impl<'a> PoolDiscoveryService<'a> {
                     .update_dex_last_synced_block(&dex.dex.name, to_block)
                     .await?;
 
-                log::info!(
+                log::debug!(
                     "Successfully synced DEX {} pools up to block {} | Summary: discovered={}, saved={}, skipped_exists={}, skipped_invalid_tokens={}",
                     dex.dex.name,
                     to_block.separate_with_commas(),
@@ -479,6 +479,7 @@ impl<'a> PoolDiscoveryService<'a> {
                 .get_block_timestamp(pool_event.block_number)
                 .copied()
                 .unwrap_or_default();
+
             let mut pool = Pool::new(
                 self.chain.clone(),
                 dex.clone(),

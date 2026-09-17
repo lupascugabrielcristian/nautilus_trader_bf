@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 
 #[allow(unused_imports)] // Used in template pattern for returns conversion
 use nautilus_core::UnixNanos;
+use nautilus_model::position::Position;
 use pyo3::prelude::*;
 
 use crate::{statistic::PortfolioStatistic, statistics::winner_avg::AvgWinner};
@@ -24,6 +25,10 @@ use crate::{statistic::PortfolioStatistic, statistics::winner_avg::AvgWinner};
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl AvgWinner {
+    /// Calculates the average winning trade from realized PnLs.
+    ///
+    /// Only positive PnLs count as winners. Returns `NaN` for an empty series or
+    /// when there are no winning trades.
     #[new]
     fn py_new() -> Self {
         Self {}
@@ -52,7 +57,7 @@ impl AvgWinner {
     }
 
     #[pyo3(name = "calculate_from_positions")]
-    fn py_calculate_from_positions(&mut self, _positions: Vec<Py<PyAny>>) -> Option<f64> {
+    fn py_calculate_from_positions(&mut self, _positions: Vec<Position>) -> Option<f64> {
         None
     }
 }

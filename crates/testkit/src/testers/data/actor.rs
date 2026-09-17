@@ -13,12 +13,13 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::time::Duration;
+use std::{num::NonZeroUsize, time::Duration};
 
 use ahash::{AHashMap, AHashSet};
-use chrono::Duration as ChronoDuration;
+use jiff::SignedDuration;
 use nautilus_common::{
     actor::{DataActor, DataActorCore},
+    config::ConfigError,
     enums::LogColor,
     log_info, nautilus_actor,
     timer::TimeEvent,
@@ -26,14 +27,16 @@ use nautilus_common::{
 use nautilus_model::{
     data::{
         Bar, FundingRateUpdate, IndexPriceUpdate, InstrumentClose, InstrumentStatus,
-        MarkPriceUpdate, OrderBookDeltas, QuoteTick, TradeTick, option_chain::OptionGreeks,
+        MarkPriceUpdate, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
+        option_chain::OptionGreeks,
     },
     identifiers::InstrumentId,
-    instruments::InstrumentAny,
+    instruments::{Instrument, InstrumentAny},
     orderbook::OrderBook,
 };
 
 use super::config::DataTesterConfig;
+use crate::testers::timestamps::{warn_if_implausible_optional, warn_if_implausible_unix_nanos};
 
 /// A data tester actor for live testing market data subscriptions.
 ///
@@ -108,23 +111,31 @@ impl DataActor for DataTester {
                 self.subscribe_book_at_interval(
                     instrument_id,
                     self.config.book_type,
-                    self.config.book_depth,
-                    self.config.book_interval_ms,
+                    self.config
+                        .book_depth
+                        .map(|depth| {
+                            NonZeroUsize::new(depth).ok_or_else(|| {
+                                ConfigError::range("book_depth", "must be positive, was 0")
+                            })
+                        })
+                        .transpose()?,
+                    NonZeroUsize::new(self.config.book_interval_ms).ok_or_else(|| {
+                        ConfigError::range("book_interval_ms", "must be positive, was 0")
+                    })?,
                     client_id,
                     subscribe_params.clone(),
                 );
             }
 
-            // TODO: Support subscribe_book_depth when the method is available
-            // if self.config.subscribe_book_depth {
-            //     self.subscribe_book_depth(
-            //         instrument_id,
-            //         self.config.book_type,
-            //         self.config.book_depth,
-            //         client_id,
-            //         subscribe_params.clone(),
-            //     );
-            // }
+            if self.config.subscribe_book_depth {
+                self.subscribe_book_depth10(
+                    instrument_id,
+                    self.config.book_type,
+                    client_id,
+                    self.config.manage_book,
+                    subscribe_params.clone(),
+                );
+            }
 
             if self.config.subscribe_quotes {
                 self.subscribe_quotes(instrument_id, client_id, subscribe_params.clone());
@@ -164,7 +175,7 @@ impl DataActor for DataTester {
 
             // Request historical quotes (default to last 1 hour)
             if self.config.request_quotes {
-                let start = self.clock().utc_now() - ChronoDuration::hours(1);
+                let start = self.clock().utc_now() - SignedDuration::from_hours(1);
 
                 if let Err(e) = self.request_quotes(
                     instrument_id,
@@ -182,7 +193,14 @@ impl DataActor for DataTester {
             if self.config.request_book_snapshot {
                 let _ = self.request_book_snapshot(
                     instrument_id,
-                    self.config.book_depth,
+                    self.config
+                        .book_depth
+                        .map(|depth| {
+                            NonZeroUsize::new(depth).ok_or_else(|| {
+                                ConfigError::range("book_depth", "must be positive, was 0")
+                            })
+                        })
+                        .transpose()?,
                     client_id,
                     request_params.clone(),
                 );
@@ -192,7 +210,7 @@ impl DataActor for DataTester {
 
             // Request historical trades (default to last 1 hour)
             if self.config.request_trades {
-                let start = self.clock().utc_now() - ChronoDuration::hours(1);
+                let start = self.clock().utc_now() - SignedDuration::from_hours(1);
 
                 if let Err(e) = self.request_trades(
                     instrument_id,
@@ -208,7 +226,7 @@ impl DataActor for DataTester {
 
             // Request historical funding rates (default to last 7 days)
             if self.config.request_funding_rates {
-                let start = self.clock().utc_now() - ChronoDuration::days(7);
+                let start = self.clock().utc_now() - SignedDuration::from_hours(7 * 24);
 
                 if let Err(e) = self.request_funding_rates(
                     instrument_id,
@@ -232,7 +250,7 @@ impl DataActor for DataTester {
 
                 // Request historical bars (default to last 1 hour)
                 if self.config.request_bars {
-                    let start = self.clock().utc_now() - ChronoDuration::hours(1);
+                    let start = self.clock().utc_now() - SignedDuration::from_hours(1);
 
                     if let Err(e) = self.request_bars(
                         bar_type,
@@ -285,16 +303,17 @@ impl DataActor for DataTester {
             if self.config.subscribe_book_at_interval {
                 self.unsubscribe_book_at_interval(
                     instrument_id,
-                    self.config.book_interval_ms,
+                    NonZeroUsize::new(self.config.book_interval_ms).ok_or_else(|| {
+                        ConfigError::range("book_interval_ms", "must be positive, was 0")
+                    })?,
                     client_id,
                     subscribe_params.clone(),
                 );
             }
 
-            // TODO: Support unsubscribe_book_depth when the method is available
-            // if self.config.subscribe_book_depth {
-            //     self.unsubscribe_book_depth(instrument_id, client_id, subscribe_params.clone());
-            // }
+            if self.config.subscribe_book_depth {
+                self.unsubscribe_book_depth10(instrument_id, client_id, subscribe_params.clone());
+            }
 
             if self.config.subscribe_quotes {
                 self.unsubscribe_quotes(instrument_id, client_id, subscribe_params.clone());
@@ -354,6 +373,8 @@ impl DataActor for DataTester {
     }
 
     fn on_instrument(&mut self, instrument: &InstrumentAny) -> anyhow::Result<()> {
+        warn_if_implausible_unix_nanos("instrument", instrument.ts_event(), instrument.ts_init());
+
         if self.config.log_data {
             log_info!("{instrument:?}", color = LogColor::Cyan);
         }
@@ -372,6 +393,8 @@ impl DataActor for DataTester {
     }
 
     fn on_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
+        warn_if_implausible_unix_nanos("book deltas", deltas.ts_event, deltas.ts_init);
+
         if self.config.manage_book {
             if let Some(book) = self.books.get_mut(&deltas.instrument_id) {
                 book.apply_deltas(deltas)?;
@@ -389,7 +412,18 @@ impl DataActor for DataTester {
         Ok(())
     }
 
+    fn on_book_depth(&mut self, depth: &OrderBookDepth10) -> anyhow::Result<()> {
+        warn_if_implausible_unix_nanos("book depth", depth.ts_event, depth.ts_init);
+
+        if self.config.log_data {
+            log_info!("{depth:?}", color = LogColor::Cyan);
+        }
+        Ok(())
+    }
+
     fn on_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
+        warn_if_implausible_unix_nanos("quote", quote.ts_event, quote.ts_init);
+
         if self.config.log_data {
             log_info!("{quote:?}", color = LogColor::Cyan);
         }
@@ -397,6 +431,8 @@ impl DataActor for DataTester {
     }
 
     fn on_trade(&mut self, trade: &TradeTick) -> anyhow::Result<()> {
+        warn_if_implausible_unix_nanos("trade", trade.ts_event, trade.ts_init);
+
         if self.config.log_data {
             log_info!("{trade:?}", color = LogColor::Cyan);
         }
@@ -404,6 +440,8 @@ impl DataActor for DataTester {
     }
 
     fn on_bar(&mut self, bar: &Bar) -> anyhow::Result<()> {
+        warn_if_implausible_unix_nanos("bar", bar.ts_event, bar.ts_init);
+
         if self.config.log_data {
             log_info!("{bar:?}", color = LogColor::Cyan);
         }
@@ -411,6 +449,8 @@ impl DataActor for DataTester {
     }
 
     fn on_mark_price(&mut self, mark_price: &MarkPriceUpdate) -> anyhow::Result<()> {
+        warn_if_implausible_unix_nanos("mark price", mark_price.ts_event, mark_price.ts_init);
+
         if self.config.log_data {
             log_info!("{mark_price:?}", color = LogColor::Cyan);
         }
@@ -418,6 +458,8 @@ impl DataActor for DataTester {
     }
 
     fn on_index_price(&mut self, index_price: &IndexPriceUpdate) -> anyhow::Result<()> {
+        warn_if_implausible_unix_nanos("index price", index_price.ts_event, index_price.ts_init);
+
         if self.config.log_data {
             log_info!("{index_price:?}", color = LogColor::Cyan);
         }
@@ -425,6 +467,13 @@ impl DataActor for DataTester {
     }
 
     fn on_funding_rate(&mut self, funding_rate: &FundingRateUpdate) -> anyhow::Result<()> {
+        warn_if_implausible_unix_nanos("funding rate", funding_rate.ts_event, funding_rate.ts_init);
+        warn_if_implausible_optional(
+            "funding rate",
+            "next_funding_ns",
+            funding_rate.next_funding_ns,
+        );
+
         if self.config.log_data {
             log_info!("{funding_rate:?}", color = LogColor::Cyan);
         }
@@ -432,6 +481,8 @@ impl DataActor for DataTester {
     }
 
     fn on_instrument_status(&mut self, data: &InstrumentStatus) -> anyhow::Result<()> {
+        warn_if_implausible_unix_nanos("instrument status", data.ts_event, data.ts_init);
+
         if self.config.log_data {
             log_info!("{data:?}", color = LogColor::Cyan);
         }
@@ -439,6 +490,8 @@ impl DataActor for DataTester {
     }
 
     fn on_instrument_close(&mut self, update: &InstrumentClose) -> anyhow::Result<()> {
+        warn_if_implausible_unix_nanos("instrument close", update.ts_event, update.ts_init);
+
         if self.config.log_data {
             log_info!("{update:?}", color = LogColor::Cyan);
         }
@@ -446,6 +499,8 @@ impl DataActor for DataTester {
     }
 
     fn on_option_greeks(&mut self, greeks: &OptionGreeks) -> anyhow::Result<()> {
+        warn_if_implausible_unix_nanos("option greeks", greeks.ts_event, greeks.ts_init);
+
         if self.config.log_data {
             log_info!("{greeks:?}", color = LogColor::Cyan);
         }
@@ -453,6 +508,10 @@ impl DataActor for DataTester {
     }
 
     fn on_historical_trades(&mut self, trades: &[TradeTick]) -> anyhow::Result<()> {
+        for trade in trades {
+            warn_if_implausible_unix_nanos("historical trade", trade.ts_event, trade.ts_init);
+        }
+
         if self.config.log_data {
             log_info!(
                 "Received {} historical trades",
@@ -476,6 +535,10 @@ impl DataActor for DataTester {
     }
 
     fn on_historical_quotes(&mut self, quotes: &[QuoteTick]) -> anyhow::Result<()> {
+        for quote in quotes {
+            warn_if_implausible_unix_nanos("historical quote", quote.ts_event, quote.ts_init);
+        }
+
         if self.config.log_data {
             log_info!(
                 "Received {} historical quotes",
@@ -502,6 +565,15 @@ impl DataActor for DataTester {
         &mut self,
         funding_rates: &[FundingRateUpdate],
     ) -> anyhow::Result<()> {
+        for rate in funding_rates {
+            warn_if_implausible_unix_nanos("historical funding rate", rate.ts_event, rate.ts_init);
+            warn_if_implausible_optional(
+                "historical funding rate",
+                "next_funding_ns",
+                rate.next_funding_ns,
+            );
+        }
+
         if self.config.log_data {
             log_info!(
                 "Received {} historical funding rates",
@@ -525,6 +597,10 @@ impl DataActor for DataTester {
     }
 
     fn on_historical_bars(&mut self, bars: &[Bar]) -> anyhow::Result<()> {
+        for bar in bars {
+            warn_if_implausible_unix_nanos("historical bar", bar.ts_event, bar.ts_init);
+        }
+
         if self.config.log_data {
             log_info!(
                 "Received {} historical bars",

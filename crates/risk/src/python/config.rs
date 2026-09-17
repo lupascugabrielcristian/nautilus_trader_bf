@@ -20,18 +20,18 @@ use std::{collections::HashMap, str::FromStr};
 use ahash::AHashMap;
 use nautilus_common::throttler::RateLimit;
 use nautilus_core::{datetime::NANOSECONDS_IN_SECOND, python::to_pyvalue_err};
-use nautilus_model::identifiers::InstrumentId;
+use nautilus_model::identifiers::{InstrumentId, Venue};
 use pyo3::{Py, PyAny, PyResult, Python, prelude::PyAnyMethods, pymethods};
 use rust_decimal::Decimal;
 
 use crate::engine::config::RiskEngineConfig;
 
 fn format_rate_limit(rate: &RateLimit) -> String {
-    let total_secs = rate.interval_ns / NANOSECONDS_IN_SECOND;
+    let total_secs = rate.interval_ns() / NANOSECONDS_IN_SECOND;
     let hours = total_secs / 3_600;
     let minutes = (total_secs % 3_600) / 60;
     let seconds = total_secs % 60;
-    format!("{}/{:02}:{:02}:{:02}", rate.limit, hours, minutes, seconds)
+    format!("{}/{hours:02}:{minutes:02}:{seconds:02}", rate.limit())
 }
 
 fn parse_rate_limit(name: &str, value: &str) -> PyResult<RateLimit> {
@@ -42,12 +42,6 @@ fn parse_rate_limit(name: &str, value: &str) -> PyResult<RateLimit> {
     let limit = limit
         .parse::<usize>()
         .map_err(|e| to_pyvalue_err(format!("invalid `{name}` limit: {e}")))?;
-
-    if limit == 0 {
-        return Err(to_pyvalue_err(format!(
-            "invalid `{name}`: limit must be greater than zero"
-        )));
-    }
 
     let mut total_secs: u64 = 0;
     let mut parts = interval.split(':');
@@ -71,16 +65,8 @@ fn parse_rate_limit(name: &str, value: &str) -> PyResult<RateLimit> {
         )));
     }
 
-    if total_secs == 0 {
-        return Err(to_pyvalue_err(format!(
-            "invalid `{name}`: interval must be greater than zero"
-        )));
-    }
-
-    Ok(RateLimit::new(
-        limit,
-        total_secs.saturating_mul(NANOSECONDS_IN_SECOND),
-    ))
+    RateLimit::new_checked(limit, total_secs.saturating_mul(NANOSECONDS_IN_SECOND))
+        .map_err(|e| to_pyvalue_err(format!("invalid `{name}`: {e}")))
 }
 
 fn coerce_max_notional_per_order(
@@ -116,6 +102,7 @@ impl RiskEngineConfig {
         max_order_submit_rate = None,
         max_order_modify_rate = None,
         max_notional_per_order = None,
+        full_position_exit_venues = None,
         debug = None,
     ))]
     fn py_new(
@@ -123,6 +110,7 @@ impl RiskEngineConfig {
         max_order_submit_rate: Option<String>,
         max_order_modify_rate: Option<String>,
         max_notional_per_order: Option<HashMap<String, Py<PyAny>>>,
+        full_position_exit_venues: Option<Vec<Venue>>,
         debug: Option<bool>,
     ) -> PyResult<Self> {
         let default = Self::default();
@@ -139,14 +127,19 @@ impl RiskEngineConfig {
             Some(raw) => coerce_max_notional_per_order(raw)?,
             None => default.max_notional_per_order,
         };
+        let full_position_exit_venues = full_position_exit_venues
+            .map(|venues| venues.into_iter().collect())
+            .unwrap_or(default.full_position_exit_venues);
 
-        Ok(Self {
-            bypass: bypass.unwrap_or(default.bypass),
-            max_order_submit,
-            max_order_modify,
-            max_notional_per_order,
-            debug: debug.unwrap_or(default.debug),
-        })
+        Self::builder()
+            .bypass(bypass.unwrap_or(default.bypass))
+            .max_order_submit(max_order_submit)
+            .max_order_modify(max_order_modify)
+            .max_notional_per_order(max_notional_per_order)
+            .full_position_exit_venues(full_position_exit_venues)
+            .debug(debug.unwrap_or(default.debug))
+            .build()
+            .map_err(to_pyvalue_err)
     }
 
     #[getter]
@@ -174,6 +167,18 @@ impl RiskEngineConfig {
             .iter()
             .map(|(id, notional)| (id.to_string(), notional.to_string()))
             .collect()
+    }
+
+    #[getter]
+    #[pyo3(name = "full_position_exit_venues")]
+    fn py_full_position_exit_venues(&self) -> Vec<Venue> {
+        let mut venues = self
+            .full_position_exit_venues
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        venues.sort_unstable();
+        venues
     }
 
     #[getter]

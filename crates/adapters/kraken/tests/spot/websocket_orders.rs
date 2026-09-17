@@ -44,8 +44,10 @@ use nautilus_kraken::{
         spot_v2::messages::KrakenWsAddOrderParams,
     },
 };
+use nautilus_live::task::TaskGroup;
 use nautilus_model::identifiers::{AccountId, ClientOrderId, TraderId};
 use rstest::rstest;
+use rust_decimal_macros::dec;
 use tokio_util::sync::CancellationToken;
 
 /// Shared state for the mock WebSocket server.
@@ -108,10 +110,10 @@ fn make_add_order_params(symbol: &str) -> KrakenWsAddOrderParams {
     KrakenWsAddOrderParams {
         order_type: KrakenOrderType::Limit,
         side: KrakenOrderSide::Buy,
-        order_qty: 0.001,
+        order_qty: dec!(0.001),
         symbol: symbol.to_string(),
         token: "test-token".to_string(),
-        limit_price: Some(50_000.0),
+        limit_price: Some(dec!(50000)),
         time_in_force: None,
         expire_time: None,
         cl_ord_id: Some("O-TEST-001".to_string()),
@@ -143,12 +145,14 @@ fn build_order_request_state(
             >,
         >,
     >,
-) -> Arc<OrderRequestState> {
+) -> (Arc<OrderRequestState>, TaskGroup) {
     let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
     let dispatch_state = Arc::new(WsDispatchState::new());
     let req_id_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    Arc::new(OrderRequestState::new(
+    let pending_tasks = TaskGroup::new();
+    let pending_spawner = pending_tasks.spawner().expect("pending task spawner");
+    let state = Arc::new(OrderRequestState::new(
         cmd_tx_handle,
         event_tx,
         dispatch_state,
@@ -157,9 +161,11 @@ fn build_order_request_state(
         TraderId::new("TESTER-001"),
         AccountId::new("KRAKEN-001"),
         Arc::new(tokio::sync::RwLock::new(None)),
-        tokio_util::sync::CancellationToken::new(),
+        pending_spawner,
         nautilus_core::time::get_atomic_clock_realtime(),
-    ))
+    ));
+
+    (state, pending_tasks)
 }
 
 /// Regression: build the dispatcher before `connect()`, like
@@ -179,7 +185,7 @@ async fn test_submit_order_via_ws_sends_add_order_message() {
     let mut ws_client = KrakenSpotWebSocketClient::new(config, CancellationToken::new(), None);
 
     let cmd_tx_handle = ws_client.handler_command_handle();
-    let order_state = build_order_request_state(cmd_tx_handle);
+    let (order_state, _pending_tasks) = build_order_request_state(cmd_tx_handle);
 
     ws_client.connect().await.unwrap();
 
@@ -240,6 +246,50 @@ async fn test_submit_order_via_ws_sends_add_order_message() {
     ws_client.disconnect().await.unwrap();
 }
 
+#[rstest]
+#[tokio::test]
+async fn test_closed_timeout_scope_does_not_reclassify_sent_order_as_unsent() {
+    let (addr, server_state) = start_mock_server().await;
+    let ws_url = format!("ws://{addr}/v2");
+    let config = KrakenDataClientConfig {
+        ws_private_url: Some(ws_url),
+        ..Default::default()
+    };
+    let mut ws_client = KrakenSpotWebSocketClient::new(config, CancellationToken::new(), None);
+    let cmd_tx_handle = ws_client.handler_command_handle();
+    let (order_state, pending_tasks) = build_order_request_state(cmd_tx_handle);
+
+    ws_client.connect().await.unwrap();
+    wait_until_async(
+        || {
+            let state = Arc::clone(&server_state);
+            async move { *state.connection_count.lock().await > 0 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    pending_tasks.begin_shutdown();
+
+    let result = order_state.submit(make_add_order_params("BTC/USD"), make_pending_request(), 0);
+
+    assert!(result.is_ok());
+    wait_until_async(
+        || {
+            let state = Arc::clone(&server_state);
+            async move { !state.received_messages.lock().await.is_empty() }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    let messages = server_state.messages().await;
+    assert_eq!(
+        messages[0].get("method").and_then(|value| value.as_str()),
+        Some("add_order"),
+    );
+
+    ws_client.disconnect().await.unwrap();
+}
+
 /// Verifies that when the WebSocket client is not connected (WS inactive),
 /// [`OrderRequestState::submit`] returns an error because the handler
 /// command channel's receiver is dropped before `connect()` is called.
@@ -265,7 +315,7 @@ async fn test_submit_order_falls_back_to_rest_when_ws_inactive() {
     assert!(ws_client.is_closed());
 
     let cmd_tx_handle = ws_client.handler_command_handle();
-    let order_state = build_order_request_state(cmd_tx_handle);
+    let (order_state, _pending_tasks) = build_order_request_state(cmd_tx_handle);
 
     let params = make_add_order_params("BTC/USD");
     let pending = make_pending_request();

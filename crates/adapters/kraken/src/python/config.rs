@@ -16,15 +16,13 @@
 //! Python bindings for Kraken configuration.
 
 use nautilus_core::python::to_pyvalue_err;
-use nautilus_model::{
-    enums::AccountType,
-    identifiers::{AccountId, TraderId},
-};
+use nautilus_model::{enums::AccountType, identifiers::AccountId};
+use nautilus_network::websocket::TransportBackend;
 use pyo3::prelude::*;
 
 use crate::{
     common::enums::{KrakenEnvironment, KrakenProductType},
-    config::{KrakenDataClientConfig, KrakenExecClientConfig},
+    config::{KrakenDataClientConfig, KrakenExecutionClientConfig},
 };
 
 #[pymethods]
@@ -45,7 +43,9 @@ impl KrakenDataClientConfig {
         proxy_url = None,
         timeout_secs = None,
         heartbeat_interval_secs = None,
+        ws_idle_timeout_ms = None,
         max_requests_per_second = None,
+        transport_backend = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -61,7 +61,9 @@ impl KrakenDataClientConfig {
         proxy_url: Option<String>,
         timeout_secs: Option<u64>,
         heartbeat_interval_secs: Option<u64>,
+        ws_idle_timeout_ms: Option<u64>,
         max_requests_per_second: Option<u32>,
+        transport_backend: Option<TransportBackend>,
     ) -> Self {
         let defaults = Self::default();
         Self {
@@ -78,23 +80,46 @@ impl KrakenDataClientConfig {
             timeout_secs: timeout_secs.unwrap_or(defaults.timeout_secs),
             heartbeat_interval_secs: heartbeat_interval_secs
                 .unwrap_or(defaults.heartbeat_interval_secs),
+            ws_idle_timeout_ms: ws_idle_timeout_ms.unwrap_or(defaults.ws_idle_timeout_ms),
             max_requests_per_second,
-            transport_backend: defaults.transport_backend,
+            transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
         }
     }
 
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
+    /// Returns the configured public WebSocket URL override.
+    #[getter]
+    fn get_ws_public_url(&self) -> Option<String> {
+        self.ws_public_url.clone()
+    }
+
+    /// Returns the configured private WebSocket URL override.
+    #[getter]
+    fn get_ws_private_url(&self) -> Option<String> {
+        self.ws_private_url.clone()
+    }
+
+    /// Returns the configured L3 WebSocket URL override.
+    #[getter]
+    fn get_ws_l3_url(&self) -> Option<String> {
+        self.ws_l3_url.clone()
+    }
+
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(KrakenDataClientConfig).to_string()
     }
 }
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl KrakenExecClientConfig {
+impl KrakenExecutionClientConfig {
     /// Configuration for the Kraken execution client.
     #[new]
     #[pyo3(signature = (
-        trader_id,
         account_id,
         api_key,
         api_secret,
@@ -105,6 +130,7 @@ impl KrakenExecClientConfig {
         proxy_url = None,
         timeout_secs = None,
         heartbeat_interval_secs = None,
+        auth_timeout_secs = None,
         max_requests_per_second = None,
         spot_account_type = None,
         default_leverage = None,
@@ -113,10 +139,10 @@ impl KrakenExecClientConfig {
         margin_balance_asset = None,
         use_ws_trade = None,
         ws_request_timeout_secs = None,
+        transport_backend = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
-        trader_id: TraderId,
         account_id: AccountId,
         api_key: String,
         api_secret: String,
@@ -127,6 +153,7 @@ impl KrakenExecClientConfig {
         proxy_url: Option<String>,
         timeout_secs: Option<u64>,
         heartbeat_interval_secs: Option<u64>,
+        auth_timeout_secs: Option<u64>,
         max_requests_per_second: Option<u32>,
         spot_account_type: Option<AccountType>,
         default_leverage: Option<u16>,
@@ -135,6 +162,7 @@ impl KrakenExecClientConfig {
         margin_balance_asset: Option<String>,
         use_ws_trade: Option<bool>,
         ws_request_timeout_secs: Option<u64>,
+        transport_backend: Option<TransportBackend>,
     ) -> PyResult<Self> {
         let defaults = Self::default();
         let spot_account_type = spot_account_type.unwrap_or(defaults.spot_account_type);
@@ -144,7 +172,6 @@ impl KrakenExecClientConfig {
             ));
         }
         Ok(Self {
-            trader_id,
             account_id,
             api_key,
             api_secret,
@@ -156,8 +183,9 @@ impl KrakenExecClientConfig {
             timeout_secs: timeout_secs.unwrap_or(defaults.timeout_secs),
             heartbeat_interval_secs: heartbeat_interval_secs
                 .unwrap_or(defaults.heartbeat_interval_secs),
+            auth_timeout_secs,
             max_requests_per_second,
-            transport_backend: defaults.transport_backend,
+            transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
             spot_account_type,
             default_leverage,
             use_spot_position_reports: use_spot_position_reports
@@ -171,7 +199,18 @@ impl KrakenExecClientConfig {
         })
     }
 
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
+    /// Returns the configured WebSocket URL override.
+    #[getter]
+    fn get_ws_url(&self) -> Option<String> {
+        self.ws_url.clone()
+    }
+
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(KrakenExecutionClientConfig).to_string()
     }
 }

@@ -29,7 +29,6 @@ extension-module = [
   "python",
   "pyo3/extension-module",
 ]
-ffi = ["nautilus-common/ffi", "nautilus-core/ffi", "nautilus-model/ffi"]
 python = [
   "nautilus-common/python",
   "nautilus-core/python",
@@ -41,21 +40,22 @@ simulation = ["dep:madsim", "nautilus-core/simulation"]
 high-precision = ["nautilus-model/high-precision"]
 
 [package.metadata.docs.rs]
-all-features = true
+# Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
+features = ["high-precision", "simulation"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 nautilus-common = { workspace = true }
 nautilus-core = { workspace = true }
-nautilus-model = { workspace = true, features = ["stubs"] }
+nautilus-model = { workspace = true, features = ["test-support"] }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
-chrono = { workspace = true }
 futures = { workspace = true }
 indexmap = { workspace = true }
+jiff = { workspace = true }
 log = { workspace = true }
 rand = { workspace = true }
 rstest = { workspace = true }
@@ -71,10 +71,17 @@ pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
+bytes = { workspace = true }
 criterion = { workspace = true }
 proptest = { workspace = true }
+serde_json = { workspace = true }
 
 [[bench]]
 name = "matching_core"
 path = "benches/matching_core.rs"
+harness = false
+
+[[bench]]
+name = "matching_engine"
+path = "benches/matching_engine.rs"
 harness = false

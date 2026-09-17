@@ -38,9 +38,8 @@ use pyo3::{
     types::{PyDict, PyInt, PyString, PyTuple},
 };
 
-use super::data_to_pycapsule;
 use crate::{
-    data::{Data, TradeTick},
+    data::TradeTick,
     enums::{AggressorSide, FromU8},
     identifiers::{InstrumentId, TradeId},
     python::common::PY_MODULE_MODEL,
@@ -49,60 +48,6 @@ use crate::{
         quantity::{Quantity, QuantityRaw},
     },
 };
-
-impl TradeTick {
-    /// Creates a new [`TradeTick`] from a Python object.
-    ///
-    /// # Panics
-    ///
-    /// Panics if converting `aggressor_side_u8` to `AggressorSide` fails.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `PyErr` if attribute extraction or type conversion fails.
-    pub fn from_pyobject(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
-        // Fast path: avoid property getters that trigger enum type deadlocks
-        if let Ok(tick) = obj.cast::<Self>() {
-            return Ok(*tick.borrow());
-        }
-
-        let instrument_id_obj: Bound<'_, PyAny> = obj.getattr("instrument_id")?.extract()?;
-        let instrument_id_str: String = instrument_id_obj.getattr("value")?.extract()?;
-        let instrument_id =
-            InstrumentId::from_str(instrument_id_str.as_str()).map_err(to_pyvalue_err)?;
-
-        let price_py: Bound<'_, PyAny> = obj.getattr("price")?.extract()?;
-        let price_raw: PriceRaw = price_py.getattr("raw")?.extract()?;
-        let price_prec: u8 = price_py.getattr("precision")?.extract()?;
-        let price = Price::from_raw(price_raw, price_prec);
-
-        let size_py: Bound<'_, PyAny> = obj.getattr("size")?.extract()?;
-        let size_raw: QuantityRaw = size_py.getattr("raw")?.extract()?;
-        let size_prec: u8 = size_py.getattr("precision")?.extract()?;
-        let size = Quantity::from_raw(size_raw, size_prec);
-
-        let aggressor_side_obj: Bound<'_, PyAny> = obj.getattr("aggressor_side")?.extract()?;
-        let aggressor_side_u8 = aggressor_side_obj.getattr("value")?.extract()?;
-        let aggressor_side = AggressorSide::from_u8(aggressor_side_u8).unwrap();
-
-        let trade_id_obj: Bound<'_, PyAny> = obj.getattr("trade_id")?.extract()?;
-        let trade_id_str: String = trade_id_obj.getattr("value")?.extract()?;
-        let trade_id = TradeId::from(trade_id_str.as_str());
-
-        let ts_event: u64 = obj.getattr("ts_event")?.extract()?;
-        let ts_init: u64 = obj.getattr("ts_init")?.extract()?;
-
-        Ok(Self::new(
-            instrument_id,
-            price,
-            size,
-            aggressor_side,
-            trade_id,
-            ts_event.into(),
-            ts_init.into(),
-        ))
-    }
-}
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
@@ -154,7 +99,9 @@ impl TradeTick {
         self.instrument_id = InstrumentId::from_str(instrument_id_str).map_err(to_pyvalue_err)?;
         self.price = Price::from_raw(price_raw, price_prec);
         self.size = Quantity::from_raw(size_raw, size_prec);
-        self.aggressor_side = AggressorSide::from_u8(aggressor_side_u8).unwrap();
+        self.aggressor_side = AggressorSide::from_u8(aggressor_side_u8).ok_or_else(|| {
+            to_pyvalue_err(format!("Invalid aggressor_side value: {aggressor_side_u8}"))
+        })?;
         self.trade_id = TradeId::from(trade_id_str);
         self.ts_event = ts_event.into();
         self.ts_init = ts_init.into();
@@ -322,26 +269,6 @@ impl TradeTick {
         from_dict_pyo3(py, values)
     }
 
-    /// Creates a `PyCapsule` containing a raw pointer to a `Data::Trade` object.
-    ///
-    /// This function takes the current object (assumed to be of a type that can be represented as
-    /// `Data::Trade`), and encapsulates a raw pointer to it within a `PyCapsule`.
-    ///
-    /// # Safety
-    ///
-    /// This function is safe as long as the following conditions are met:
-    /// - The `Data::Trade` object pointed to by the capsule must remain valid for the lifetime of the capsule.
-    /// - The consumer of the capsule must ensure proper handling to avoid dereferencing a dangling pointer.
-    ///
-    /// # Panics
-    ///
-    /// The function will panic if the `PyCapsule` creation fails, which can occur if the
-    /// `Data::Trade` object cannot be converted into a raw pointer.
-    #[pyo3(name = "as_pycapsule")]
-    fn py_as_pycapsule(&self, py: Python<'_>) -> Py<PyAny> {
-        data_to_pycapsule(py, Data::Trade(*self))
-    }
-
     /// Return a dictionary representation of the object.
     #[pyo3(name = "to_dict")]
     fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
@@ -350,14 +277,18 @@ impl TradeTick {
 
     /// Return JSON encoded bytes representation of the object.
     #[pyo3(name = "to_json_bytes")]
-    fn py_to_json_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        self.to_json_bytes().unwrap().into_py_any_unwrap(py)
+    fn py_to_json_bytes(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.to_json_bytes()
+            .map_err(to_pyvalue_err)?
+            .into_py_any(py)
     }
 
     /// Return `MsgPack` encoded bytes representation of the object.
     #[pyo3(name = "to_msgpack_bytes")]
-    fn py_to_msgpack_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        self.to_msgpack_bytes().unwrap().into_py_any_unwrap(py)
+    fn py_to_msgpack_bytes(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.to_msgpack_bytes()
+            .map_err(to_pyvalue_err)?
+            .into_py_any(py)
     }
 }
 
@@ -378,12 +309,11 @@ impl TradeTick {
 
 #[cfg(test)]
 mod tests {
-    use nautilus_core::python::IntoPyObjectNautilusExt;
     use pyo3::Python;
     use rstest::rstest;
 
     use crate::{
-        data::{TradeTick, stubs::stub_trade_ethusdt_buyer},
+        data::{TradeTick, stubs::stub_trade_ethusdt_buy},
         enums::AggressorSide,
         identifiers::{InstrumentId, TradeId},
         types::{Price, Quantity},
@@ -394,7 +324,7 @@ mod tests {
         let instrument_id = InstrumentId::from("ETH-USDT-SWAP.OKX");
         let price = Price::from("10000.00");
         let zero_size = Quantity::from(0);
-        let aggressor_side = AggressorSide::Buyer;
+        let aggressor_side = AggressorSide::Buy;
         let trade_id = TradeId::from("123456789");
         let ts_event = 1;
         let ts_init = 2;
@@ -413,38 +343,26 @@ mod tests {
     }
 
     #[rstest]
-    fn test_to_dict(stub_trade_ethusdt_buyer: TradeTick) {
-        let trade = stub_trade_ethusdt_buyer;
+    fn test_to_dict(stub_trade_ethusdt_buy: TradeTick) {
+        let trade = stub_trade_ethusdt_buy;
 
         Python::initialize();
         Python::attach(|py| {
             let dict_string = trade.py_to_dict(py).unwrap().to_string();
-            let expected_string = "{'type': 'TradeTick', 'instrument_id': 'ETHUSDT-PERP.BINANCE', 'price': '10000.0000', 'size': '1.00000000', 'aggressor_side': 'BUYER', 'trade_id': '123456789', 'ts_event': 0, 'ts_init': 1}";
+            let expected_string = "{'type': 'TradeTick', 'instrument_id': 'ETHUSDT-PERP.BINANCE', 'price': '10000.0000', 'size': '1.00000000', 'aggressor_side': 'BUY', 'trade_id': '123456789', 'ts_event': 0, 'ts_init': 1}";
             assert_eq!(dict_string, expected_string);
         });
     }
 
     #[rstest]
-    fn test_from_dict(stub_trade_ethusdt_buyer: TradeTick) {
-        let trade = stub_trade_ethusdt_buyer;
+    fn test_from_dict(stub_trade_ethusdt_buy: TradeTick) {
+        let trade = stub_trade_ethusdt_buy;
 
         Python::initialize();
         Python::attach(|py| {
             let dict = trade.py_to_dict(py).unwrap();
             let parsed = TradeTick::py_from_dict(py, dict).unwrap();
             assert_eq!(parsed, trade);
-        });
-    }
-
-    #[rstest]
-    fn test_from_pyobject(stub_trade_ethusdt_buyer: TradeTick) {
-        let trade = stub_trade_ethusdt_buyer;
-
-        Python::initialize();
-        Python::attach(|py| {
-            let tick_pyobject = trade.into_py_any_unwrap(py);
-            let parsed_tick = TradeTick::from_pyobject(tick_pyobject.bind(py)).unwrap();
-            assert_eq!(parsed_tick, trade);
         });
     }
 }

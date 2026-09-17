@@ -29,7 +29,7 @@ use crate::{
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.indicators", unsendable)
+    pyo3::pyclass(module = "nautilus_trader.indicators", unsendable)
 )]
 #[cfg_attr(
     feature = "python",
@@ -75,8 +75,9 @@ impl Indicator for MovingAverageConvergenceDivergence {
         self.initialized
     }
 
-    fn handle_quote(&mut self, quote: &QuoteTick) {
-        self.update_raw(quote.extract_price(self.price_type).into());
+    fn handle_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
+        self.update_raw(quote.extract_price(self.price_type)?.into());
+        Ok(())
     }
 
     fn handle_trade(&mut self, trade: &TradeTick) {
@@ -89,6 +90,7 @@ impl Indicator for MovingAverageConvergenceDivergence {
 
     fn reset(&mut self) {
         self.value = 0.0;
+        self.count = 0;
         self.fast_ma.reset();
         self.slow_ma.reset();
         self.has_inputs = false;
@@ -139,6 +141,7 @@ impl MovingAverage for MovingAverageConvergenceDivergence {
         self.fast_ma.update_raw(close);
         self.slow_ma.update_raw(close);
         self.value = self.fast_ma.value() - self.slow_ma.value();
+        self.count += 1;
 
         // Initialization logic
         if !self.initialized {
@@ -160,7 +163,7 @@ mod tests {
         indicator::{Indicator, MovingAverage},
         momentum::macd::MovingAverageConvergenceDivergence,
         stubs::*,
-        testing::approx_equal,
+        testing::assert_approx_equal,
     };
 
     #[rstest]
@@ -213,11 +216,7 @@ mod tests {
         macd_10.update_raw(1.00020);
         macd_10.update_raw(1.00010);
         macd_10.update_raw(1.00000);
-        assert!(
-            approx_equal(macd_10.value, -2.5e-5),
-            "MACD value {:.17e} not within tolerance of –2.5e-5",
-            macd_10.value
-        );
+        assert_approx_equal(macd_10.value, -2.5e-5);
     }
 
     #[rstest]
@@ -225,7 +224,7 @@ mod tests {
         mut macd_10: MovingAverageConvergenceDivergence,
         stub_quote: QuoteTick,
     ) {
-        macd_10.handle_quote(&stub_quote);
+        macd_10.handle_quote(&stub_quote).unwrap();
         assert_eq!(macd_10.value, 0.0);
     }
 
@@ -253,9 +252,20 @@ mod tests {
         macd_10.update_raw(1.0);
         macd_10.reset();
         assert_eq!(macd_10.value, 0.0);
+        assert_eq!(macd_10.count, 0);
         assert_eq!(macd_10.fast_ma.value(), 0.0);
         assert_eq!(macd_10.slow_ma.value(), 0.0);
         assert!(!macd_10.has_inputs);
         assert!(!macd_10.initialized);
+    }
+
+    #[rstest]
+    fn count_matches_inputs(mut macd_10: MovingAverageConvergenceDivergence) {
+        assert_eq!(macd_10.count(), 0);
+
+        for i in 1..=12 {
+            macd_10.update_raw(f64::from(i));
+            assert_eq!(macd_10.count(), i as usize);
+        }
     }
 }

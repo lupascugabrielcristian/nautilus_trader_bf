@@ -15,9 +15,8 @@
 
 //! Enumerations for the trading domain model.
 
-use std::{str::FromStr, sync::OnceLock};
+use std::{borrow::Cow, fmt::Display, marker::PhantomData, str::FromStr};
 
-use ahash::AHashSet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use strum::{AsRefStr, Display, EnumIter, EnumString, FromRepr};
 
@@ -68,7 +67,7 @@ pub trait FromU16 {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -113,7 +112,7 @@ pub enum AccountType {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -155,7 +154,7 @@ pub enum AggregationSource {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -169,17 +168,23 @@ pub enum AggressorSide {
     #[default]
     NoAggressor = 0,
     /// The BUY order was the aggressor for the trade.
-    Buyer = 1,
+    ///
+    /// The deprecated `BUYER` serialization value is still accepted when parsing.
+    #[strum(serialize = "BUYER", to_string = "BUY")]
+    Buy = 1,
     /// The SELL order was the aggressor for the trade.
-    Seller = 2,
+    ///
+    /// The deprecated `SELLER` serialization value is still accepted when parsing.
+    #[strum(serialize = "SELLER", to_string = "SELL")]
+    Sell = 2,
 }
 
 impl FromU8 for AggressorSide {
     fn from_u8(value: u8) -> Option<Self> {
         match value {
             0 => Some(Self::NoAggressor),
-            1 => Some(Self::Buyer),
-            2 => Some(Self::Seller),
+            1 => Some(Self::Buy),
+            2 => Some(Self::Sell),
             _ => None,
         }
     }
@@ -210,7 +215,7 @@ impl FromU8 for AggressorSide {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -277,7 +282,7 @@ impl FromU8 for AssetClass {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -351,7 +356,7 @@ pub enum BarAggregation {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -393,7 +398,7 @@ pub enum BarIntervalType {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -421,16 +426,10 @@ impl BetSide {
 }
 
 impl From<OrderSide> for BetSide {
-    /// Returns the equivalent [`BetSide`] for a given [`OrderSide`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if `side` is [`OrderSide::NoOrderSide`].
     fn from(side: OrderSide) -> Self {
         match side {
             OrderSide::Buy => Self::Back,
             OrderSide::Sell => Self::Lay,
-            OrderSide::NoOrderSide => panic!("Invalid `OrderSide` for `BetSide`, was {side}"),
         }
     }
 }
@@ -460,7 +459,7 @@ impl From<OrderSide> for BetSide {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -517,7 +516,7 @@ impl FromU8 for BookAction {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -550,12 +549,14 @@ impl FromU8 for BookType {
 /// The order contingency type which specifies the behavior of linked orders.
 ///
 /// [FIX 5.0 SP2 : ContingencyType <1385> field](https://www.onixs.biz/fix-dictionary/5.0.sp2/tagnum_1385.html).
+///
+/// Python retains `NO_CONTINGENCY` as a compatibility alias for `None`. The alias is not an enum
+/// variant and may be removed in a future version.
 #[repr(C)]
 #[derive(
     Copy,
     Clone,
     Debug,
-    Default,
     Display,
     Hash,
     PartialEq,
@@ -575,7 +576,7 @@ impl FromU8 for BookType {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -585,9 +586,6 @@ impl FromU8 for BookType {
     pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.model")
 )]
 pub enum ContingencyType {
-    /// Not a contingent order.
-    #[default]
-    NoContingency = 0,
     /// One-Cancels-the-Other.
     Oco = 1,
     /// One-Triggers-the-Other.
@@ -634,7 +632,7 @@ pub enum ContingencyType {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -694,7 +692,7 @@ impl ContinuousFutureAdjustmentType {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -737,7 +735,7 @@ pub enum CurrencyType {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -765,7 +763,7 @@ pub enum InstrumentClass {
     Option = 8,
     /// An option spread instrument class. A strategy involving the purchase and/or sale of multiple option contracts on the same underlying asset with different strike prices or expiration dates to hedge risk or speculate on price movements.
     OptionSpread = 9,
-    /// A warrant instrument class. A derivative that gives the holder the right, but not the obligation, to buy or sell a security—most commonly an equity—at a certain price before expiration.
+    /// A warrant instrument class. A derivative that gives the holder the right, but not the obligation, to buy or sell a security - most commonly an equity - at a certain price before expiration.
     Warrant = 10,
     /// A sports betting instrument class. A financialized derivative that allows wagering on the outcome of sports events using structured contracts or prediction markets.
     SportsBetting = 11,
@@ -844,7 +842,7 @@ impl InstrumentClass {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -896,7 +894,7 @@ impl FromU8 for InstrumentCloseType {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -939,7 +937,7 @@ pub enum LiquiditySide {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -951,12 +949,12 @@ pub enum LiquiditySide {
 pub enum MarketStatus {
     /// The instrument is trading.
     Open = 1,
-    /// The instrument is in a pre-open period.
+    /// Trading in the instrument has closed.
     Closed = 2,
     /// Trading in the instrument has been paused.
     Paused = 3,
     /// Trading in the instrument has been halted.
-    // Halted = 4,  # TODO: Unfortunately can't use this yet due to Cython (C enum namespacing)
+    Halted = 4,
     /// Trading in the instrument has been suspended.
     Suspended = 5,
     /// Trading in the instrument is not available.
@@ -988,7 +986,7 @@ pub enum MarketStatus {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -1032,7 +1030,7 @@ pub enum MarketStatusAction {
     NotAvailableForTrading = 15,
 }
 
-/// Convert the given `value` to an [`OrderSide`].
+/// Convert the given `value` to a [`MarketStatusAction`].
 impl FromU16 for MarketStatusAction {
     fn from_u16(value: u16) -> Option<Self> {
         match value {
@@ -1083,7 +1081,7 @@ impl FromU16 for MarketStatusAction {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -1129,7 +1127,7 @@ pub enum OmsType {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -1181,7 +1179,7 @@ pub enum OptionKind {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -1224,7 +1222,7 @@ pub enum GreeksConvention {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -1241,13 +1239,15 @@ pub enum OtoTriggerMode {
     Full = 1,
 }
 
-/// The order side for a specific order, or action related to orders.
+/// The order side (BUY or SELL).
+///
+/// Python retains `NO_ORDER_SIDE` as a compatibility alias for `None`. The alias is not an enum
+/// variant and may be removed in a future version.
 #[repr(C)]
 #[derive(
     Copy,
     Clone,
     Debug,
-    Default,
     Display,
     Hash,
     PartialEq,
@@ -1267,7 +1267,7 @@ pub enum OtoTriggerMode {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -1277,9 +1277,6 @@ pub enum OtoTriggerMode {
     pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.model")
 )]
 pub enum OrderSide {
-    /// No order side is specified.
-    #[default]
-    NoOrderSide = 0,
     /// The order is a BUY.
     Buy = 1,
     /// The order is a SELL.
@@ -1287,75 +1284,12 @@ pub enum OrderSide {
 }
 
 impl OrderSide {
-    /// Returns the specified [`OrderSideSpecified`] (BUY or SELL) for this side.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `self` is [`OrderSide::NoOrderSide`].
-    #[must_use]
-    pub fn as_specified(&self) -> OrderSideSpecified {
-        match &self {
-            Self::Buy => OrderSideSpecified::Buy,
-            Self::Sell => OrderSideSpecified::Sell,
-            Self::NoOrderSide => panic!("Order invariant failed: side must be `Buy` or `Sell`"),
-        }
-    }
-}
-
-/// Convert the given `value` to an [`OrderSide`].
-impl FromU8 for OrderSide {
-    fn from_u8(value: u8) -> Option<Self> {
-        match value {
-            0 => Some(Self::NoOrderSide),
-            1 => Some(Self::Buy),
-            2 => Some(Self::Sell),
-            _ => None,
-        }
-    }
-}
-
-/// The specified order side (BUY or SELL).
-#[repr(C)]
-#[derive(
-    Copy,
-    Clone,
-    Debug,
-    Display,
-    Hash,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    AsRefStr,
-    FromRepr,
-    EnumIter,
-    EnumString,
-)]
-#[strum(ascii_case_insensitive)]
-#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
-pub enum OrderSideSpecified {
-    /// The order is a BUY.
-    Buy = 1,
-    /// The order is a SELL.
-    Sell = 2,
-}
-
-impl OrderSideSpecified {
     /// Returns the opposite order side.
     #[must_use]
     pub fn opposite(&self) -> Self {
         match &self {
             Self::Buy => Self::Sell,
             Self::Sell => Self::Buy,
-        }
-    }
-
-    /// Converts this specified side into an [`OrderSide`].
-    #[must_use]
-    pub fn as_order_side(&self) -> OrderSide {
-        match &self {
-            Self::Buy => OrderSide::Buy,
-            Self::Sell => OrderSide::Sell,
         }
     }
 }
@@ -1380,6 +1314,7 @@ impl OrderSideSpecified {
 ///  - `CANCELED`
 ///  - `EXPIRED`
 ///  - `FILLED`
+///  - `VOIDED`
 #[repr(C)]
 #[derive(
     Copy,
@@ -1404,7 +1339,7 @@ impl OrderSideSpecified {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -1416,7 +1351,7 @@ impl OrderSideSpecified {
 pub enum OrderStatus {
     /// The order is initialized (instantiated) within the Nautilus system.
     Initialized = 1,
-    /// The order was denied by the Nautilus system, either for being invalid, unprocessable or exceeding a risk limit.
+    /// The order was denied by the Nautilus system, either for being invalid, unprocessable, or exceeding a risk limit.
     Denied = 2,
     /// The order became emulated by the Nautilus system in the `OrderEmulator` component.
     Emulated = 3,
@@ -1442,6 +1377,8 @@ pub enum OrderStatus {
     PartiallyFilled = 13,
     /// The order has been completely filled on a trading venue (closed/done).
     Filled = 14,
+    /// The order is terminal after an authoritative venue void or fill correction.
+    Voided = 15,
 }
 
 impl OrderStatus {
@@ -1464,7 +1401,12 @@ impl OrderStatus {
     pub const fn is_closed(self) -> bool {
         matches!(
             self,
-            Self::Denied | Self::Rejected | Self::Canceled | Self::Expired | Self::Filled
+            Self::Denied
+                | Self::Rejected
+                | Self::Canceled
+                | Self::Expired
+                | Self::Filled
+                | Self::Voided
         )
     }
 
@@ -1475,33 +1417,6 @@ impl OrderStatus {
             self,
             Self::Accepted | Self::Triggered | Self::PendingUpdate | Self::PartiallyFilled
         )
-    }
-
-    /// Returns a cached `AHashSet` of order statuses safe for cancellation queries.
-    ///
-    /// These are statuses where an order is working on the venue but not already
-    /// in the process of being cancelled or updated. Including `PENDING_CANCEL`
-    /// in cancellation filters can cause duplicate cancel attempts or incorrect open order counts.
-    ///
-    /// Returns:
-    /// - `ACCEPTED`: Order is working on the venue.
-    /// - `TRIGGERED`: Stop order has been triggered.
-    /// - `PENDING_UPDATE`: Order being updated.
-    /// - `PARTIALLY_FILLED`: Order is partially filled but still working.
-    ///
-    /// Excludes:
-    /// - `PENDING_CANCEL`: Already being cancelled.
-    #[must_use]
-    pub fn cancellable_statuses_set() -> &'static AHashSet<Self> {
-        static CANCELLABLE_SET: OnceLock<AHashSet<OrderStatus>> = OnceLock::new();
-        CANCELLABLE_SET.get_or_init(|| {
-            AHashSet::from_iter([
-                Self::Accepted,
-                Self::Triggered,
-                Self::PendingUpdate,
-                Self::PartiallyFilled,
-            ])
-        })
     }
 }
 
@@ -1530,7 +1445,7 @@ impl OrderStatus {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -1585,7 +1500,7 @@ pub enum OrderType {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -1611,13 +1526,15 @@ impl FromU8 for PositionAdjustmentType {
     }
 }
 
-/// The market side for a specific position, or action related to positions.
+/// The position side (FLAT, LONG, or SHORT).
+///
+/// Python retains `NO_POSITION_SIDE` as a compatibility alias for `None`. The alias is not an enum
+/// variant and may be removed in a future version.
 #[repr(C)]
 #[derive(
     Copy,
     Clone,
     Debug,
-    Default,
     Display,
     Hash,
     PartialEq,
@@ -1637,7 +1554,7 @@ impl FromU8 for PositionAdjustmentType {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -1647,10 +1564,7 @@ impl FromU8 for PositionAdjustmentType {
     pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.model")
 )]
 pub enum PositionSide {
-    /// No position side is specified (only valid in the context of a filter for actions involving positions).
-    #[default]
-    NoPositionSide = 0,
-    /// A neural/flat position, where no position is currently held in the market.
+    /// A neutral/flat position, where no position is currently held in the market.
     Flat = 1,
     /// A long position in the market, typically acquired through one or many BUY orders.
     Long = 2,
@@ -1658,78 +1572,252 @@ pub enum PositionSide {
     Short = 3,
 }
 
-impl PositionSide {
-    /// Returns the specified [`PositionSideSpecified`] (`Long`, `Short`, or `Flat`) for this side.
+/// Serde compatibility for an optional order side previously encoded with `NO_ORDER_SIDE`.
+pub mod serde_option_order_side {
+    use serde::{Deserializer, Serializer};
+
+    use super::{OrderSide, deserialize_optional_enum, serialize_optional_enum};
+
+    /// Serializes an optional order side using the legacy no-side token.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `self` is [`PositionSide::NoPositionSide`].
-    #[must_use]
-    pub fn as_specified(&self) -> PositionSideSpecified {
-        match &self {
-            Self::Long => PositionSideSpecified::Long,
-            Self::Short => PositionSideSpecified::Short,
-            Self::Flat => PositionSideSpecified::Flat,
-            Self::NoPositionSide => {
-                panic!("Position invariant failed: side must be `Long`, `Short`, or `Flat`")
+    /// Returns an error if the serializer cannot encode the value.
+    pub fn serialize<S>(value: &Option<OrderSide>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serialize_optional_enum(value.as_ref(), serializer, "NO_ORDER_SIDE")
+    }
+
+    /// Deserializes an optional order side from a side token or null.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input is not a valid order side.
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<OrderSide>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_optional_enum(
+            deserializer,
+            "NO_ORDER_SIDE",
+            "BUY, SELL, NO_ORDER_SIDE, or null",
+        )
+    }
+}
+
+/// Serde compatibility for an optional position side previously encoded with `NO_POSITION_SIDE`.
+pub mod serde_option_position_side {
+    use serde::{Deserializer, Serializer};
+
+    use super::{PositionSide, deserialize_optional_enum, serialize_optional_enum};
+
+    /// Serializes an optional position side using the legacy no-side token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the serializer cannot encode the value.
+    pub fn serialize<S>(value: &Option<PositionSide>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serialize_optional_enum(value.as_ref(), serializer, "NO_POSITION_SIDE")
+    }
+
+    /// Deserializes an optional position side from a side token or null.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input is not a valid position side.
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<PositionSide>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_optional_enum(
+            deserializer,
+            "NO_POSITION_SIDE",
+            "FLAT, LONG, SHORT, NO_POSITION_SIDE, or null",
+        )
+    }
+}
+
+/// Serde compatibility for an optional contingency type previously encoded with `NO_CONTINGENCY`.
+pub mod serde_option_contingency_type {
+    use serde::{Deserializer, Serializer};
+
+    use super::{ContingencyType, deserialize_optional_enum, serialize_optional_enum};
+
+    /// Serializes an optional contingency type using the legacy no-contingency token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the serializer cannot encode the value.
+    pub fn serialize<S>(value: &Option<ContingencyType>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serialize_optional_enum(value.as_ref(), serializer, "NO_CONTINGENCY")
+    }
+
+    /// Deserializes an optional contingency type from a contingency token or null.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input is not a valid contingency type.
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<ContingencyType>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_optional_enum(
+            deserializer,
+            "NO_CONTINGENCY",
+            "OCO, OTO, OUO, NO_CONTINGENCY, or null",
+        )
+    }
+}
+
+/// Serde compatibility for an optional trailing offset type previously encoded with
+/// `NO_TRAILING_OFFSET`.
+pub mod serde_option_trailing_offset_type {
+    use serde::{Deserializer, Serializer};
+
+    use super::{TrailingOffsetType, deserialize_optional_enum, serialize_optional_enum};
+
+    /// Serializes an optional trailing offset type using the legacy no-offset token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the serializer cannot encode the value.
+    pub fn serialize<S>(
+        value: &Option<TrailingOffsetType>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serialize_optional_enum(value.as_ref(), serializer, "NO_TRAILING_OFFSET")
+    }
+
+    /// Deserializes an optional trailing offset type from an offset token or null.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input is not a valid trailing offset type.
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<TrailingOffsetType>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_optional_enum(
+            deserializer,
+            "NO_TRAILING_OFFSET",
+            "PRICE, BASIS_POINTS, TICKS, PRICE_TIER, NO_TRAILING_OFFSET, or null",
+        )
+    }
+}
+
+/// Serde compatibility for an optional trigger type previously encoded with `NO_TRIGGER`.
+pub mod serde_option_trigger_type {
+    use serde::{Deserializer, Serializer};
+
+    use super::{TriggerType, deserialize_optional_enum, serialize_optional_enum};
+
+    /// Serializes an optional trigger type using the legacy no-trigger token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the serializer cannot encode the value.
+    pub fn serialize<S>(value: &Option<TriggerType>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serialize_optional_enum(value.as_ref(), serializer, "NO_TRIGGER")
+    }
+
+    /// Deserializes an optional trigger type from a trigger token or null.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input is not a valid trigger type.
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<TriggerType>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_optional_enum(
+            deserializer,
+            "NO_TRIGGER",
+            "a trigger type, NO_TRIGGER, or null",
+        )
+    }
+}
+
+fn serialize_optional_enum<S, T>(
+    value: Option<&T>,
+    serializer: S,
+    none_token: &'static str,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    T: AsRef<str>,
+{
+    serializer.serialize_str(value.map_or(none_token, AsRef::as_ref))
+}
+
+fn deserialize_optional_enum<'de, D, T>(
+    deserializer: D,
+    none_token: &'static str,
+    expected: &'static str,
+) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: FromStr,
+    T::Err: Display,
+{
+    struct OptionalEnumVisitor<T> {
+        none_token: &'static str,
+        expected: &'static str,
+        marker: PhantomData<T>,
+    }
+
+    impl<'de, T> serde::de::Visitor<'de> for OptionalEnumVisitor<T>
+    where
+        T: FromStr,
+        T::Err: Display,
+    {
+        type Value = Option<T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(self.expected)
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            let value = Cow::<'de, str>::deserialize(deserializer)?;
+            if value.eq_ignore_ascii_case(self.none_token) {
+                Ok(None)
+            } else {
+                T::from_str(&value)
+                    .map(Some)
+                    .map_err(serde::de::Error::custom)
             }
         }
     }
-}
 
-/// The market side for a specific position, or action related to positions.
-#[repr(C)]
-#[derive(
-    Copy,
-    Clone,
-    Debug,
-    Display,
-    Hash,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    AsRefStr,
-    FromRepr,
-    EnumIter,
-    EnumString,
-)]
-#[strum(ascii_case_insensitive)]
-#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(
-        frozen,
-        eq,
-        eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
-        from_py_object,
-        rename_all = "SCREAMING_SNAKE_CASE",
-    )
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.model")
-)]
-pub enum PositionSideSpecified {
-    /// A neural/flat position, where no position is currently held in the market.
-    Flat = 1,
-    /// A long position in the market, typically acquired through one or many BUY orders.
-    Long = 2,
-    /// A short position in the market, typically acquired through one or many SELL orders.
-    Short = 3,
-}
-
-impl PositionSideSpecified {
-    /// Converts this specified side into a [`PositionSide`].
-    #[must_use]
-    pub fn as_position_side(&self) -> PositionSide {
-        match &self {
-            Self::Long => PositionSide::Long,
-            Self::Short => PositionSide::Short,
-            Self::Flat => PositionSide::Flat,
-        }
-    }
+    deserializer.deserialize_option(OptionalEnumVisitor {
+        none_token,
+        expected,
+        marker: PhantomData,
+    })
 }
 
 /// The type of price for an instrument in a market.
@@ -1757,7 +1845,7 @@ impl PositionSideSpecified {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -1767,9 +1855,9 @@ impl PositionSideSpecified {
     pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.model")
 )]
 pub enum PriceType {
-    // TODO: Revisit during v2 cutover after Cython and legacy FFI removal. Make bar price
-    // sources consistent with mark/index price subscriptions, including `PriceType::Index` and
-    // internal bar aggregation from mark/index updates. Document the source derivation order.
+    // Bar price sources are not yet consistent with mark/index price subscriptions. The open
+    // decisions are whether to add a `PriceType::Index` variant, whether to aggregate bars
+    // internally from mark/index updates, and what the documented source derivation order is.
     /// The best quoted price at which buyers are willing to buy a quantity of an instrument.
     /// Often considered the best bid in the order book.
     Bid = 1,
@@ -1810,7 +1898,7 @@ pub enum PriceType {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -1868,7 +1956,7 @@ impl RecordFlag {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -1919,7 +2007,7 @@ pub enum TimeInForce {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -1938,12 +2026,14 @@ pub enum TradingState {
 }
 
 /// The trailing offset type for an order type which specifies a trailing stop/trigger or limit price.
+///
+/// Python retains `NO_TRAILING_OFFSET` as a compatibility alias for `None`. The alias is not an enum
+/// variant and may be removed in a future version.
 #[repr(C)]
 #[derive(
     Copy,
     Clone,
     Debug,
-    Default,
     Display,
     Hash,
     PartialEq,
@@ -1963,7 +2053,7 @@ pub enum TradingState {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -1973,9 +2063,6 @@ pub enum TradingState {
     pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.model")
 )]
 pub enum TrailingOffsetType {
-    /// No trailing offset type is specified (invalid for trailing type orders).
-    #[default]
-    NoTrailingOffset = 0,
     /// The trailing offset is based on a market price.
     Price = 1,
     /// The trailing offset is based on a percentage represented in basis points, of a market price.
@@ -1987,12 +2074,14 @@ pub enum TrailingOffsetType {
 }
 
 /// The trigger type for the stop/trigger price of an order.
+///
+/// Python retains `NO_TRIGGER` as a compatibility alias for `None`. The alias is not an enum variant
+/// and may be removed in a future version.
 #[repr(C)]
 #[derive(
     Copy,
     Clone,
     Debug,
-    Default,
     Display,
     Hash,
     PartialEq,
@@ -2012,7 +2101,7 @@ pub enum TrailingOffsetType {
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model.enums",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -2022,9 +2111,6 @@ pub enum TrailingOffsetType {
     pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.model")
 )]
 pub enum TriggerType {
-    /// No trigger type is specified (invalid for orders with a trigger).
-    #[default]
-    NoTrigger = 0,
     /// The default trigger type set by the trading venue.
     Default = 1,
     /// Based on the last traded price for the instrument.
@@ -2065,12 +2151,10 @@ enum_strum_serde!(MarketStatusAction);
 enum_strum_serde!(OmsType);
 enum_strum_serde!(OptionKind);
 enum_strum_serde!(OrderSide);
-enum_strum_serde!(OrderSideSpecified);
 enum_strum_serde!(OrderStatus);
 enum_strum_serde!(OrderType);
 enum_strum_serde!(PositionAdjustmentType);
 enum_strum_serde!(PositionSide);
-enum_strum_serde!(PositionSideSpecified);
 enum_strum_serde!(PriceType);
 enum_strum_serde!(RecordFlag);
 enum_strum_serde!(TimeInForce);
@@ -2084,14 +2168,149 @@ mod tests {
 
     use super::*;
 
+    #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    struct OptionalSides {
+        #[serde(with = "serde_option_order_side")]
+        order: Option<OrderSide>,
+        #[serde(with = "serde_option_position_side")]
+        position: Option<PositionSide>,
+    }
+
+    #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    struct OptionalOrderTypes {
+        #[serde(with = "serde_option_contingency_type")]
+        contingency: Option<ContingencyType>,
+        #[serde(with = "serde_option_trailing_offset_type")]
+        trailing_offset: Option<TrailingOffsetType>,
+        #[serde(with = "serde_option_trigger_type")]
+        trigger: Option<TriggerType>,
+    }
+
+    #[rstest]
+    fn test_optional_sides_serde_preserves_legacy_none_tokens() {
+        let value = OptionalSides {
+            order: None,
+            position: None,
+        };
+
+        let json = serde_json::to_string(&value).unwrap();
+        let decoded: OptionalSides = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            json,
+            r#"{"order":"NO_ORDER_SIDE","position":"NO_POSITION_SIDE"}"#
+        );
+        assert_eq!(decoded, value);
+    }
+
+    #[rstest]
+    fn test_optional_sides_serde_accepts_null_and_valid_sides() {
+        let json = r#"{"order":null,"position":"LONG"}"#;
+        let decoded: OptionalSides = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            decoded,
+            OptionalSides {
+                order: None,
+                position: Some(PositionSide::Long),
+            }
+        );
+    }
+
+    #[rstest]
+    fn test_optional_order_types_serde_preserves_legacy_none_tokens() {
+        let value = OptionalOrderTypes {
+            contingency: None,
+            trailing_offset: None,
+            trigger: None,
+        };
+
+        let json = serde_json::to_string(&value).unwrap();
+        let decoded: OptionalOrderTypes = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            json,
+            r#"{"contingency":"NO_CONTINGENCY","trailing_offset":"NO_TRAILING_OFFSET","trigger":"NO_TRIGGER"}"#,
+        );
+        assert_eq!(decoded, value);
+    }
+
+    #[rstest]
+    fn test_optional_order_types_serde_accepts_null_and_valid_values() {
+        let json = r#"{"contingency":null,"trailing_offset":"PRICE","trigger":"LAST_PRICE"}"#;
+        let decoded: OptionalOrderTypes = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            decoded,
+            OptionalOrderTypes {
+                contingency: None,
+                trailing_offset: Some(TrailingOffsetType::Price),
+                trigger: Some(TriggerType::LastPrice),
+            },
+        );
+    }
+
+    #[rstest]
+    #[case(r#"{"contingency":"INVALID","trailing_offset":"NO_TRAILING_OFFSET","trigger":"NO_TRIGGER"}"#)]
+    #[case(
+        r#"{"contingency":"NO_CONTINGENCY","trailing_offset":"INVALID","trigger":"NO_TRIGGER"}"#
+    )]
+    #[case(r#"{"contingency":"NO_CONTINGENCY","trailing_offset":"NO_TRAILING_OFFSET","trigger":"INVALID"}"#)]
+    fn test_optional_order_types_serde_rejects_invalid_values(#[case] json: &str) {
+        assert!(serde_json::from_str::<OptionalOrderTypes>(json).is_err());
+    }
+
     #[rstest]
     #[case::no_aggressor(0, Some(AggressorSide::NoAggressor))]
-    #[case::buyer(1, Some(AggressorSide::Buyer))]
-    #[case::seller(2, Some(AggressorSide::Seller))]
+    #[case::buy(1, Some(AggressorSide::Buy))]
+    #[case::sell(2, Some(AggressorSide::Sell))]
     #[case::invalid(3, None)]
     #[case::max_u8(255, None)]
     fn test_aggressor_side_from_u8(#[case] value: u8, #[case] expected: Option<AggressorSide>) {
         assert_eq!(AggressorSide::from_u8(value), expected);
+    }
+
+    #[rstest]
+    #[case(AggressorSide::NoAggressor, "NO_AGGRESSOR")]
+    #[case(AggressorSide::Buy, "BUY")]
+    #[case(AggressorSide::Sell, "SELL")]
+    fn test_aggressor_side_to_string(#[case] value: AggressorSide, #[case] expected: &str) {
+        assert_eq!(value.to_string(), expected);
+        assert_eq!(value.as_ref(), expected);
+    }
+
+    #[rstest]
+    #[case(AggressorSide::NoAggressor, "NO_AGGRESSOR")]
+    #[case(AggressorSide::Buy, "BUY")]
+    #[case(AggressorSide::Sell, "SELL")]
+    #[case(AggressorSide::Buy, "BUYER")]
+    #[case(AggressorSide::Sell, "SELLER")]
+    #[case(AggressorSide::Buy, "buy")]
+    #[case(AggressorSide::Sell, "seller")]
+    fn test_aggressor_side_from_str(#[case] expected: AggressorSide, #[case] value: &str) {
+        assert_eq!(AggressorSide::from_str(value), Ok(expected));
+    }
+
+    #[rstest]
+    #[case(AggressorSide::Buy, "\"BUY\"")]
+    #[case(AggressorSide::Sell, "\"SELL\"")]
+    #[case(AggressorSide::NoAggressor, "\"NO_AGGRESSOR\"")]
+    fn test_aggressor_side_serde_roundtrip(#[case] input: AggressorSide, #[case] expected: &str) {
+        let json = serde_json::to_string(&input).unwrap();
+        assert_eq!(json, expected);
+        let parsed: AggressorSide = serde_json::from_str(expected).unwrap();
+        assert_eq!(parsed, input);
+    }
+
+    #[rstest]
+    #[case("BUYER", AggressorSide::Buy)]
+    #[case("SELLER", AggressorSide::Sell)]
+    fn test_aggressor_side_serde_accepts_historical(
+        #[case] value: &str,
+        #[case] expected: AggressorSide,
+    ) {
+        let parsed: AggressorSide = serde_json::from_str(&format!("\"{value}\"")).unwrap();
+        assert_eq!(parsed, expected);
     }
 
     #[rstest]

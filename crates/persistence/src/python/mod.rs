@@ -29,7 +29,7 @@ use nautilus_model::data::ensure_rust_extractor_registered;
 use nautilus_serialization::arrow::custom::ensure_custom_data_registered;
 use pyo3::prelude::*;
 
-/// Loaded as `nautilus_pyo3.persistence`.
+/// Exposed through `nautilus_trader.persistence`.
 ///
 /// # Errors
 ///
@@ -54,6 +54,7 @@ pub fn persistence(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::backend::session::DataBackendSession>()?;
     m.add_class::<crate::backend::session::DataQueryResult>()?;
     m.add_class::<backend::session::NautilusDataType>()?;
+    m.add_class::<crate::config::DataCatalogConfig>()?;
     m.add_class::<catalog::PyParquetDataCatalog>()?;
     m.add_class::<feather::PyStreamingFeatherWriter>()?;
     m.add_class::<wranglers::bar::BarDataWrangler>()?;

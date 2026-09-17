@@ -17,18 +17,18 @@
 //!
 //! Configures the Polymarket data client with `subscribe_new_markets: true` so
 //! the WebSocket connection receives `new_market` events. A [`SearchFilter`]
-//! pre-populates BTC markets from the Gamma search API at startup — these
-//! serve as the initial instrument set. Any new market created on Polymarket
-//! is then fetched from the Gamma API and emitted alongside the initial BTC
-//! instruments. A custom [`DataActor`] subscribes to all instruments from the
-//! POLYMARKET venue and logs every instrument that arrives — including newly
-//! created markets pushed in real time.
+//! pre-populates the configured query's markets from the Gamma search API at
+//! startup - these serve as the initial instrument set. Any new market created
+//! on Polymarket is then fetched from the Gamma API and emitted alongside the
+//! initial instruments. A custom [`DataActor`] subscribes to all instruments
+//! from the POLYMARKET venue and logs every instrument that arrives - including
+//! newly created markets pushed in real time.
 //!
-//! # Usage
+//! Edit the constants below to change the initial market search query.
 //!
-//! ```sh
-//! cargo run --example polymarket-new-market-monitor --package nautilus-polymarket --features examples
-//! ```
+//! Run with: `cargo run --example polymarket-new-market-monitor --package nautilus-polymarket --features examples`
+//!
+//! This data-only example uses public Polymarket endpoints and does not require credentials.
 
 use std::sync::Arc;
 
@@ -41,19 +41,22 @@ use nautilus_common::{
 };
 use nautilus_live::node::LiveNode;
 use nautilus_model::{
-    identifiers::{AccountId, ClientId, TraderId},
+    identifiers::{ClientId, TraderId},
     instruments::{Instrument, InstrumentAny},
 };
 use nautilus_polymarket::{
     common::{
         consts::{POLYMARKET_CLIENT_ID, POLYMARKET_VENUE},
-        enums::SignatureType,
         models::PolymarketLabel,
     },
-    config::{PolymarketDataClientConfig, PolymarketExecClientConfig},
-    factories::{PolymarketDataClientFactory, PolymarketExecutionClientFactory},
+    config::PolymarketDataClientConfig,
+    factories::PolymarketDataClientFactory,
     filters::SearchFilter,
 };
+
+const TRADER_ID: &str = "TESTER-001";
+const NODE_NAME: &str = "POLYMARKET-NEW-MARKET-MONITOR-001";
+const SEARCH_QUERY: &str = "BTC";
 
 #[derive(Debug, Clone)]
 struct NewMarketMonitorConfig {
@@ -92,7 +95,6 @@ impl DataActor for NewMarketMonitor {
             .iter()
             .map(|i| (i.id(), PolymarketLabel::from_instrument(i)))
             .collect();
-        drop(cache);
 
         log::info!(
             "Initial provider load: {} instruments in cache",
@@ -101,7 +103,7 @@ impl DataActor for NewMarketMonitor {
 
         self.instrument_count = cached_instruments.len();
 
-        // Subscribe to all instruments from the venue — this will deliver
+        // Subscribe to all instruments from the venue - this will deliver
         // both existing and any new instruments pushed by the data client
         // when subscribe_new_markets is enabled.
         self.subscribe_instruments(venue, client_id, None);
@@ -115,7 +117,7 @@ impl DataActor for NewMarketMonitor {
         self.instrument_count += 1;
         let label = PolymarketLabel::from_instrument(instrument);
         log::info!(
-            "Instrument received (total={}): {} — {label} | tick_size={} price_prec={} size_prec={}",
+            "Instrument received (total={}): {} - {label} | tick_size={} price_prec={} size_prec={}",
             self.instrument_count,
             instrument.id(),
             instrument.price_increment(),
@@ -131,23 +133,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
     let environment = Environment::Live;
-    let trader_id = TraderId::from("TESTER-001");
-    let account_id = AccountId::from("POLYMARKET-001");
+    let trader_id = TraderId::from(TRADER_ID);
     let client_id = *POLYMARKET_CLIENT_ID;
 
-    // SearchFilter pre-populates BTC markets as the initial instrument set
-    let search_filter = SearchFilter::from_query("BTC");
+    // SearchFilter pre-populates the query's markets as the initial instrument set
+    let search_filter = SearchFilter::from_query(SEARCH_QUERY);
 
     let data_config = PolymarketDataClientConfig {
         subscribe_new_markets: true,
         filters: vec![Arc::new(search_filter)],
-        ..Default::default()
-    };
-
-    let exec_config = PolymarketExecClientConfig {
-        trader_id,
-        account_id,
-        signature_type: SignatureType::PolyGnosisSafe,
         ..Default::default()
     };
 
@@ -157,21 +151,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut node = LiveNode::builder(trader_id, environment)?
-        .with_name("POLYMARKET-NEW-MARKET-MONITOR-001".to_string())
+        .with_name(NODE_NAME.to_string())
         .with_logging(log_config)
-        .with_reconciliation(true)
-        .with_reconciliation_lookback_mins(120)
-        .with_timeout_reconciliation(60)
         .with_delay_post_stop_secs(2)
         .add_data_client(
             None,
             Box::new(PolymarketDataClientFactory),
             Box::new(data_config),
-        )?
-        .add_exec_client(
-            None,
-            Box::new(PolymarketExecutionClientFactory),
-            Box::new(exec_config),
         )?
         .build()?;
 

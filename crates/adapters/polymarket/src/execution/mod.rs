@@ -15,42 +15,45 @@
 
 //! Live execution client implementation for the Polymarket adapter.
 
+pub mod order_builder;
+pub mod parse;
+
+pub(crate) mod identity;
+pub(crate) mod order_fill_tracker;
+pub(crate) mod pending;
+pub(crate) mod reconciliation;
+pub(crate) mod submitter;
+pub(crate) mod types;
+
 mod cancellations;
 mod lifecycle;
 mod orders;
 mod reports;
 mod responses;
 
-pub mod order_builder;
-pub(crate) mod order_fill_tracker;
-pub mod parse;
-pub(crate) mod reconciliation;
-pub(crate) mod submitter;
-pub(crate) mod types;
-
 use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
-use ahash::AHashSet;
 use anyhow::Context;
 use async_trait::async_trait;
 use nautilus_common::{
-    cache::fifo::FifoCacheMap,
     clients::ExecutionClient,
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
         GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
         ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
     },
+    msgbus::TypedHandler,
 };
 use nautilus_core::{
-    MUTEX_POISONED, UnixNanos,
+    Params, UnixNanos,
     collections::AtomicMap,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
-use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
+use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter, SocketControl, task::TaskGroup};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{AccountType, LiquiditySide, OmsType},
+    events::{OrderEventAny, PositionEvent},
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
     },
@@ -59,77 +62,54 @@ use nautilus_model::{
     types::{AccountBalance, MarginBalance, Money, Price, Quantity},
 };
 use nautilus_network::retry::RetryConfig;
-use tokio::task::JoinHandle;
+pub(crate) use responses::is_post_only_crossing;
+use rust_decimal::Decimal;
 use ustr::Ustr;
 
+pub(crate) use self::reports::get_pusd_currency;
 use self::{
-    order_builder::PolymarketOrderBuilder, order_fill_tracker::OrderFillTrackerMap,
+    identity::OrderIdentityRegistry,
+    order_builder::PolymarketOrderBuilder,
+    order_fill_tracker::OrderFillTrackerMap,
+    pending::{PendingCancelTracker, PendingSubmitTracker},
     submitter::OrderSubmitter,
 };
 use crate::{
     common::{consts::POLYMARKET_VENUE, credential::Secrets, enums::SignatureType},
-    config::PolymarketExecClientConfig,
+    config::PolymarketExecutionClientConfig,
     http::{clob::PolymarketClobHttpClient, data_api::PolymarketDataApiHttpClient},
     signing::eip712::OrderSigner,
-    websocket::client::PolymarketWebSocketClient,
+    websocket::{
+        USER_STREAMS_ENDPOINT, client::PolymarketWebSocketClient, dispatch::WsDispatchState,
+    },
 };
-
-type PendingSubmitMap = Arc<Mutex<FifoCacheMap<VenueOrderId, ClientOrderId, 10_000>>>;
-type PendingFillMap = Arc<Mutex<FifoCacheMap<VenueOrderId, Vec<FillReport>, 1_000>>>;
-type PendingOrderReportMap = Arc<Mutex<FifoCacheMap<VenueOrderId, Vec<OrderStatusReport>, 1_000>>>;
-
-pub(crate) use self::reports::get_pusd_currency;
 
 /// Live execution client for the Polymarket prediction market.
 #[derive(Debug)]
 pub struct PolymarketExecutionClient {
     core: ExecutionClientCore,
     clock: &'static AtomicTime,
-    config: PolymarketExecClientConfig,
+    config: PolymarketExecutionClientConfig,
     emitter: ExecutionEventEmitter,
     http_client: PolymarketClobHttpClient,
     data_api_client: PolymarketDataApiHttpClient,
     submitter: OrderSubmitter,
     ws_client: PolymarketWebSocketClient,
     secrets: Secrets,
-    pending_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    session_tasks: TaskGroup,
+    pending_tasks: TaskGroup,
+    shutdown_errors: Vec<String>,
     stopping: Arc<AtomicBool>,
-    ws_stream_handle: Mutex<Option<JoinHandle<()>>>,
+    heartbeat_healthy: Arc<AtomicBool>,
+    order_event_handler: Option<TypedHandler<OrderEventAny>>,
+    position_event_handler: Option<TypedHandler<PositionEvent>>,
     shared_token_instruments: Arc<AtomicMap<Ustr, InstrumentAny>>,
     neg_risk_index: Arc<AtomicMap<InstrumentId, bool>>,
-    fill_tracker: Arc<OrderFillTrackerMap>,
-    pending_submits: PendingSubmitMap,
+    pending_submits: PendingSubmitTracker,
     pending_cancels: PendingCancelTracker,
-    pending_fills: PendingFillMap,
-    pending_order_reports: PendingOrderReportMap,
-}
-
-#[derive(Clone, Debug, Default)]
-struct PendingCancelTracker {
-    client_order_ids: Arc<Mutex<AHashSet<ClientOrderId>>>,
-}
-
-impl PendingCancelTracker {
-    fn insert(&self, client_order_id: ClientOrderId) {
-        self.client_order_ids
-            .lock()
-            .expect(MUTEX_POISONED)
-            .insert(client_order_id);
-    }
-
-    fn remove(&self, client_order_id: &ClientOrderId) -> bool {
-        self.client_order_ids
-            .lock()
-            .expect(MUTEX_POISONED)
-            .remove(client_order_id)
-    }
-
-    fn contains(&self, client_order_id: &ClientOrderId) -> bool {
-        self.client_order_ids
-            .lock()
-            .expect(MUTEX_POISONED)
-            .contains(client_order_id)
-    }
+    order_identities: Arc<OrderIdentityRegistry>,
+    fill_tracker: Arc<OrderFillTrackerMap>,
+    ws_dispatch_state: Arc<Mutex<WsDispatchState>>,
 }
 
 impl PolymarketExecutionClient {
@@ -140,8 +120,9 @@ impl PolymarketExecutionClient {
     /// Returns an error if credentials cannot be resolved or clients fail to construct.
     pub fn new(
         core: ExecutionClientCore,
-        config: PolymarketExecClientConfig,
+        config: PolymarketExecutionClientConfig,
     ) -> anyhow::Result<Self> {
+        let proxy_url = config.validated_proxy_url()?;
         let secrets = Secrets::resolve(
             config.private_key.as_deref(),
             config.api_key.clone(),
@@ -152,30 +133,28 @@ impl PolymarketExecutionClient {
         .context("failed to resolve Polymarket credentials")?;
 
         let signer_address = secrets.address.clone();
-        let maker_address = secrets
-            .funder
-            .clone()
-            .unwrap_or_else(|| signer_address.clone());
-        if config.signature_type == SignatureType::Poly1271
-            && maker_address.eq_ignore_ascii_case(&signer_address)
-        {
-            anyhow::bail!(
-                "POLY_1271 signature type requires a deposit wallet funder distinct from the signing address"
-            );
-        }
-        let http_client = PolymarketClobHttpClient::new(
+        let maker_address = resolve_maker_address(
+            config.signature_type,
+            &signer_address,
+            secrets.funder.as_deref(),
+        )?;
+        let http_client = PolymarketClobHttpClient::new_with_proxy(
             secrets.credential.clone(),
             signer_address.clone(),
             config.base_url_http.clone(),
             config.http_timeout_secs,
+            proxy_url.clone(),
         )
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("failed to create CLOB HTTP client")?;
 
-        let data_api_client =
-            PolymarketDataApiHttpClient::new(Some(config.data_api_url()), config.http_timeout_secs)
-                .map_err(|e| anyhow::anyhow!("{e}"))
-                .context("failed to create Data API HTTP client")?;
+        let data_api_client = PolymarketDataApiHttpClient::new_with_proxy(
+            Some(config.data_api_url()),
+            config.http_timeout_secs,
+            proxy_url.clone(),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("failed to create Data API HTTP client")?;
 
         let order_signer =
             OrderSigner::new(&secrets.private_key).context("failed to create order signer")?;
@@ -198,11 +177,18 @@ impl PolymarketExecutionClient {
         };
         let submitter = OrderSubmitter::new(http_client.clone(), order_builder, retry_config);
 
-        let ws_client = PolymarketWebSocketClient::new_user(
+        let ws_client = PolymarketWebSocketClient::new_user_with_proxy(
             config.base_url_ws.clone(),
             secrets.credential.clone(),
             config.transport_backend,
+            proxy_url,
         );
+
+        let ws_client = ws_client.with_socket_control(SocketControl::new(
+            core.client_id,
+            Some(*POLYMARKET_VENUE),
+            USER_STREAMS_ENDPOINT,
+        ));
 
         let clock = get_atomic_clock_realtime();
         let pusd = get_pusd_currency();
@@ -214,6 +200,9 @@ impl PolymarketExecutionClient {
             Some(pusd),
         );
 
+        let session_tasks = TaskGroup::new();
+        let pending_tasks = TaskGroup::new();
+
         Ok(Self {
             core,
             clock,
@@ -224,24 +213,57 @@ impl PolymarketExecutionClient {
             submitter,
             ws_client,
             secrets,
-            pending_tasks: Arc::new(Mutex::new(Vec::new())),
+            session_tasks,
+            pending_tasks,
+            shutdown_errors: Vec::new(),
             stopping: Arc::new(AtomicBool::new(false)),
-            ws_stream_handle: Mutex::new(None),
+            heartbeat_healthy: Arc::new(AtomicBool::new(true)),
+            order_event_handler: None,
+            position_event_handler: None,
             shared_token_instruments: Arc::new(AtomicMap::new()),
             neg_risk_index: Arc::new(AtomicMap::new()),
-            fill_tracker: Arc::new(OrderFillTrackerMap::new()),
-            pending_submits: Arc::new(Mutex::new(FifoCacheMap::default())),
+            pending_submits: PendingSubmitTracker::default(),
             pending_cancels: PendingCancelTracker::default(),
-            pending_fills: Arc::new(Mutex::new(FifoCacheMap::default())),
-            pending_order_reports: Arc::new(Mutex::new(FifoCacheMap::default())),
+            order_identities: Arc::new(OrderIdentityRegistry::default()),
+            fill_tracker: Arc::new(OrderFillTrackerMap::new()),
+            ws_dispatch_state: Arc::new(Mutex::new(WsDispatchState::default())),
         })
     }
+}
+
+fn resolve_maker_address(
+    signature_type: SignatureType,
+    signer_address: &str,
+    funder: Option<&str>,
+) -> anyhow::Result<String> {
+    let maker_address = match signature_type {
+        SignatureType::Eoa => funder.unwrap_or(signer_address),
+        SignatureType::PolyProxy | SignatureType::PolyGnosisSafe | SignatureType::Poly1271 => {
+            funder.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Polymarket {signature_type:?} signature type requires a funder wallet address",
+                )
+            })?
+        }
+    };
+
+    if signature_type != SignatureType::Eoa && maker_address.eq_ignore_ascii_case(signer_address) {
+        anyhow::bail!(
+            "Polymarket {signature_type:?} signature type requires a funder distinct from the signing address",
+        );
+    }
+
+    Ok(maker_address.to_string())
 }
 
 #[async_trait(?Send)]
 impl ExecutionClient for PolymarketExecutionClient {
     fn is_connected(&self) -> bool {
         self.core.is_connected()
+            && (!self.config.heartbeat_enabled
+                || self
+                    .heartbeat_healthy
+                    .load(std::sync::atomic::Ordering::Acquire))
     }
 
     fn client_id(&self) -> ClientId {
@@ -264,15 +286,20 @@ impl ExecutionClient for PolymarketExecutionClient {
         self.core.cache().account_owned(&self.core.account_id)
     }
 
+    fn position_reconciliation_tolerance(&self) -> Decimal {
+        crate::common::consts::POSITION_RECONCILIATION_TOLERANCE
+    }
+
     fn generate_account_state(
         &self,
         balances: Vec<AccountBalance>,
         margins: Vec<MarginBalance>,
         reported: bool,
         ts_event: UnixNanos,
+        info: Option<Params>,
     ) -> anyhow::Result<()> {
         self.emitter
-            .emit_account_state(balances, margins, reported, ts_event);
+            .emit_account_state(balances, margins, reported, ts_event, info);
         Ok(())
     }
 
@@ -283,6 +310,11 @@ impl ExecutionClient for PolymarketExecutionClient {
 
     fn stop(&mut self) -> anyhow::Result<()> {
         self.stop_client();
+        Ok(())
+    }
+
+    fn reset(&mut self) -> anyhow::Result<()> {
+        self.reset_client();
         Ok(())
     }
 
@@ -306,8 +338,7 @@ impl ExecutionClient for PolymarketExecutionClient {
     }
 
     fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
-        self.cancel_all_orders_command(&cmd);
-        Ok(())
+        self.cancel_all_orders_command(&cmd)
     }
 
     fn batch_cancel_orders(&self, cmd: BatchCancelOrders) -> anyhow::Result<()> {
@@ -336,7 +367,7 @@ impl ExecutionClient for PolymarketExecutionClient {
     }
 
     fn on_instrument(&mut self, instrument: InstrumentAny) {
-        self.on_instrument_update(instrument);
+        self.on_instrument_update(&instrument);
     }
 
     fn calculate_commission(
@@ -345,8 +376,9 @@ impl ExecutionClient for PolymarketExecutionClient {
         last_qty: Quantity,
         last_px: Price,
         liquidity_side: LiquiditySide,
-    ) -> Option<Money> {
-        Some(self.calculate_commission_impl(instrument, last_qty, last_px, liquidity_side))
+    ) -> anyhow::Result<Option<Money>> {
+        self.calculate_commission_impl(instrument, last_qty, last_px, liquidity_side)
+            .map(Some)
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
@@ -390,5 +422,46 @@ impl ExecutionClient for PolymarketExecutionClient {
         lookback_mins: Option<u64>,
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
         self.generate_mass_status_impl(lookback_mins).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case(SignatureType::PolyProxy)]
+    #[case(SignatureType::PolyGnosisSafe)]
+    #[case(SignatureType::Poly1271)]
+    fn proxy_signature_types_require_funder(#[case] signature_type: SignatureType) {
+        let error = resolve_maker_address(signature_type, "0xsigner", None).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires a funder wallet address")
+        );
+    }
+
+    #[rstest]
+    #[case(SignatureType::PolyProxy)]
+    #[case(SignatureType::PolyGnosisSafe)]
+    #[case(SignatureType::Poly1271)]
+    fn proxy_signature_types_require_distinct_funder(#[case] signature_type: SignatureType) {
+        let error =
+            resolve_maker_address(signature_type, "0xsigner", Some("0xSIGNER")).unwrap_err();
+
+        assert!(error.to_string().contains("requires a funder distinct"));
+    }
+
+    #[rstest]
+    #[case(None, "0xsigner")]
+    #[case(Some("0xfunder"), "0xfunder")]
+    fn eoa_uses_configured_funder_or_signer(#[case] funder: Option<&str>, #[case] expected: &str) {
+        let maker_address = resolve_maker_address(SignatureType::Eoa, "0xsigner", funder).unwrap();
+
+        assert_eq!(maker_address, expected);
     }
 }

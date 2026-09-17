@@ -17,7 +17,7 @@
 //! [Derive](https://docs.derive.xyz).
 //!
 //! The `nautilus-derive` crate provides integration with the Derive self-custodial onchain
-//! options, perpetuals and spot exchange. Authentication uses an EVM smart-contract wallet
+//! options, perpetuals, and spot exchange. Authentication uses an EVM smart-contract wallet
 //! on the Derive Chain together with a session-key signer; orders are EIP-712 typed-data
 //! signed against the venue's per-action module contracts.
 //!
@@ -47,6 +47,9 @@
 #![deny(missing_debug_implementations)]
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
+// pyo3's `from_py_object` generates `.clone()` on `Copy` fields that clippy flags from the
+// macro expansion; an item-level `allow` cannot reach the expansion
+#![allow(clippy::clone_on_copy)]
 
 pub mod common;
 pub mod config;
@@ -62,7 +65,7 @@ pub mod websocket;
 pub mod python;
 
 pub use crate::{
-    config::{DeriveDataClientConfig, DeriveExecClientConfig},
+    config::{DeriveDataClientConfig, DeriveExecutionClientConfig},
     execution::DeriveExecutionClient,
-    factories::{DeriveDataClientFactory, DeriveExecFactoryConfig, DeriveExecutionClientFactory},
+    factories::{DeriveDataClientFactory, DeriveExecutionClientFactory},
 };

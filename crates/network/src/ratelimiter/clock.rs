@@ -15,18 +15,13 @@
 
 //! Time sources for rate limiters.
 //!
-//! The time sources contained in this module allow the rate limiter
-//! to be (optionally) independent of std, and additionally
-//! allow mocking the passage of time.
-//!
-//! You can supply a custom time source by implementing both [`Reference`]
-//! and [`Clock`] for your own types, and by implementing `Add<Nanos>` for
-//! your [`Reference`] type:
+//! Custom time sources implement [`Reference`], [`Clock`], and `Add<Nanos>`. This supports
+//! deterministic tests without coupling rate-limiting decisions to wall-clock time.
+
 use std::{
     fmt::Debug,
     future::Future,
     ops::Add,
-    prelude::v1::*,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -73,9 +68,7 @@ pub trait Clock: Clone {
 impl Reference for Duration {
     /// The internal duration between this point and another.
     fn duration_since(&self, earlier: Self) -> Nanos {
-        self.checked_sub(earlier)
-            .unwrap_or_else(|| Self::new(0, 0))
-            .into()
+        (*self).saturating_sub(earlier).into()
     }
 
     /// The internal duration between this point and another.

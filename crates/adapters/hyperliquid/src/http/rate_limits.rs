@@ -24,7 +24,7 @@ use serde_json::Value;
 use crate::{
     common::enums::HyperliquidInfoRequestType,
     http::{
-        models::HyperliquidExecAction,
+        models::HyperliquidExchangeAction,
         query::{ExchangeAction, ExchangeActionParams, InfoRequest},
     },
 };
@@ -132,6 +132,7 @@ pub fn info_base_weight(req: &InfoRequest) -> u32 {
     match req.request_type {
         HyperliquidInfoRequestType::L2Book
         | HyperliquidInfoRequestType::AllMids
+        | HyperliquidInfoRequestType::RecentTrades
         | HyperliquidInfoRequestType::ClearinghouseState
         | HyperliquidInfoRequestType::OrderStatus
         | HyperliquidInfoRequestType::SpotClearinghouseState
@@ -192,21 +193,21 @@ pub fn exchange_weight(action: &ExchangeAction) -> u32 {
 }
 
 /// Exchange weight for the canonical typed execution action model.
-pub fn exec_action_weight(action: &HyperliquidExecAction) -> u32 {
+pub fn exec_action_weight(action: &HyperliquidExchangeAction) -> u32 {
     let batch_size = match action {
-        HyperliquidExecAction::Order { orders, .. } => orders.len(),
-        HyperliquidExecAction::Cancel { cancels } => cancels.len(),
-        HyperliquidExecAction::CancelByCloid { cancels } => cancels.len(),
-        HyperliquidExecAction::Modify { .. } => 1,
-        HyperliquidExecAction::BatchModify { modifies } => modifies.len(),
-        HyperliquidExecAction::UpdateLeverage { .. }
-        | HyperliquidExecAction::UpdateIsolatedMargin { .. }
-        | HyperliquidExecAction::ScheduleCancel { .. }
-        | HyperliquidExecAction::UsdClassTransfer { .. }
-        | HyperliquidExecAction::UserOutcome { .. }
-        | HyperliquidExecAction::TwapPlace { .. }
-        | HyperliquidExecAction::TwapCancel { .. }
-        | HyperliquidExecAction::Noop => 0,
+        HyperliquidExchangeAction::Order { orders, .. } => orders.len(),
+        HyperliquidExchangeAction::Cancel { cancels, .. } => cancels.len(),
+        HyperliquidExchangeAction::CancelByCloid { cancels, .. } => cancels.len(),
+        HyperliquidExchangeAction::Modify { .. } => 1,
+        HyperliquidExchangeAction::BatchModify { modifies } => modifies.len(),
+        HyperliquidExchangeAction::UpdateLeverage { .. }
+        | HyperliquidExchangeAction::UpdateIsolatedMargin { .. }
+        | HyperliquidExchangeAction::ScheduleCancel { .. }
+        | HyperliquidExchangeAction::UsdClassTransfer { .. }
+        | HyperliquidExchangeAction::UserOutcome { .. }
+        | HyperliquidExchangeAction::TwapPlace { .. }
+        | HyperliquidExchangeAction::TwapCancel { .. }
+        | HyperliquidExchangeAction::Noop => 0,
     };
     1 + (batch_size as u32 / 40)
 }
@@ -218,10 +219,11 @@ mod tests {
 
     use super::{
         super::models::{
-            Cloid, HyperliquidExecAction, HyperliquidExecCancelByCloidRequest,
-            HyperliquidExecCancelOrderRequest, HyperliquidExecGrouping, HyperliquidExecLimitParams,
-            HyperliquidExecModifyOrderRequest, HyperliquidExecOrderKind,
-            HyperliquidExecPlaceOrderRequest, HyperliquidExecTif,
+            Cloid, HyperliquidExchangeAction, HyperliquidExchangeCancelByCloidRequest,
+            HyperliquidExchangeCancelOrderRequest, HyperliquidExchangeGrouping,
+            HyperliquidExchangeLimitParams, HyperliquidExchangeModifyOrderRequest,
+            HyperliquidExchangeOrderKind, HyperliquidExchangePlaceOrderRequest,
+            HyperliquidExchangeTif,
         },
         *,
     };
@@ -230,31 +232,31 @@ mod tests {
         UpdateLeverageParams,
     };
 
-    fn exec_order() -> HyperliquidExecPlaceOrderRequest {
-        HyperliquidExecPlaceOrderRequest {
+    fn exec_order() -> HyperliquidExchangePlaceOrderRequest {
+        HyperliquidExchangePlaceOrderRequest {
             asset: 0,
             is_buy: true,
             price: Decimal::new(50000, 0),
             size: Decimal::new(1, 0),
             reduce_only: false,
-            kind: HyperliquidExecOrderKind::Limit {
-                limit: HyperliquidExecLimitParams {
-                    tif: HyperliquidExecTif::Gtc,
+            kind: HyperliquidExchangeOrderKind::Limit {
+                limit: HyperliquidExchangeLimitParams {
+                    tif: HyperliquidExchangeTif::Gtc,
                 },
             },
             cloid: Some(Cloid::from_hex("0x00000000000000000000000000000000").unwrap()),
         }
     }
 
-    fn exec_modify() -> HyperliquidExecModifyOrderRequest {
-        HyperliquidExecModifyOrderRequest {
-            oid: 12345,
+    fn exec_modify() -> HyperliquidExchangeModifyOrderRequest {
+        HyperliquidExchangeModifyOrderRequest {
+            oid: 12345.into(),
             order: exec_order(),
         }
     }
 
-    fn exec_cancel_by_cloid() -> HyperliquidExecCancelByCloidRequest {
-        HyperliquidExecCancelByCloidRequest {
+    fn exec_cancel_by_cloid() -> HyperliquidExchangeCancelByCloidRequest {
+        HyperliquidExchangeCancelByCloidRequest {
             asset: 0,
             cloid: Cloid::from_hex("0x00000000000000000000000000000000").unwrap(),
         }
@@ -270,14 +272,14 @@ mod tests {
         #[case] array_len: usize,
         #[case] expected_weight: u32,
     ) {
-        let orders: Vec<HyperliquidExecPlaceOrderRequest> =
+        let orders: Vec<HyperliquidExchangePlaceOrderRequest> =
             (0..array_len).map(|_| exec_order()).collect();
 
         let action = ExchangeAction {
             action_type: ExchangeActionType::Order,
             params: ExchangeActionParams::Order(OrderParams {
                 orders,
-                grouping: HyperliquidExecGrouping::Na,
+                grouping: HyperliquidExchangeGrouping::Na,
                 builder: None,
             }),
         };
@@ -294,9 +296,9 @@ mod tests {
         #[case] array_len: usize,
         #[case] expected_weight: u32,
     ) {
-        let action = HyperliquidExecAction::Order {
+        let action = HyperliquidExchangeAction::Order {
             orders: (0..array_len).map(|_| exec_order()).collect(),
-            grouping: HyperliquidExecGrouping::Na,
+            grouping: HyperliquidExchangeGrouping::Na,
             builder: None,
         };
 
@@ -313,13 +315,14 @@ mod tests {
         #[case] array_len: usize,
         #[case] expected_weight: u32,
     ) {
-        let action = HyperliquidExecAction::Cancel {
+        let action = HyperliquidExchangeAction::Cancel {
             cancels: (0..array_len)
-                .map(|i| HyperliquidExecCancelOrderRequest {
+                .map(|i| HyperliquidExchangeCancelOrderRequest {
                     asset: 0,
                     oid: i as u64,
                 })
                 .collect(),
+            fast: None,
         };
 
         assert_eq!(exec_action_weight(&action), expected_weight);
@@ -335,8 +338,9 @@ mod tests {
         #[case] array_len: usize,
         #[case] expected_weight: u32,
     ) {
-        let action = HyperliquidExecAction::CancelByCloid {
+        let action = HyperliquidExchangeAction::CancelByCloid {
             cancels: (0..array_len).map(|_| exec_cancel_by_cloid()).collect(),
+            fast: None,
         };
 
         assert_eq!(exec_action_weight(&action), expected_weight);
@@ -352,7 +356,7 @@ mod tests {
         #[case] array_len: usize,
         #[case] expected_weight: u32,
     ) {
-        let action = HyperliquidExecAction::BatchModify {
+        let action = HyperliquidExchangeAction::BatchModify {
             modifies: (0..array_len).map(|_| exec_modify()).collect(),
         };
 
@@ -361,7 +365,7 @@ mod tests {
 
     #[rstest]
     fn test_exec_action_weight_modify() {
-        let action = HyperliquidExecAction::Modify {
+        let action = HyperliquidExchangeAction::Modify {
             modify: exec_modify(),
         };
 
@@ -370,7 +374,7 @@ mod tests {
 
     #[rstest]
     fn test_exec_action_weight_non_batch_action() {
-        let action = HyperliquidExecAction::UpdateLeverage {
+        let action = HyperliquidExchangeAction::UpdateLeverage {
             asset: 1,
             is_cross: true,
             leverage: 10,
@@ -381,12 +385,15 @@ mod tests {
 
     #[rstest]
     fn test_exchange_weight_cancel() {
-        let cancels: Vec<HyperliquidExecCancelByCloidRequest> =
+        let cancels: Vec<HyperliquidExchangeCancelByCloidRequest> =
             (0..40).map(|_| exec_cancel_by_cloid()).collect();
 
         let action = ExchangeAction {
             action_type: ExchangeActionType::Cancel,
-            params: ExchangeActionParams::Cancel(CancelParams { cancels }),
+            params: ExchangeActionParams::Cancel(CancelParams {
+                cancels,
+                fast: None,
+            }),
         };
         assert_eq!(exchange_weight(&action), 2);
     }

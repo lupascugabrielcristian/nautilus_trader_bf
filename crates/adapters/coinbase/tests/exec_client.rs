@@ -40,13 +40,13 @@ use axum::{
     response::{IntoResponse, Json},
     routing::{get, post},
 };
-use chrono::{TimeZone, Utc};
+use jiff::Timestamp;
 use nautilus_coinbase::{
     common::{
         consts::{COINBASE_CLIENT_ID, COINBASE_VENUE},
         enums::CoinbaseEnvironment,
     },
-    config::CoinbaseExecClientConfig,
+    config::CoinbaseExecutionClientConfig,
     execution::CoinbaseExecutionClient,
     http::client::CoinbaseHttpClient,
 };
@@ -66,7 +66,7 @@ use nautilus_common::{
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
-    enums::{AccountType, OmsType, OrderSide, OrderType, PositionSideSpecified, TimeInForce},
+    enums::{AccountType, OmsType, OrderSide, OrderType, PositionSide, TimeInForce},
     events::OrderEventAny,
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId,
@@ -422,19 +422,11 @@ async fn start_mock_server(state: TestState) -> SocketAddr {
         axum::serve(listener, router).await.unwrap();
     });
 
-    let start = std::time::Instant::now();
-
-    loop {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            break;
-        }
-
-        assert!(
-            start.elapsed() <= Duration::from_secs(5),
-            "Mock server did not start within timeout"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_until_async(
+        || async { tokio::net::TcpStream::connect(addr).await.is_ok() },
+        Duration::from_secs(5),
+    )
+    .await;
 
     addr
 }
@@ -752,7 +744,7 @@ async fn test_exec_client_request_order_status_reports_encodes_rfc3339_start_dat
     let client = create_http_client(addr);
     bootstrap_btc_usd_instrument(&client).await;
 
-    let start = Utc.with_ymd_and_hms(2024, 1, 15, 10, 0, 0).unwrap();
+    let start = "2024-01-15T10:00:00Z".parse::<Timestamp>().unwrap();
     let _ = client
         .request_order_status_reports(account_id(), None, false, Some(start), None, None)
         .await
@@ -1524,7 +1516,7 @@ async fn test_http_request_cfm_account_state_produces_margin_account() {
 #[rstest]
 #[tokio::test]
 async fn test_http_request_position_status_reports_for_cfm() {
-    use nautilus_model::enums::PositionSideSpecified;
+    use nautilus_model::enums::PositionSide;
 
     let state = TestState::default();
     let addr = start_mock_server(state.clone()).await;
@@ -1537,7 +1529,7 @@ async fn test_http_request_position_status_reports_for_cfm() {
 
     assert_eq!(reports.len(), 1);
     let report = &reports[0];
-    assert_eq!(report.position_side, PositionSideSpecified::Long);
+    assert_eq!(report.position_side, PositionSide::Long);
     assert_eq!(report.quantity, Quantity::from("2"));
     assert_eq!(report.avg_px_open, Some(dec!(49000.00)));
     assert_eq!(report.instrument_id.symbol.as_str(), "BIP-20DEC30-CDE");
@@ -1552,7 +1544,7 @@ async fn test_http_request_position_status_reports_for_cfm() {
 #[rstest]
 #[tokio::test]
 async fn test_http_request_position_status_report_single_product() {
-    use nautilus_model::enums::PositionSideSpecified;
+    use nautilus_model::enums::PositionSide;
 
     let state = TestState::default();
     let addr = start_mock_server(state.clone()).await;
@@ -1565,7 +1557,7 @@ async fn test_http_request_position_status_report_single_product() {
         .expect("position report should build")
         .expect("fixture provides a non-flat position");
 
-    assert_eq!(report.position_side, PositionSideSpecified::Short);
+    assert_eq!(report.position_side, PositionSide::Short);
     assert_eq!(report.quantity, Quantity::from("3"));
     assert_eq!(report.avg_px_open, Some(dec!(51000.00)));
 
@@ -1697,12 +1689,12 @@ fn make_exec_client_with_events(
         cache,
     );
 
-    let config = CoinbaseExecClientConfig {
+    let config = CoinbaseExecutionClientConfig {
         api_key: Some(test_api_key()),
         api_secret: Some(test_pem_key()),
         base_url_rest: Some(format!("http://{addr}")),
         account_type,
-        ..CoinbaseExecClientConfig::default()
+        ..CoinbaseExecutionClientConfig::default()
     };
 
     (
@@ -1783,7 +1775,7 @@ async fn test_exec_client_position_reports_margin_list_hits_cfm_positions() {
         .expect("position reports");
 
     assert_eq!(reports.len(), 1);
-    assert_eq!(reports[0].position_side, PositionSideSpecified::Long);
+    assert_eq!(reports[0].position_side, PositionSide::Long);
     assert_eq!(reports[0].instrument_id.symbol.as_str(), "BIP-20DEC30-CDE");
 
     // Exec client must route to the list endpoint, not the single-product one.
@@ -1809,7 +1801,7 @@ async fn test_exec_client_position_reports_margin_single_hits_scoped_endpoint() 
         .expect("position reports");
 
     assert_eq!(reports.len(), 1);
-    assert_eq!(reports[0].position_side, PositionSideSpecified::Short);
+    assert_eq!(reports[0].position_side, PositionSide::Short);
     assert_eq!(reports[0].instrument_id, instrument_id);
 
     // Exec client must target the single-product endpoint; the list
@@ -2219,7 +2211,7 @@ async fn test_exec_cancel_all_http_failure_does_not_emit_cancel_rejected() {
         Some(*COINBASE_CLIENT_ID),
         StrategyId::from("S-CANCEL-ALL"),
         btc_usd_instrument_id(),
-        OrderSide::NoOrderSide,
+        None,
         UUID4::new(),
         UnixNanos::default(),
         None,
@@ -2247,18 +2239,11 @@ async fn start_failure_server(router: Router) -> SocketAddr {
         axum::serve(listener, router).await.unwrap();
     });
 
-    let start = std::time::Instant::now();
-
-    loop {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            break;
-        }
-        assert!(
-            start.elapsed() <= std::time::Duration::from_secs(5),
-            "failure server did not start within timeout"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    wait_until_async(
+        || async { tokio::net::TcpStream::connect(addr).await.is_ok() },
+        Duration::from_secs(5),
+    )
+    .await;
     addr
 }
 

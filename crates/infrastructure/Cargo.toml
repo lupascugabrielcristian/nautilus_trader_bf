@@ -41,24 +41,25 @@ redis = ["dep:redis"]
 postgres = ["dep:sqlx"]
 
 [package.metadata.docs.rs]
-all-features = true
+# Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
+features = ["postgres", "redis"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 nautilus-common = { workspace = true, features = ["live"] }
 nautilus-core = { workspace = true }
 nautilus-cryptography = { workspace = true }
-nautilus-model = { workspace = true, features = ["stubs"] }
+nautilus-model = { workspace = true, features = ["test-support"] }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
-chrono = { workspace = true }
 derive_builder = { workspace = true }
 futures = { workspace = true }
 indexmap = { workspace = true }
+jiff = { workspace = true }
 log = { workspace = true }
 regex = { workspace = true }
 rmp-serde = { workspace = true }
@@ -75,9 +76,11 @@ redis = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 
 [dev-dependencies]
+nautilus-live = { workspace = true, features = ["node"] }
 nautilus-persistence = { workspace = true }
 nautilus-serialization = { workspace = true }
 
 rstest = { workspace = true }
 serde = { workspace = true }
+strum = { workspace = true }
 toml = { workspace = true }

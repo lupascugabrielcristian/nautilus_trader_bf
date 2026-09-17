@@ -23,22 +23,29 @@ crate-type = ["rlib"]
 [features]
 default = []
 extension-module = ["python", "pyo3/extension-module"]
-python = ["nautilus-model/python", "pyo3", "pyo3-stub-gen"]
+python = [
+  "nautilus-analysis/python",
+  "nautilus-common/python",
+  "nautilus-model/python",
+  "pyo3",
+  "pyo3-stub-gen",
+]
 
 [package.metadata.docs.rs]
-all-features = true
+# Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 nautilus-analysis = { workspace = true }
 nautilus-common = { workspace = true }
 nautilus-core = { workspace = true }
-nautilus-model = { workspace = true, features = ["stubs"] }
+nautilus-model = { workspace = true, features = ["test-support"] }
 
 pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 ahash = { workspace = true }
+anyhow = { workspace = true }
 bon = { workspace = true }
 indexmap = { workspace = true }
 log = { workspace = true }

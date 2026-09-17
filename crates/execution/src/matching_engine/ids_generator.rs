@@ -13,9 +13,11 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+//! Identifier generation for the order matching engine.
+
 use std::{cell::RefCell, fmt::Debug, rc::Rc};
 
-use nautilus_common::cache::Cache;
+use nautilus_common::cache::{Cache, VenueOrderIdOwnershipError};
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     enums::OmsType,
@@ -26,7 +28,10 @@ use nautilus_model::{
 // FNV-1a 64-bit constants (see http://www.isthe.com/chongo/tech/comp/fnv/).
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0100_0000_01b3;
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+const TRADE_ID_COUNTER_START: usize = 19;
 
+/// Generates venue order, position, and trade identifiers.
 pub struct IdsGenerator {
     venue: Venue,
     raw_id: u32,
@@ -49,6 +54,7 @@ impl Debug for IdsGenerator {
 }
 
 impl IdsGenerator {
+    /// Creates a new identifier generator.
     pub const fn new(
         venue: Venue,
         oms_type: OmsType,
@@ -70,6 +76,7 @@ impl IdsGenerator {
         }
     }
 
+    /// Resets all identifier counters.
     pub const fn reset(&mut self) {
         self.position_count = 0;
         self.order_count = 0;
@@ -82,23 +89,55 @@ impl IdsGenerator {
     ///
     /// Returns an error if ID generation fails.
     pub fn get_venue_order_id(&mut self, order: &OrderAny) -> anyhow::Result<VenueOrderId> {
-        // check existing on order
+        // Check existing on order
         if let Some(venue_order_id) = order.venue_order_id() {
             return Ok(venue_order_id);
         }
 
-        // check existing in cache
+        // Check existing in cache
         if let Some(venue_order_id) = self.cache.borrow().venue_order_id(&order.client_order_id()) {
             return Ok(venue_order_id.to_owned());
         }
 
-        let venue_order_id = self.generate_venue_order_id();
-        self.cache.borrow_mut().add_venue_order_id(
-            &order.client_order_id(),
-            &venue_order_id,
-            false,
-        )?;
-        Ok(venue_order_id)
+        let client_order_id = order.client_order_id();
+        let mut conflict_count = 0_usize;
+
+        loop {
+            let venue_order_id = self.try_generate_venue_order_id()?;
+            let claim_result = self.cache.borrow_mut().add_venue_order_id(
+                &client_order_id,
+                &venue_order_id,
+                false,
+            );
+
+            match claim_result {
+                Ok(()) => {
+                    if conflict_count > 0 {
+                        log::info!(
+                            "Allocated venue order ID {venue_order_id} for {client_order_id} after \
+                             probing past {conflict_count} ownership conflicts"
+                        );
+                    }
+                    return Ok(venue_order_id);
+                }
+                Err(e) => {
+                    let Some(conflict) = e.downcast_ref::<VenueOrderIdOwnershipError>() else {
+                        return Err(e);
+                    };
+
+                    if conflict_count == 0 {
+                        log::error!(
+                            "Generated venue order ID conflict: candidate={}, existing_owner={}, \
+                             claimant={}",
+                            conflict.venue_order_id,
+                            conflict.existing_client_order_id,
+                            conflict.claimant_client_order_id,
+                        );
+                    }
+                    conflict_count += 1;
+                }
+            }
+        }
     }
 
     /// Retrieves or generates a position ID for the given order.
@@ -132,18 +171,26 @@ impl IdsGenerator {
         } else {
             // Netting OMS (position id will be derived from instrument and strategy)
             let cache = self.cache.as_ref().borrow();
-            let positions_open =
-                cache.positions_open(None, Some(&order.instrument_id()), None, None, None);
-            if positions_open.is_empty() {
-                None
-            } else {
-                Some(positions_open[0].id)
-            }
+            let positions_open = cache.positions_open(
+                None,
+                Some(&order.instrument_id()),
+                Some(&order.strategy_id()),
+                None,
+                None,
+            );
+            positions_open.first().map(|position| position.id)
         }
     }
 
+    /// Generates a deterministic trade ID.
+    ///
+    /// # Panics
+    ///
+    /// Panics if overflow checks are enabled and the execution counter overflows, or if the
+    /// generated trade ID exceeds 36 characters.
     pub fn generate_trade_id(&mut self, ts_init: UnixNanos) -> TradeId {
         self.execution_count += 1;
+
         // Trade IDs are always deterministic; `use_random_ids` only affects
         // venue order IDs and position IDs. A bounded FNV-1a hash of
         // `(venue, raw_id, ts_init)` keeps the ID under the 36-character
@@ -151,10 +198,40 @@ impl IdsGenerator {
         // against collisions after `reset()` rewinds `execution_count`, and
         // the trailing counter distinguishes multiple fills at the same ts.
         let hash = fnv1a_trade_id_hash(self.venue, self.raw_id, ts_init.as_u64());
-        let trade_id = format!("T-{hash:016x}-{:03}", self.execution_count);
-        TradeId::from(trade_id.as_str())
+        let mut value = [0_u8; TRADE_ID_COUNTER_START + usize::BITS as usize];
+        value[..2].copy_from_slice(b"T-");
+
+        for (index, byte) in value[2..18].iter_mut().enumerate() {
+            let shift = (15 - index) * 4;
+            *byte = HEX_DIGITS[((hash >> shift) & 0x0f) as usize];
+        }
+
+        value[18] = b'-';
+
+        let mut counter = self.execution_count;
+        let mut digit_start = value.len();
+
+        loop {
+            digit_start -= 1;
+            value[digit_start] = b'0' + (counter % 10) as u8;
+            counter /= 10;
+            if counter == 0 {
+                break;
+            }
+        }
+
+        let digit_count = value.len() - digit_start;
+        let padding = 3_usize.saturating_sub(digit_count);
+        let value_len = TRADE_ID_COUNTER_START + padding + digit_count;
+        value[TRADE_ID_COUNTER_START..TRADE_ID_COUNTER_START + padding].fill(b'0');
+        value.copy_within(digit_start.., TRADE_ID_COUNTER_START + padding);
+
+        let value =
+            std::str::from_utf8(&value[..value_len]).expect("trade ID bytes should be valid ASCII");
+        TradeId::from(value)
     }
 
+    /// Generates a venue position ID when position IDs are enabled.
     pub fn generate_venue_position_id(&mut self) -> Option<PositionId> {
         if !self.use_position_ids {
             return None;
@@ -171,15 +248,28 @@ impl IdsGenerator {
         }
     }
 
+    /// Generates a venue order ID.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the deterministic order counter is exhausted.
     pub fn generate_venue_order_id(&mut self) -> VenueOrderId {
-        self.order_count += 1;
+        self.try_generate_venue_order_id()
+            .expect("Venue order ID counter exhausted")
+    }
+
+    fn try_generate_venue_order_id(&mut self) -> anyhow::Result<VenueOrderId> {
+        self.order_count = self
+            .order_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Venue order ID counter exhausted"))?;
 
         if self.use_random_ids {
-            VenueOrderId::new(UUID4::new().to_string())
+            Ok(VenueOrderId::new(UUID4::new().to_string()))
         } else {
-            VenueOrderId::new(
+            Ok(VenueOrderId::new(
                 format!("{}-{}-{}", self.venue, self.raw_id, self.order_count).as_str(),
-            )
+            ))
         }
     }
 }
@@ -206,18 +296,19 @@ fn fnv1a_trade_id_hash(venue: Venue, raw_id: u32, ts_init_ns: u64) -> u64 {
 mod tests {
     use std::{cell::RefCell, rc::Rc};
 
-    use nautilus_common::cache::Cache;
+    use nautilus_common::cache::{Cache, VenueOrderIdOwnershipError};
     use nautilus_core::UnixNanos;
     use nautilus_model::{
         enums::{OmsType, OrderSide, OrderType},
         events::{OrderFilled, order::spec::OrderFilledSpec},
         identifiers::{
-            AccountId, ClientOrderId, PositionId, Venue, VenueOrderId, stubs::account_id,
+            AccountId, ClientOrderId, PositionId, StrategyId, Venue, VenueOrderId,
+            stubs::account_id,
         },
         instruments::{
             CryptoPerpetual, Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt,
         },
-        orders::{Order, OrderAny, OrderTestBuilder},
+        orders::{Order, OrderAny, OrderTestBuilder, stubs::TestOrderEventStubs},
         position::Position,
         types::{Price, Quantity},
     };
@@ -344,6 +435,33 @@ mod tests {
     }
 
     #[rstest]
+    fn test_get_position_id_netting_filters_by_strategy(
+        instrument_eth_usdt: InstrumentAny,
+        market_order_fill: OrderFilled,
+    ) {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let mut ids_generator = get_ids_generator(cache.clone(), false, OmsType::Netting);
+        let position = Position::new(&instrument_eth_usdt, market_order_fill);
+        cache
+            .as_ref()
+            .borrow_mut()
+            .add_position(&position, OmsType::Netting)
+            .unwrap();
+
+        let order_for_other_strategy = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument_eth_usdt.id())
+            .strategy_id(StrategyId::from("S-002"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-9"))
+            .submit(true)
+            .build();
+
+        let position_id = ids_generator.get_position_id(&order_for_other_strategy, None);
+        assert_eq!(position_id, None);
+    }
+
+    #[rstest]
     fn test_generate_venue_position_id() {
         let cache = Rc::new(RefCell::new(Cache::default()));
         let mut ids_generator_with_position_ids =
@@ -402,6 +520,99 @@ mod tests {
         // check if venue order id is cached again
         let venue_order_id3 = ids_generator.get_venue_order_id(&market_order_buy).unwrap();
         assert_eq!(venue_order_id3, VenueOrderId::from("BINANCE-1-1"));
+    }
+
+    #[rstest]
+    fn test_get_venue_order_id_probes_past_preclaimed_candidates(market_order_buy: OrderAny) {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let owner_id = ClientOrderId::from("O-OWNER");
+
+        for suffix in 1..=3 {
+            cache
+                .borrow_mut()
+                .add_venue_order_id(
+                    &owner_id,
+                    &VenueOrderId::from(format!("BINANCE-1-{suffix}")),
+                    true,
+                )
+                .unwrap();
+        }
+        let mut ids_generator = get_ids_generator(Rc::clone(&cache), true, OmsType::Netting);
+
+        let venue_order_id = ids_generator.get_venue_order_id(&market_order_buy).unwrap();
+
+        assert_eq!(venue_order_id, VenueOrderId::from("BINANCE-1-4"));
+        assert_eq!(
+            cache
+                .borrow()
+                .venue_order_id(&market_order_buy.client_order_id()),
+            Some(&venue_order_id)
+        );
+
+        for suffix in 1..=3 {
+            assert_eq!(
+                cache
+                    .borrow()
+                    .client_order_id(&VenueOrderId::from(format!("BINANCE-1-{suffix}"))),
+                Some(&owner_id)
+            );
+        }
+    }
+
+    #[rstest]
+    fn test_get_venue_order_id_fails_when_counter_is_exhausted(market_order_buy: OrderAny) {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let mut ids_generator = get_ids_generator(Rc::clone(&cache), true, OmsType::Netting);
+        ids_generator.order_count = usize::MAX;
+
+        let error = ids_generator
+            .get_venue_order_id(&market_order_buy)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("counter exhausted"));
+        assert_eq!(
+            cache
+                .borrow()
+                .venue_order_id(&market_order_buy.client_order_id()),
+            None
+        );
+    }
+
+    #[rstest]
+    fn test_get_venue_order_id_does_not_replace_authoritative_id(mut market_order_buy: OrderAny) {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let venue_order_id = VenueOrderId::from("V-AUTHORITATIVE");
+        let owner_id = ClientOrderId::from("O-OWNER");
+        cache
+            .borrow_mut()
+            .add_venue_order_id(&owner_id, &venue_order_id, false)
+            .unwrap();
+        let accepted = TestOrderEventStubs::accepted(
+            &market_order_buy,
+            AccountId::from("ACCOUNT-001"),
+            venue_order_id,
+        );
+        market_order_buy.apply(accepted).unwrap();
+        let mut ids_generator = get_ids_generator(Rc::clone(&cache), true, OmsType::Netting);
+
+        let returned_id = ids_generator.get_venue_order_id(&market_order_buy).unwrap();
+        let error = cache
+            .borrow_mut()
+            .add_venue_order_id(&market_order_buy.client_order_id(), &returned_id, false)
+            .unwrap_err();
+
+        assert_eq!(returned_id, venue_order_id);
+        assert!(error.is::<VenueOrderIdOwnershipError>());
+        assert_eq!(
+            cache.borrow().client_order_id(&venue_order_id),
+            Some(&owner_id)
+        );
+        assert_eq!(
+            cache
+                .borrow()
+                .venue_order_id(&market_order_buy.client_order_id()),
+            None
+        );
     }
 
     fn build_ids_generator(venue: Venue, raw_id: u32) -> IdsGenerator {
@@ -464,6 +675,118 @@ mod tests {
         assert!(first.as_str().ends_with("-001"));
         assert!(second.as_str().ends_with("-002"));
         assert!(third.as_str().ends_with("-003"));
+    }
+
+    #[rstest]
+    #[case(8, "T-5c080ffb681dc0d4-009")]
+    #[case(9, "T-5c080ffb681dc0d4-010")]
+    #[case(98, "T-5c080ffb681dc0d4-099")]
+    #[case(99, "T-5c080ffb681dc0d4-100")]
+    #[case(998, "T-5c080ffb681dc0d4-999")]
+    #[case(999, "T-5c080ffb681dc0d4-1000")]
+    fn test_generate_trade_id_counter_width(
+        #[case] execution_count: usize,
+        #[case] expected: &str,
+    ) {
+        let mut generator = build_ids_generator(Venue::from("BINANCE"), 1);
+        generator.execution_count = execution_count;
+
+        let trade_id = generator.generate_trade_id(UnixNanos::from(1_700_000_000_000_000_000_u64));
+
+        assert_eq!(trade_id.as_str(), expected);
+    }
+
+    #[rstest]
+    fn test_generate_trade_id_preserves_full_lowercase_hash_width() {
+        let mut generator = build_ids_generator(Venue::from("BINANCE"), 0);
+
+        let trade_id = generator.generate_trade_id(UnixNanos::from(3));
+
+        assert_eq!(trade_id.as_str(), "T-0114760c17a06c2c-001");
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[rstest]
+    fn test_generate_trade_id_accepts_maximum_length() {
+        let mut generator = build_ids_generator(Venue::from("BINANCE"), 1);
+        generator.execution_count = 99_999_999_999_999_998;
+
+        let trade_id = generator.generate_trade_id(UnixNanos::from(1_700_000_000_000_000_000_u64));
+
+        assert_eq!(trade_id.as_str(), "T-5c080ffb681dc0d4-99999999999999999");
+        assert_eq!(trade_id.as_str().len(), 36);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[rstest]
+    #[case(99_999_999_999_999_999, 37)]
+    #[case(9_999_999_999_999_999_998, 38)]
+    #[case(usize::MAX - 1, 39)]
+    fn test_generate_trade_id_preserves_length_validation(
+        #[case] execution_count: usize,
+        #[case] expected_length: usize,
+    ) {
+        let mut generator = build_ids_generator(Venue::from("BINANCE"), 1);
+        generator.execution_count = execution_count;
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            generator.generate_trade_id(UnixNanos::from(1_700_000_000_000_000_000_u64));
+        }))
+        .expect_err("an oversized trade ID should fail validation");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("trade ID validation should panic with a string message");
+
+        assert!(
+            message.contains(&format!(
+                "String exceeds maximum length of 36 characters, was {expected_length}"
+            )),
+            "unexpected trade ID validation panic: {message}",
+        );
+        assert_eq!(generator.execution_count, execution_count + 1);
+
+        generator.reset();
+        let trade_id = generator.generate_trade_id(UnixNanos::from(1_700_000_000_000_000_000_u64));
+        assert_eq!(trade_id.as_str(), "T-5c080ffb681dc0d4-001");
+    }
+
+    #[rstest]
+    fn test_generate_trade_id_preserves_counter_overflow_semantics() {
+        let expected = std::panic::catch_unwind(|| {
+            let mut counter = std::hint::black_box(usize::MAX);
+            counter += 1;
+            counter
+        });
+        let mut generator = build_ids_generator(Venue::from("BINANCE"), 1);
+        generator.execution_count = usize::MAX;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            generator.generate_trade_id(UnixNanos::from(1_700_000_000_000_000_000_u64))
+        }));
+
+        match (expected, result) {
+            (Ok(expected_count), Ok(trade_id)) => {
+                assert_eq!(trade_id.as_str(), "T-5c080ffb681dc0d4-000");
+                assert_eq!(generator.execution_count, expected_count);
+            }
+            (Err(_), Err(panic)) => {
+                let message = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .expect("counter overflow should panic with a string message");
+
+                assert!(
+                    message.contains("attempt to add with overflow"),
+                    "unexpected execution counter overflow panic: {message}",
+                );
+                assert_eq!(generator.execution_count, usize::MAX);
+            }
+            (Ok(_), Err(_)) => panic!("execution counter unexpectedly used checked overflow"),
+            (Err(_), Ok(_)) => panic!("execution counter unexpectedly used unchecked overflow"),
+        }
     }
 
     #[rstest]

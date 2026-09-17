@@ -40,7 +40,7 @@ use crate::{
 /// Python wrapper for the core Databento historical client.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.databento")
+    pyo3::pyclass(module = "nautilus_trader.adapters.databento")
 )]
 #[cfg_attr(
     feature = "python",
@@ -102,6 +102,10 @@ impl DatabentoHistoricalClient {
     }
 
     /// Gets the date range for a specific dataset.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails.
     #[pyo3(name = "get_dataset_range")]
     fn py_get_dataset_range<'py>(
         &self,
@@ -125,6 +129,10 @@ impl DatabentoHistoricalClient {
     }
 
     /// Fetches instrument definitions for the given parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request or data processing fails.
     #[pyo3(name = "get_range_instruments")]
     #[pyo3(signature = (dataset, instrument_ids, start, end=None, limit=None))]
     #[expect(clippy::needless_pass_by_value)]
@@ -161,13 +169,17 @@ impl DatabentoHistoricalClient {
                     .map(|inst| instrument_any_to_pyobject(py, inst))
                     .collect::<PyResult<Vec<Py<PyAny>>>>()?;
 
-                let list = PyList::new(py, &objs).expect("Invalid `ExactSizeIterator`");
+                let list = PyList::new(py, &objs)?;
                 Ok(list.into_py_any_unwrap(py))
             })
         })
     }
 
     /// Fetches quote ticks for the given parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request or data processing fails.
     #[pyo3(name = "get_range_quotes")]
     #[pyo3(signature = (dataset, instrument_ids, start, end=None, limit=None, price_precision=None, schema=None))]
     #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
@@ -204,8 +216,12 @@ impl DatabentoHistoricalClient {
     }
 
     /// Fetches trade ticks for the given parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request or data processing fails.
     #[pyo3(name = "get_range_trades")]
-    #[pyo3(signature = (dataset, instrument_ids, start, end=None, limit=None, price_precision=None))]
+    #[pyo3(signature = (dataset, instrument_ids, start, end=None, limit=None, price_precision=None, schema=None))]
     #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_get_range_trades<'py>(
         &self,
@@ -216,6 +232,7 @@ impl DatabentoHistoricalClient {
         end: Option<u64>,
         limit: Option<u64>,
         price_precision: Option<u8>,
+        schema: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let symbols = inner.prepare_symbols_from_instrument_ids(&instrument_ids);
@@ -231,7 +248,7 @@ impl DatabentoHistoricalClient {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let trades = inner
-                .get_range_trades(params)
+                .get_range_trades(params, schema)
                 .await
                 .map_err(to_pyvalue_err)?;
             Python::attach(|py| trades.into_py_any(py))
@@ -239,6 +256,10 @@ impl DatabentoHistoricalClient {
     }
 
     /// Fetches bars for the given parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request or data processing fails.
     #[pyo3(name = "get_range_bars")]
     #[pyo3(signature = (dataset, instrument_ids, aggregation, start, end=None, limit=None, price_precision=None, timestamp_on_close=true))]
     #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
@@ -309,6 +330,10 @@ impl DatabentoHistoricalClient {
     }
 
     /// Fetches order book deltas for the given parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request or data processing fails.
     #[pyo3(name = "get_range_order_book_deltas")]
     #[pyo3(signature = (dataset, instrument_ids, start, end=None, limit=None, price_precision=None))]
     #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
@@ -344,6 +369,10 @@ impl DatabentoHistoricalClient {
     }
 
     /// Fetches imbalance data for the given parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request or data processing fails.
     #[pyo3(name = "get_range_imbalance")]
     #[pyo3(signature = (dataset, instrument_ids, start, end=None, limit=None, price_precision=None))]
     #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
@@ -379,6 +408,10 @@ impl DatabentoHistoricalClient {
     }
 
     /// Fetches statistics data for the given parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request or data processing fails.
     #[pyo3(name = "get_range_statistics")]
     #[pyo3(signature = (dataset, instrument_ids, start, end=None, limit=None, price_precision=None))]
     #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
@@ -414,6 +447,10 @@ impl DatabentoHistoricalClient {
     }
 
     /// Fetches status data for the given parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request or data processing fails.
     #[pyo3(name = "get_range_status")]
     #[pyo3(signature = (dataset, instrument_ids, start, end=None, limit=None))]
     #[expect(clippy::needless_pass_by_value)]

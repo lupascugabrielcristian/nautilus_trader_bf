@@ -19,11 +19,15 @@ use nautilus_model::position::Position;
 
 use crate::{Returns, statistic::PortfolioStatistic};
 
+/// Calculates the arithmetic mean of portfolio returns.
+///
+/// All returns are included, so zero returns count toward the average.
+/// Returns `NaN` for an empty series.
 #[repr(C)]
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.analysis", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.analysis", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",

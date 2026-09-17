@@ -74,33 +74,26 @@ fn load_json(filename: &str) -> Value {
 
 /// Creates a mock BTC-PERPETUAL instrument for testing.
 fn create_btc_perpetual() -> InstrumentAny {
-    InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
-        InstrumentId::new(Symbol::from("BTC-PERPETUAL"), *DERIBIT_VENUE),
-        Symbol::from("BTC-PERPETUAL"),
-        Currency::BTC(),
-        Currency::USD(),
-        Currency::BTC(),
-        false,
-        1, // price_precision
-        0, // size_precision
-        Price::new(0.5, 1),
-        Quantity::new(1.0, 0),
-        None, // multiplier
-        None, // lot_size
-        None, // max_quantity
-        None, // min_quantity
-        None, // max_notional
-        None, // min_notional
-        None, // max_price
-        None, // min_price
-        None, // margin_init
-        None, // margin_maint
-        None, // maker_fee
-        None, // taker_fee
-        None,
-        UnixNanos::default(),
-        UnixNanos::default(),
-    ))
+    InstrumentAny::CryptoPerpetual(
+        CryptoPerpetual::builder()
+            .instrument_id(InstrumentId::new(
+                Symbol::from("BTC-PERPETUAL"),
+                *DERIBIT_VENUE,
+            ))
+            .raw_symbol(Symbol::from("BTC-PERPETUAL"))
+            .base_currency(Currency::BTC())
+            .quote_currency(Currency::USD())
+            .settlement_currency(Currency::BTC())
+            .is_inverse(false)
+            .price_precision(1)
+            .size_precision(0)
+            .price_increment(Price::new(0.5, 1))
+            .size_increment(Quantity::new(1.0, 0))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap(),
+    )
 }
 
 fn load_test_instruments() -> Vec<InstrumentAny> {
@@ -617,6 +610,7 @@ fn create_test_client(ws_url: &str) -> DeribitWebSocketClient {
         None,                        // api_key
         None,                        // api_secret
         30,                          // heartbeat_interval
+        None,                        // auth_timeout_secs
         DeribitEnvironment::Testnet, // environment,
         TransportBackend::default(),
         None, // proxy_url
@@ -678,6 +672,7 @@ async fn test_wait_until_active_timeout() {
         None,                        // api_key
         None,                        // api_secret
         30,                          // heartbeat_interval
+        None,                        // auth_timeout_secs
         DeribitEnvironment::Testnet, // environment,
         TransportBackend::default(),
         None, // proxy_url
@@ -1618,6 +1613,7 @@ fn create_authenticated_client(ws_url: &str) -> DeribitWebSocketClient {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         30,                          // heartbeat_interval
+        None,                        // auth_timeout_secs
         DeribitEnvironment::Testnet, // environment,
         TransportBackend::default(),
         None, // proxy_url

@@ -13,6 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use core::fmt::NumBuffer;
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -20,8 +21,7 @@ use std::{
     rc::Rc,
 };
 
-use chrono::{DateTime, Datelike, Timelike};
-use itoa::Buffer;
+use jiff::{Timestamp, tz::Offset};
 use nautilus_model::identifiers::{PositionId, StrategyId, TraderId};
 
 use crate::clock::Clock;
@@ -39,7 +39,7 @@ pub struct PositionIdGenerator {
     buf: String,
     fixed_prefix_len: usize,
     epoch_second: u64,
-    count_buf: Buffer,
+    count_buf: NumBuffer<usize>,
 }
 
 impl Debug for PositionIdGenerator {
@@ -77,7 +77,7 @@ impl PositionIdGenerator {
             buf,
             fixed_prefix_len: 0,
             epoch_second: u64::MAX,
-            count_buf: Buffer::new(),
+            count_buf: NumBuffer::new(),
         }
     }
 
@@ -104,7 +104,9 @@ impl PositionIdGenerator {
         self.buf.truncate(self.fixed_prefix_len);
         self.buf.push_str(strategy_id.get_tag());
         self.buf.push('-');
-        self.buf.push_str(self.count_buf.format(next_count));
+        self.buf
+            .push_str(next_count.format_into(&mut self.count_buf));
+
         if flipped {
             self.buf.push('F');
         }
@@ -126,8 +128,12 @@ impl PositionIdGenerator {
 }
 
 fn write_fixed_prefix(buf: &mut String, trader_tag: &str, epoch_second: u64) {
-    let now_utc = DateTime::from_timestamp_millis((epoch_second * 1_000) as i64)
-        .expect("Milliseconds timestamp should be within valid range");
+    let now_utc = Offset::UTC.to_datetime(
+        Timestamp::from_second(
+            i64::try_from(epoch_second).expect("seconds timestamp should fit i64"),
+        )
+        .expect("seconds timestamp should be within valid range"),
+    );
 
     buf.clear();
 

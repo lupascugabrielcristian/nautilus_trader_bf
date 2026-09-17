@@ -43,7 +43,7 @@ use crate::{
 impl BookOrder {
     /// Represents an order in a book.
     #[new]
-    fn py_new(side: OrderSide, price: Price, size: Quantity, order_id: OrderId) -> Self {
+    fn py_new(side: Option<OrderSide>, price: Price, size: Quantity, order_id: OrderId) -> Self {
         Self::new(side, price, size, order_id)
     }
 
@@ -71,7 +71,7 @@ impl BookOrder {
 
     #[getter]
     #[pyo3(name = "side")]
-    fn py_side(&self) -> OrderSide {
+    const fn py_side(&self) -> Option<OrderSide> {
         self.side
     }
 
@@ -134,14 +134,18 @@ impl BookOrder {
 
     /// Return JSON encoded bytes representation of the object.
     #[pyo3(name = "to_json_bytes")]
-    fn py_to_json_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        self.to_json_bytes().unwrap().into_py_any_unwrap(py)
+    fn py_to_json_bytes(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.to_json_bytes()
+            .map_err(to_pyvalue_err)?
+            .into_py_any(py)
     }
 
     /// Return `MsgPack` encoded bytes representation of the object.
     #[pyo3(name = "to_msgpack_bytes")]
-    fn py_to_msgpack_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        self.to_msgpack_bytes().unwrap().into_py_any_unwrap(py)
+    fn py_to_msgpack_bytes(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.to_msgpack_bytes()
+            .map_err(to_pyvalue_err)?
+            .into_py_any(py)
     }
 
     fn __reduce__(&self, py: Python) -> PyResult<Py<PyAny>> {

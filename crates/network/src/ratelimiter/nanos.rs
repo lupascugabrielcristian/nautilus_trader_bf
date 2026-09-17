@@ -13,12 +13,11 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! A time-keeping abstraction (nanoseconds) that works for storing in an atomic integer.
+//! Nanosecond values suitable for atomic storage.
 
 use std::{
     fmt::Debug,
     ops::{Add, Div, Mul},
-    prelude::v1::*,
     time::Duration,
 };
 
@@ -26,25 +25,37 @@ use super::clock;
 
 /// A number of nanoseconds from a reference point.
 ///
-/// Nanos can not represent durations >584 years, but hopefully that
-/// should not be a problem in real-world applications.
+/// Values are limited to `u64::MAX` nanoseconds, or approximately 584 years.
 #[derive(PartialEq, Eq, Default, Clone, Copy, PartialOrd, Ord)]
 pub struct Nanos(u64);
-
-impl Nanos {
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-}
 
 impl Nanos {
     pub const fn new(u: u64) -> Self {
         Self(u)
     }
 
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+
     /// Converts a [`Duration`], clamping at `u64::MAX` nanoseconds (~584 years).
     pub fn from_duration_saturating(d: Duration) -> Self {
         Self(u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+    }
+
+    #[inline]
+    pub const fn saturating_sub(self, rhs: Self) -> Self {
+        Self(self.0.saturating_sub(rhs.0))
+    }
+
+    #[inline]
+    pub const fn saturating_add(self, rhs: Self) -> Self {
+        Self(self.0.saturating_add(rhs.0))
+    }
+
+    #[inline]
+    pub const fn saturating_mul(self, rhs: u64) -> Self {
+        Self(self.0.saturating_mul(rhs))
     }
 }
 
@@ -107,23 +118,6 @@ impl From<Nanos> for u64 {
 impl From<Nanos> for Duration {
     fn from(n: Nanos) -> Self {
         Self::from_nanos(n.0)
-    }
-}
-
-impl Nanos {
-    #[inline]
-    pub const fn saturating_sub(self, rhs: Self) -> Self {
-        Self(self.0.saturating_sub(rhs.0))
-    }
-
-    #[inline]
-    pub const fn saturating_add(self, rhs: Self) -> Self {
-        Self(self.0.saturating_add(rhs.0))
-    }
-
-    #[inline]
-    pub const fn saturating_mul(self, rhs: u64) -> Self {
-        Self(self.0.saturating_mul(rhs))
     }
 }
 

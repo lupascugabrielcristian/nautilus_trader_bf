@@ -22,8 +22,7 @@ use nautilus_core::{
     string::{parsing::precision_from_str, secret::REDACTED, urlencoding},
 };
 use nautilus_model::instruments::InstrumentAny;
-use nautilus_network::http::HttpClient;
-use ustr::Ustr;
+use nautilus_network::http::{HttpClient, USER_AGENT};
 
 use super::{
     error::{Error, TardisErrorResponse},
@@ -49,7 +48,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// See <https://docs.tardis.dev/api/http>.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.tardis", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.tardis", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -99,7 +98,7 @@ impl TardisHttpClient {
             base_url.map_or_else(|| TARDIS_HTTP_BASE_URL.to_string(), ToString::to_string);
 
         let mut headers = HashMap::new();
-        headers.insert("User-Agent".to_string(), NAUTILUS_USER_AGENT.to_string());
+        headers.insert(USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string());
 
         if let Some(ref cred) = credential {
             headers.insert(
@@ -109,14 +108,13 @@ impl TardisHttpClient {
         }
 
         let keyed_quotas = vec![(TARDIS_REST_RATE_KEY.to_string(), *TARDIS_REST_QUOTA)];
-        let client = HttpClient::new(
-            headers,
-            vec![],
-            keyed_quotas,
-            Some(*TARDIS_REST_QUOTA),
-            timeout_secs.or(Some(60)),
-            proxy_url,
-        )?;
+        let client = HttpClient::builder()
+            .headers(headers)
+            .keyed_quotas(keyed_quotas)
+            .default_quota(*TARDIS_REST_QUOTA)
+            .maybe_timeout_secs(timeout_secs.or(Some(60)))
+            .maybe_proxy_url(proxy_url)
+            .build()?;
 
         Ok(Self {
             base_url,
@@ -254,7 +252,7 @@ impl TardisHttpClient {
         let mut nautilus_instruments: Vec<InstrumentAny> = Vec::new();
 
         for exchange in exchanges {
-            log::info!("Fetching instruments for {exchange}");
+            log::debug!("Fetching instruments for {exchange}");
 
             let instruments_info = match self.instruments_info(*exchange, None, None).await {
                 Ok(info) => info,
@@ -264,7 +262,7 @@ impl TardisHttpClient {
                 }
             };
 
-            log::info!(
+            log::debug!(
                 "Received {} instruments for {exchange}",
                 instruments_info.len()
             );
@@ -282,7 +280,7 @@ impl TardisHttpClient {
 
                 let info = TardisInstrumentMiniInfo::new(
                     instrument_id,
-                    Some(Ustr::from(&inst.id)),
+                    Some(inst.id),
                     *exchange,
                     price_precision,
                     size_precision,

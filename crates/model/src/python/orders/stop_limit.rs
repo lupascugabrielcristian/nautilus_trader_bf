@@ -143,7 +143,7 @@ impl StopLimitOrder {
 
     #[staticmethod]
     #[pyo3(name = "closing_side")]
-    fn py_closing_side(side: PositionSide) -> OrderSide {
+    fn py_closing_side(side: PositionSide) -> Option<OrderSide> {
         OrderCore::closing_side(side)
     }
 
@@ -373,7 +373,7 @@ impl StopLimitOrder {
     fn py_tags(&self) -> Option<Vec<&str>> {
         self.tags
             .as_ref()
-            .map(|vec| vec.iter().map(|s| s.as_str()).collect())
+            .map(|vec| vec.iter().map(Ustr::as_str).collect())
     }
 
     #[pyo3(name = "events")]
@@ -396,7 +396,7 @@ impl StopLimitOrder {
 
     #[pyo3(name = "apply")]
     fn py_apply(&mut self, event: Py<PyAny>, py: Python<'_>) -> PyResult<()> {
-        let event_any = pyobject_to_order_event(py, event).unwrap();
+        let event_any = pyobject_to_order_event(py, event)?;
         self.apply(event_any).map_err(to_pyruntime_err)
     }
 
@@ -460,7 +460,7 @@ impl StopLimitOrder {
             .map(|vec| vec.iter().map(|s| Ustr::from(s)).collect());
         let init_id = get_required_parsed(values, "init_id", |s| s.parse::<UUID4>())?;
         let ts_init = get_required::<u64>(values, "ts_init")?;
-        let stop_limit_order = Self::new(
+        let stop_limit_order = Self::new_checked(
             trader_id,
             strategy_id,
             instrument_id,
@@ -488,7 +488,8 @@ impl StopLimitOrder {
             tags,
             init_id,
             ts_init.into(),
-        );
+        )
+        .map_err(to_pyvalue_err)?;
         Ok(stop_limit_order)
     }
 
@@ -529,7 +530,7 @@ impl StopLimitOrder {
         )?;
         self.avg_px.map_or_else(
             || dict.set_item("avg_px", py.None()),
-            |x| dict.set_item("avg_px", x),
+            |x| dict.set_item("avg_px", x.to_string()),
         )?;
         self.position_id.map_or_else(
             || dict.set_item("position_id", py.None()),
@@ -541,7 +542,7 @@ impl StopLimitOrder {
         )?;
         self.slippage.map_or_else(
             || dict.set_item("slippage", py.None()),
-            |x| dict.set_item("slippage", x),
+            |x| dict.set_item("slippage", x.to_string()),
         )?;
         self.account_id.map_or_else(
             || dict.set_item("account_id", py.None()),
@@ -601,7 +602,7 @@ impl StopLimitOrder {
             "tags",
             self.tags
                 .as_ref()
-                .map(|vec| vec.iter().map(|s| s.to_string()).collect::<Vec<String>>()),
+                .map(|vec| vec.iter().map(ToString::to_string).collect::<Vec<String>>()),
         )?;
         Ok(dict.into())
     }

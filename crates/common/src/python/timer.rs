@@ -17,7 +17,7 @@ use std::str::FromStr;
 
 use nautilus_core::{
     UUID4, UnixNanos,
-    python::{IntoPyObjectNautilusExt, clone_py_object, to_pyvalue_err},
+    python::{IntoPyObjectNautilusExt, to_pyvalue_err},
 };
 use pyo3::{
     IntoPyObjectExt,
@@ -27,56 +27,15 @@ use pyo3::{
 };
 use ustr::Ustr;
 
-use crate::timer::{TimeEvent, TimeEventCallback, TimeEventHandler};
-
-#[pyo3::pyclass(
-    module = "nautilus_trader.core.nautilus_pyo3.common",
-    name = "TimeEventHandler"
-)]
-/// Temporary time event handler for Python inter-operatbility
-///
-/// TODO: Remove once control flow moves into Rust
-///
-/// `TimeEventHandler` associates a `TimeEvent` with a callback function that is triggered
-/// when the event's timestamp is reached.
-#[derive(Debug)]
-#[allow(non_camel_case_types)]
-pub struct TimeEventHandler_Py {
-    /// The time event.
-    pub event: TimeEvent,
-    /// The callable python object.
-    pub callback: Py<PyAny>,
-}
-
-impl From<TimeEventHandler> for TimeEventHandler_Py {
-    /// # Panics
-    ///
-    /// Panics if the provided `TimeEventHandler` contains a Rust callback,
-    /// since only Python callbacks are supported by this handler.
-    fn from(value: TimeEventHandler) -> Self {
-        Self {
-            event: value.event,
-            callback: match value.callback {
-                TimeEventCallback::Python(callback) => {
-                    // `TimeEventHandler_Py` is a PyO3 v2 wrapper; legacy capsule
-                    // callbacks use `TimeEventHandler_API` instead.
-                    clone_py_object(callback.callback())
-                }
-                TimeEventCallback::Rust(_) | TimeEventCallback::RustLocal(_) => {
-                    panic!("Python time event handler is not supported for Rust callbacks")
-                }
-            },
-        }
-    }
-}
+use crate::timer::TimeEvent;
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl TimeEvent {
-    /// Represents a time event occurring at the event timestamp.
+    /// Represents a named timer event.
     ///
-    /// A `TimeEvent` carries metadata such as the event's name, a unique event ID,
-    /// and timestamps indicating when the event was scheduled to occur and when it was initialized.
+    /// `ts_event` records the scheduled event time, while `ts_init` records
+    /// when the event instance was initialized.
     #[new]
     fn py_new(name: &str, event_id: UUID4, ts_event: u64, ts_init: u64) -> Self {
         Self::new(Ustr::from(name), event_id, ts_event.into(), ts_init.into())
@@ -182,7 +141,7 @@ mod tests {
 
     use crate::{
         live::timer::LiveTimer,
-        runner::{TimeEventSender, set_time_event_sender},
+        runner::{TimeEventMessage, TimeEventSender, set_time_event_sender},
         testing::wait_until,
         timer::{TimeEvent, TimeEventCallback},
     };
@@ -196,7 +155,7 @@ mod tests {
     struct TestTimeEventSender;
 
     impl TimeEventSender for TestTimeEventSender {
-        fn send(&self, _handler: crate::timer::TimeEventHandler) {
+        fn send(&self, _message: TimeEventMessage) {
             // Test implementation - just ignore the events
         }
     }
@@ -235,7 +194,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         timer.cancel();
-        wait_until(|| timer.is_expired(), Duration::from_secs(2));
+        assert!(timer.is_expired(), "Timer should be expired after cancel");
         assert!(timer.next_time_ns() > next_time_ns);
     }
 

@@ -23,11 +23,15 @@ pub mod encoder;
 pub mod enums;
 pub mod error;
 pub mod execution;
+pub mod fees;
+pub mod instruments;
 pub mod models;
 pub mod parse;
 pub mod status;
 pub mod symbol;
 pub mod urls;
+
+pub(crate) mod websocket;
 
 #[cfg(test)]
 pub mod testing;

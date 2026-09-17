@@ -48,6 +48,7 @@ const ORDER_STATUS_REPORT_FIELDS: &[JsonFieldSpec] = &[
     JsonFieldSpec::utf8("contingency_type", false),
     JsonFieldSpec::u64("expire_time", true),
     JsonFieldSpec::utf8("price", true),
+    JsonFieldSpec::utf8("activation_price", true),
     JsonFieldSpec::utf8("trigger_price", true),
     JsonFieldSpec::utf8("trigger_type", true),
     JsonFieldSpec::utf8("limit_offset", true),
@@ -200,10 +201,10 @@ mod tests {
 
     use nautilus_core::{UUID4, UnixNanos};
     use nautilus_model::{
-        enums::{OrderSide, OrderStatus, OrderType, PositionSideSpecified, TimeInForce},
+        enums::{OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce},
         identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId, VenueOrderId},
         reports::{OrderStatusReport, PositionStatusReport},
-        types::Quantity,
+        types::{Price, Quantity},
     };
     use rstest::rstest;
     use rust_decimal::Decimal;
@@ -217,7 +218,7 @@ mod tests {
             InstrumentId::from("AUDUSD.SIM"),
             Some(ClientOrderId::from("O-19700101-000000-001-001-1")),
             VenueOrderId::from("1"),
-            OrderSide::Buy,
+            OrderSide::Buy.into(),
             OrderType::Limit,
             TimeInForce::Gtc,
             OrderStatus::Accepted,
@@ -230,6 +231,7 @@ mod tests {
         )
         .with_linked_order_ids([ClientOrderId::from("O-19700101-000000-001-001-2")]);
         let report = OrderStatusReport {
+            activation_price: Some(Price::from("1.05000")),
             limit_offset: Some(Decimal::from_str("0.123456789123456789").unwrap()),
             trailing_offset: Some(Decimal::from_str("0.987654321987654321").unwrap()),
             avg_px: Some(Decimal::from_str("1.23456789123456789").unwrap()),
@@ -250,7 +252,7 @@ mod tests {
         let report = PositionStatusReport {
             account_id: AccountId::from("SIM-001"),
             instrument_id: InstrumentId::from("AUDUSD.SIM"),
-            position_side: PositionSideSpecified::Long,
+            position_side: PositionSide::Long,
             quantity: Quantity::from("100.25"),
             signed_decimal_qty: Decimal::from_str("100.250000000123456789").unwrap(),
             report_id: UUID4::default(),

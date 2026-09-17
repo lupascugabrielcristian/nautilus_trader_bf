@@ -15,6 +15,10 @@
 
 //! A `UUID4` Universally Unique Identifier (UUID) version 4 (RFC 4122).
 
+// pyo3's `from_py_object` generates `.clone()` on `Copy` fields that clippy flags from the
+// macro expansion; an item-level `allow` cannot reach the expansion
+#![allow(clippy::clone_on_copy)]
+
 use std::{
     ffi::CStr,
     fmt::{Debug, Display},
@@ -33,48 +37,13 @@ use crate::hex::ENCODE_PAIR;
 /// The maximum length of ASCII characters for a `UUID4` string value (includes null terminator).
 pub(crate) const UUID4_LEN: usize = 37;
 
-fn format_uuid4_bytes(bytes: [u8; 16]) -> [u8; UUID4_LEN] {
-    let mut value = [0u8; UUID4_LEN];
-    let mut pos = 0;
-
-    for (idx, byte) in bytes.into_iter().enumerate() {
-        if matches!(idx, 4 | 6 | 8 | 10) {
-            value[pos] = b'-';
-            pos += 1;
-        }
-
-        value[pos..pos + 2].copy_from_slice(&ENCODE_PAIR[byte as usize]);
-        pos += 2;
-    }
-
-    value[36] = 0; // Add the null terminator
-
-    debug_assert_eq!(pos, 36, "Invariant: UUID text must be 36 bytes");
-    debug_assert!(
-        value[14] == b'4',
-        "Invariant: UUID version digit must be '4' (was {})",
-        value[14] as char
-    );
-    debug_assert!(
-        matches!(value[19], b'8' | b'9' | b'a' | b'b'),
-        "Invariant: UUID variant byte must be RFC 4122 (was {})",
-        value[19] as char
-    );
-    debug_assert!(
-        value[36] == 0,
-        "Invariant: UUID null terminator must be at index 36"
-    );
-
-    value
-}
-
 /// Represents a Universally Unique Identifier (UUID)
 /// version 4 based on a 128-bit label as specified in RFC 4122.
 #[repr(C)]
 #[derive(Copy, Clone, Hash, PartialEq, Eq)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.core", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.core", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -130,7 +99,9 @@ impl UUID4 {
     pub fn from_bytes(mut bytes: [u8; 16]) -> Self {
         bytes[6] = (bytes[6] & 0x0F) | 0x40;
         bytes[8] = (bytes[8] & 0x3F) | 0x80;
-        Self::from_validated_uuid(&Uuid::from_bytes(bytes))
+        Self {
+            value: format_uuid4_bytes(bytes),
+        }
     }
 
     /// Converts the [`UUID4`] to a C string reference.
@@ -201,11 +172,9 @@ impl UUID4 {
     }
 
     fn from_validated_uuid(uuid: &Uuid) -> Self {
-        let mut value = [0; UUID4_LEN];
-        let uuid_str = uuid.to_string();
-        value[..uuid_str.len()].copy_from_slice(uuid_str.as_bytes());
-        value[uuid_str.len()] = 0; // Add null terminator
-        Self { value }
+        Self {
+            value: format_uuid4_bytes(*uuid.as_bytes()),
+        }
     }
 }
 
@@ -283,7 +252,7 @@ impl Serialize for UUID4 {
     where
         S: Serializer,
     {
-        self.to_string().serialize(serializer)
+        serializer.serialize_str(self.as_str())
     }
 }
 
@@ -295,6 +264,41 @@ impl<'de> Deserialize<'de> for UUID4 {
         let uuid4_str: std::borrow::Cow<'de, str> = Deserialize::deserialize(deserializer)?;
         uuid4_str.as_ref().parse().map_err(serde::de::Error::custom)
     }
+}
+
+fn format_uuid4_bytes(bytes: [u8; 16]) -> [u8; UUID4_LEN] {
+    let mut value = [0u8; UUID4_LEN];
+    let mut pos = 0;
+
+    for (idx, byte) in bytes.into_iter().enumerate() {
+        if matches!(idx, 4 | 6 | 8 | 10) {
+            value[pos] = b'-';
+            pos += 1;
+        }
+
+        value[pos..pos + 2].copy_from_slice(&ENCODE_PAIR[byte as usize]);
+        pos += 2;
+    }
+
+    value[36] = 0; // Add the null terminator
+
+    debug_assert_eq!(pos, 36, "Invariant: UUID text must be 36 bytes");
+    debug_assert!(
+        value[14] == b'4',
+        "Invariant: UUID version digit must be '4' (was {})",
+        value[14] as char
+    );
+    debug_assert!(
+        matches!(value[19], b'8' | b'9' | b'a' | b'b'),
+        "Invariant: UUID variant byte must be RFC 4122 (was {})",
+        value[19] as char
+    );
+    debug_assert!(
+        value[36] == 0,
+        "Invariant: UUID null terminator must be at index 36"
+    );
+
+    value
 }
 
 #[cfg(test)]
@@ -688,18 +692,15 @@ mod tests {
         }
 
         #[rstest]
-        fn prop_uuid4_equality_and_hashing(uuid1 in uuid4_strategy(), uuid2 in uuid4_strategy()) {
-            // Identity
-            prop_assert_eq!(uuid1, uuid1);
+        fn prop_uuid4_equality_and_hashing(uuid in uuid4_strategy()) {
+            let equivalent = uuid;
+            let mut first_hasher = DefaultHasher::new();
+            let mut second_hasher = DefaultHasher::new();
+            uuid.hash(&mut first_hasher);
+            equivalent.hash(&mut second_hasher);
 
-            // Equality implies hash equality
-            if uuid1 == uuid2 {
-                let mut h1 = DefaultHasher::new();
-                let mut h2 = DefaultHasher::new();
-                uuid1.hash(&mut h1);
-                uuid2.hash(&mut h2);
-                prop_assert_eq!(h1.finish(), h2.finish());
-            }
+            prop_assert_eq!(uuid, equivalent);
+            prop_assert_eq!(first_hasher.finish(), second_hasher.finish());
         }
 
         #[rstest]

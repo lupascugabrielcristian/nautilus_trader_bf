@@ -35,7 +35,7 @@ use crate::{
         parse::{
             parse_millis_to_nanos, parse_secs_to_nanos, price_from_decimal, quantity_from_decimal,
         },
-        symbol::MarketRegistry,
+        symbol::{MarketRegistry, format_instrument_id_with_venue},
     },
     http::models::{
         LighterCandle, LighterFunding, LighterFundingDirection, LighterOrderBook,
@@ -72,7 +72,7 @@ pub fn register_spot_order_book_details(
 ///
 /// # Errors
 ///
-/// Returns an error if an instrument definition cannot be converted.
+/// Returns an error if metadata is nonempty but no instrument definition can be converted.
 pub fn parse_order_book_details_instruments(
     registry: &MarketRegistry,
     perp_details: &[LighterPerpOrderBookDetail],
@@ -92,7 +92,7 @@ pub fn parse_order_book_details_instruments(
 ///
 /// # Errors
 ///
-/// Returns an error if an instrument definition cannot be converted.
+/// Returns an error if metadata is nonempty but no instrument definition can be converted.
 pub fn parse_order_book_details_instruments_with_status(
     registry: &MarketRegistry,
     perp_details: &[LighterPerpOrderBookDetail],
@@ -100,19 +100,40 @@ pub fn parse_order_book_details_instruments_with_status(
     ts_init: UnixNanos,
 ) -> anyhow::Result<Vec<(InstrumentAny, LighterMarketStatus)>> {
     let mut instruments = Vec::with_capacity(perp_details.len() + spot_details.len());
+    let mut first_error = None;
 
     for detail in perp_details {
-        instruments.push((
-            parse_perp_instrument(registry, detail, ts_init)?,
-            detail.order_book.status,
-        ));
+        match parse_perp_instrument(registry, detail, ts_init) {
+            Ok(instrument) => instruments.push((instrument, detail.order_book.status)),
+            Err(e) => {
+                log::warn!(
+                    "Skipping invalid Lighter perpetual instrument `{}`: {e}",
+                    detail.order_book.symbol,
+                );
+                first_error.get_or_insert_with(|| e.to_string());
+            }
+        }
     }
 
     for detail in spot_details {
-        instruments.push((
-            parse_spot_instrument(registry, detail, ts_init)?,
-            detail.order_book.status,
-        ));
+        match parse_spot_instrument(registry, detail, ts_init) {
+            Ok(instrument) => instruments.push((instrument, detail.order_book.status)),
+            Err(e) => {
+                log::warn!(
+                    "Skipping invalid Lighter spot instrument `{}`: {e}",
+                    detail.order_book.symbol,
+                );
+                first_error.get_or_insert_with(|| e.to_string());
+            }
+        }
+    }
+
+    let input_len = perp_details.len() + spot_details.len();
+    if input_len > 0 && instruments.is_empty() {
+        anyhow::bail!(
+            "failed to parse any of {input_len} Lighter instruments: {}",
+            first_error.as_deref().unwrap_or("unknown parse error"),
+        );
     }
 
     Ok(instruments)
@@ -163,6 +184,27 @@ pub fn parse_candle_bar(
     instrument: &InstrumentAny,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Bar> {
+    anyhow::ensure!(
+        candle.open > Decimal::ZERO,
+        "non-positive candle open `{}`",
+        candle.open
+    );
+    anyhow::ensure!(
+        candle.high > Decimal::ZERO,
+        "non-positive candle high `{}`",
+        candle.high
+    );
+    anyhow::ensure!(
+        candle.low > Decimal::ZERO,
+        "non-positive candle low `{}`",
+        candle.low
+    );
+    anyhow::ensure!(
+        candle.close > Decimal::ZERO,
+        "non-positive candle close `{}`",
+        candle.close
+    );
+
     let timestamp_ms =
         u64::try_from(candle.timestamp).context("negative Lighter candle timestamp")?;
     let ts_event = parse_millis_to_nanos(timestamp_ms)?;
@@ -377,9 +419,9 @@ fn aggregate_order_levels(
 
 fn aggressor_side_from_is_maker_ask(is_maker_ask: bool) -> AggressorSide {
     if is_maker_ask {
-        AggressorSide::Buyer
+        AggressorSide::Buy
     } else {
-        AggressorSide::Seller
+        AggressorSide::Sell
     }
 }
 
@@ -405,45 +447,52 @@ fn parse_perp_instrument(
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
     let order_book = &detail.order_book;
-    let instrument_id = registry.insert(
+
+    let instrument_id = format_instrument_id_with_venue(
+        order_book.symbol.as_str(),
+        order_book.market_type,
+        registry.venue(),
+    );
+
+    let raw_symbol = Symbol::from_ustr_unchecked(order_book.symbol);
+    let settlement_currency = registry.settlement_currency();
+
+    let (base_currency, quote_currency) = symbol_currencies(
+        order_book.symbol.as_str(),
+        settlement_currency.code.as_str(),
+    );
+
+    let price_increment = price_increment(detail.price_decimals)?;
+    let size_increment = quantity_increment(detail.size_decimals)?;
+
+    let instrument = CryptoPerpetual::builder()
+        .instrument_id(instrument_id)
+        .raw_symbol(raw_symbol)
+        .base_currency(base_currency)
+        .quote_currency(quote_currency)
+        .settlement_currency(settlement_currency)
+        .is_inverse(false)
+        .price_precision(detail.price_decimals)
+        .size_precision(detail.size_decimals)
+        .price_increment(price_increment)
+        .size_increment(size_increment)
+        .maybe_min_quantity(min_quantity(order_book, detail.size_decimals)?)
+        .maybe_max_notional(max_notional(order_book, quote_currency)?)
+        .maybe_min_notional(min_notional(order_book, quote_currency)?)
+        .margin_init(margin_fraction(detail.default_initial_margin_fraction))
+        .margin_maint(margin_fraction(detail.maintenance_margin_fraction))
+        .maker_fee(order_book.maker_fee)
+        .taker_fee(order_book.taker_fee)
+        .ts_event(ts_init)
+        .ts_init(ts_init)
+        .build()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    registry.insert(
         order_book.market_id,
         order_book.symbol.as_str(),
         order_book.market_type,
     );
-    let raw_symbol = Symbol::from_ustr_unchecked(order_book.symbol);
-    let (base_currency, quote_currency) = symbol_currencies(order_book.symbol.as_str(), "USDC");
-    let settlement_currency = quote_currency;
-    let price_increment = price_increment(detail.price_decimals);
-    let size_increment = quantity_increment(detail.size_decimals);
-
-    let instrument = CryptoPerpetual::new_checked(
-        instrument_id,
-        raw_symbol,
-        base_currency,
-        quote_currency,
-        settlement_currency,
-        false,
-        detail.price_decimals,
-        detail.size_decimals,
-        price_increment,
-        size_increment,
-        None,
-        None,
-        None,
-        min_quantity(order_book, detail.size_decimals)?,
-        max_notional(order_book, quote_currency)?,
-        min_notional(order_book, quote_currency)?,
-        None,
-        None,
-        Some(margin_fraction(detail.default_initial_margin_fraction)),
-        Some(margin_fraction(detail.maintenance_margin_fraction)),
-        Some(order_book.maker_fee),
-        Some(order_book.taker_fee),
-        None,
-        ts_init,
-        ts_init,
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     Ok(InstrumentAny::CryptoPerpetual(instrument))
 }
@@ -454,44 +503,61 @@ fn parse_spot_instrument(
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
     let order_book = &detail.order_book;
-    let instrument_id = registry.insert(
+
+    let instrument_id = format_instrument_id_with_venue(
+        order_book.symbol.as_str(),
+        order_book.market_type,
+        registry.venue(),
+    );
+
+    let raw_symbol = Symbol::from_ustr_unchecked(order_book.symbol);
+    let (base_currency, quote_currency) = spot_symbol_currencies(order_book.symbol.as_str())?;
+    let price_increment = price_increment(detail.price_decimals)?;
+    let size_increment = quantity_increment(detail.size_decimals)?;
+
+    let instrument = CurrencyPair::builder()
+        .instrument_id(instrument_id)
+        .raw_symbol(raw_symbol)
+        .base_currency(base_currency)
+        .quote_currency(quote_currency)
+        .price_precision(detail.price_decimals)
+        .size_precision(detail.size_decimals)
+        .price_increment(price_increment)
+        .size_increment(size_increment)
+        .maybe_min_quantity(min_quantity(order_book, detail.size_decimals)?)
+        .maybe_max_notional(max_notional(order_book, quote_currency)?)
+        .maybe_min_notional(min_notional(order_book, quote_currency)?)
+        .maker_fee(order_book.maker_fee)
+        .taker_fee(order_book.taker_fee)
+        .ts_event(ts_init)
+        .ts_init(ts_init)
+        .build()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    registry.insert(
         order_book.market_id,
         order_book.symbol.as_str(),
         order_book.market_type,
     );
-    let raw_symbol = Symbol::from_ustr_unchecked(order_book.symbol);
-    let (base_currency, quote_currency) = symbol_currencies(order_book.symbol.as_str(), "USDC");
-    let price_increment = price_increment(detail.price_decimals);
-    let size_increment = quantity_increment(detail.size_decimals);
-
-    let instrument = CurrencyPair::new_checked(
-        instrument_id,
-        raw_symbol,
-        base_currency,
-        quote_currency,
-        detail.price_decimals,
-        detail.size_decimals,
-        price_increment,
-        size_increment,
-        None,
-        None,
-        None,
-        min_quantity(order_book, detail.size_decimals)?,
-        max_notional(order_book, quote_currency)?,
-        min_notional(order_book, quote_currency)?,
-        None,
-        None,
-        None,
-        None,
-        Some(order_book.maker_fee),
-        Some(order_book.taker_fee),
-        None,
-        ts_init,
-        ts_init,
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     Ok(InstrumentAny::CurrencyPair(instrument))
+}
+
+fn spot_symbol_currencies(symbol: &str) -> anyhow::Result<(Currency, Currency)> {
+    let (base, quote) = symbol
+        .split_once('/')
+        .context("Lighter spot symbol must use BASE/QUOTE format")?;
+    let base = base.trim();
+    let quote = quote.trim();
+    anyhow::ensure!(
+        !base.is_empty() && !quote.is_empty() && !quote.contains('/'),
+        "Lighter spot symbol must contain one nonempty BASE/QUOTE pair",
+    );
+
+    Ok((
+        Currency::get_or_create_crypto(base),
+        Currency::get_or_create_crypto(quote),
+    ))
 }
 
 fn symbol_currencies(symbol: &str, default_quote: &str) -> (Currency, Currency) {
@@ -502,20 +568,19 @@ fn symbol_currencies(symbol: &str, default_quote: &str) -> (Currency, Currency) 
     )
 }
 
-fn price_increment(decimals: u8) -> Price {
-    Price::from(decimal_increment(decimals))
+fn price_increment(decimals: u8) -> anyhow::Result<Price> {
+    Price::from_decimal_dp(decimal_increment(decimals), decimals)
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-fn quantity_increment(decimals: u8) -> Quantity {
-    Quantity::from(decimal_increment(decimals))
+fn quantity_increment(decimals: u8) -> anyhow::Result<Quantity> {
+    Quantity::from_decimal_dp(decimal_increment(decimals), decimals)
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-fn decimal_increment(decimals: u8) -> String {
-    if decimals == 0 {
-        return "1".to_string();
-    }
-
-    format!("0.{}1", "0".repeat(usize::from(decimals - 1)))
+// `10^-decimals` as an exact decimal (e.g. 3 -> 0.001, 0 -> 1).
+fn decimal_increment(decimals: u8) -> Decimal {
+    Decimal::new(1, u32::from(decimals))
 }
 
 fn min_quantity(
@@ -578,33 +643,23 @@ mod tests {
     fn create_test_instrument() -> InstrumentAny {
         let instrument_id = InstrumentId::new(Symbol::new("ETH-PERP"), Venue::new("LIGHTER"));
 
-        InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
-            instrument_id,
-            Symbol::new("ETH-PERP"),
-            Currency::from("ETH"),
-            Currency::from("USDC"),
-            Currency::from("USDC"),
-            false,
-            2,
-            4,
-            Price::from("0.01"),
-            Quantity::from("0.0001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        ))
+        InstrumentAny::CryptoPerpetual(
+            CryptoPerpetual::builder()
+                .instrument_id(instrument_id)
+                .raw_symbol(Symbol::new("ETH-PERP"))
+                .base_currency(Currency::from("ETH"))
+                .quote_currency(Currency::from("USDC"))
+                .settlement_currency(Currency::from("USDC"))
+                .is_inverse(false)
+                .price_precision(2)
+                .size_precision(4)
+                .price_increment(Price::from("0.01"))
+                .size_increment(Quantity::from("0.0001"))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
     }
 
     fn stub_trade(is_maker_ask: bool) -> LighterTrade {
@@ -670,6 +725,54 @@ mod tests {
         }
     }
 
+    fn stub_perp_detail(symbol: &str, market_id: i16) -> LighterPerpOrderBookDetail {
+        LighterPerpOrderBookDetail {
+            order_book: stub_order_book(symbol, market_id, LighterProductType::Perp),
+            size_decimals: 4,
+            price_decimals: 2,
+            quote_multiplier: 1,
+            default_initial_margin_fraction: 500,
+            min_initial_margin_fraction: 200,
+            maintenance_margin_fraction: 120,
+            closeout_margin_fraction: 80,
+            last_trade_price: Decimal::new(235_273, 2),
+            daily_trades_count: 0,
+            daily_base_token_volume: Decimal::ZERO,
+            daily_quote_token_volume: Decimal::ZERO,
+            daily_price_low: Decimal::ZERO,
+            daily_price_high: Decimal::ZERO,
+            daily_price_change: Decimal::ZERO,
+            open_interest: Decimal::ZERO,
+            daily_chart: Default::default(),
+            market_config: LighterMarketConfig {
+                market_margin_mode: LighterPositionMarginMode::Cross,
+                insurance_fund_account_index: 281474976710655,
+                liquidation_mode: 0,
+                force_reduce_only: false,
+                trading_hours: String::new(),
+                funding_fee_discounts_enabled: false,
+                hidden: false,
+            },
+            strategy_index: 2,
+        }
+    }
+
+    fn stub_spot_detail(symbol: &str, market_id: i16) -> LighterSpotOrderBookDetail {
+        LighterSpotOrderBookDetail {
+            order_book: stub_order_book(symbol, market_id, LighterProductType::Spot),
+            size_decimals: 6,
+            price_decimals: 6,
+            last_trade_price: Decimal::ONE,
+            daily_trades_count: 0,
+            daily_base_token_volume: Decimal::ZERO,
+            daily_quote_token_volume: Decimal::ZERO,
+            daily_price_low: Decimal::ZERO,
+            daily_price_high: Decimal::ZERO,
+            daily_price_change: Decimal::ZERO,
+            daily_chart: Default::default(),
+        }
+    }
+
     #[rstest]
     fn test_parse_trade_tick_maps_aggressor_from_maker_side() {
         let instrument = create_test_instrument();
@@ -678,8 +781,8 @@ mod tests {
         let seller = parse_trade_tick(&stub_trade(false), &instrument, ts_init).unwrap();
         let buyer = parse_trade_tick(&stub_trade(true), &instrument, ts_init).unwrap();
 
-        assert_eq!(seller.aggressor_side, AggressorSide::Seller);
-        assert_eq!(buyer.aggressor_side, AggressorSide::Buyer);
+        assert_eq!(seller.aggressor_side, AggressorSide::Sell);
+        assert_eq!(buyer.aggressor_side, AggressorSide::Buy);
         assert_eq!(seller.price, Price::from("2352.73"));
         assert_eq!(seller.size, Quantity::from("0.1336"));
         assert_eq!(seller.trade_id.to_string(), "19209006902");
@@ -830,6 +933,41 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case("open", Decimal::ZERO)]
+    #[case("open", Decimal::NEGATIVE_ONE)]
+    #[case("high", Decimal::ZERO)]
+    #[case("high", Decimal::NEGATIVE_ONE)]
+    #[case("low", Decimal::ZERO)]
+    #[case("low", Decimal::NEGATIVE_ONE)]
+    #[case("close", Decimal::ZERO)]
+    #[case("close", Decimal::NEGATIVE_ONE)]
+    fn test_parse_candle_bar_rejects_non_positive_ohlc(
+        #[case] field: &str,
+        #[case] value: Decimal,
+    ) {
+        let instrument = create_test_instrument();
+        let bar_type = test_bar_type(instrument.id());
+        let candles: LighterCandles = serde_json::from_str(HTTP_CANDLES).unwrap();
+        let mut candle = candles.candles[0].clone();
+        match field {
+            "open" => candle.open = value,
+            "high" => candle.high = value,
+            "low" => candle.low = value,
+            "close" => candle.close = value,
+            _ => unreachable!(),
+        }
+
+        let error =
+            parse_candle_bar(&candle, bar_type, &instrument, UnixNanos::from(1)).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("non-positive candle {field}")),
+        );
+    }
+
     // The previous string-roundtrip implementation rejected negative volume
     // implicitly via `parse_quantity`'s decimal sign check. The current
     // direct-Decimal implementation enforces the same constraint with an
@@ -895,10 +1033,10 @@ mod tests {
 
         assert_eq!(deltas.deltas.len(), 3);
         assert_eq!(deltas.deltas[0].action, BookAction::Clear);
-        assert_eq!(deltas.deltas[1].order.side, OrderSide::Buy);
+        assert_eq!(deltas.deltas[1].order.side, OrderSide::Buy.into());
         assert_eq!(deltas.deltas[1].order.price, Price::from("2352.71"));
         assert_eq!(deltas.deltas[1].order.size, Quantity::from("0.2125"));
-        assert_eq!(deltas.deltas[2].order.side, OrderSide::Sell);
+        assert_eq!(deltas.deltas[2].order.side, OrderSide::Sell.into());
         assert_eq!(deltas.deltas[2].order.price, Price::from("2352.74"));
         assert_eq!(deltas.deltas[2].order.size, Quantity::from("0.0050"));
         assert_eq!(deltas.deltas[0].sequence, 0);
@@ -1267,24 +1405,58 @@ mod tests {
                 .unwrap_err();
 
         assert!(err.to_string().contains("negative quantity"));
+        assert!(registry.is_empty());
+    }
+
+    #[rstest]
+    fn test_parse_order_book_details_instruments_skips_invalid_row_without_registry_pollution() {
+        let registry = MarketRegistry::new();
+        let mut invalid = stub_perp_detail("ETH", 0);
+        invalid.order_book.min_base_amount = Decimal::NEGATIVE_ONE;
+        let valid = stub_perp_detail("BTC", 1);
+
+        let instruments = parse_order_book_details_instruments(
+            &registry,
+            &[invalid, valid],
+            &[],
+            UnixNanos::from(1),
+        )
+        .unwrap();
+
+        assert_eq!(instruments.len(), 1);
+        assert_eq!(instruments[0].id(), instrument_id("BTC-PERP"));
+        assert_eq!(registry.market_index(&instrument_id("BTC-PERP")), Some(1));
+        assert_eq!(registry.market_index(&instrument_id("ETH-PERP")), None);
+    }
+
+    #[rstest]
+    fn test_parse_order_book_details_instruments_skips_invalid_spot_row() {
+        let registry = MarketRegistry::new();
+        let mut invalid = stub_spot_detail("ETH/USDC", 2048);
+        invalid.order_book.min_base_amount = Decimal::NEGATIVE_ONE;
+        let valid = stub_spot_detail("BTC/USDC", 2049);
+
+        let instruments = parse_order_book_details_instruments(
+            &registry,
+            &[],
+            &[invalid, valid],
+            UnixNanos::from(1),
+        )
+        .unwrap();
+
+        assert_eq!(instruments.len(), 1);
+        assert_eq!(instruments[0].id(), instrument_id("BTC/USDC-SPOT"));
+        assert_eq!(
+            registry.market_index(&instrument_id("BTC/USDC-SPOT")),
+            Some(2049),
+        );
+        assert_eq!(registry.market_index(&instrument_id("ETH/USDC-SPOT")), None);
     }
 
     #[rstest]
     fn test_parse_order_book_details_instruments_parses_spot_pair() {
         let registry = MarketRegistry::new();
-        let details = vec![LighterSpotOrderBookDetail {
-            order_book: stub_order_book("ETH/USDC", 2048, LighterProductType::Spot),
-            size_decimals: 6,
-            price_decimals: 6,
-            last_trade_price: Decimal::ONE,
-            daily_trades_count: 0,
-            daily_base_token_volume: Decimal::ZERO,
-            daily_quote_token_volume: Decimal::ZERO,
-            daily_price_low: Decimal::ZERO,
-            daily_price_high: Decimal::ZERO,
-            daily_price_change: Decimal::ZERO,
-            daily_chart: Default::default(),
-        }];
+        let details = vec![stub_spot_detail("ETH/USDC", 2048)];
         let instrument_id = instrument_id("ETH/USDC-SPOT");
 
         let instruments =
@@ -1316,26 +1488,56 @@ mod tests {
     }
 
     #[rstest]
+    fn test_parse_perp_uses_registry_venue_and_settlement_currency() {
+        let venue = Venue::new("LIGHTER_ROBINHOOD");
+        let settlement_currency = Currency::USDG();
+        let registry =
+            MarketRegistry::new_with_venue_and_settlement_currency(venue, settlement_currency);
+
+        let details = vec![stub_perp_detail("ETH", 0)];
+
+        let instruments =
+            parse_order_book_details_instruments(&registry, &details, &[], UnixNanos::from(1))
+                .unwrap();
+
+        assert_eq!(instruments.len(), 1);
+        match &instruments[0] {
+            InstrumentAny::CryptoPerpetual(perp) => {
+                assert_eq!(perp.id.venue, venue);
+                assert_eq!(perp.base_currency, Currency::from("ETH"));
+                assert_eq!(perp.quote_currency, settlement_currency);
+                assert_eq!(perp.settlement_currency, settlement_currency);
+            }
+            other => panic!("expected crypto perpetual, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case::missing_quote_separator("ETH")]
+    #[case::missing_base("/USDC")]
+    #[case::missing_quote("ETH/")]
+    #[case::extra_component("ETH/USDC/EXTRA")]
+    fn test_parse_order_book_details_instruments_rejects_invalid_spot_pair(#[case] symbol: &str) {
+        let registry = MarketRegistry::new();
+        let details = vec![stub_spot_detail(symbol, 2048)];
+
+        let error =
+            parse_order_book_details_instruments(&registry, &[], &details, UnixNanos::from(1))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("BASE/QUOTE"));
+        assert!(registry.is_empty());
+    }
+
+    #[rstest]
     fn test_register_spot_order_book_details_populates_market_registry() {
         let registry = MarketRegistry::new();
-        let details = vec![LighterSpotOrderBookDetail {
-            order_book: stub_order_book("USDC", 2048, LighterProductType::Spot),
-            size_decimals: 6,
-            price_decimals: 6,
-            last_trade_price: Decimal::ONE,
-            daily_trades_count: 0,
-            daily_base_token_volume: Decimal::ZERO,
-            daily_quote_token_volume: Decimal::ZERO,
-            daily_price_low: Decimal::ZERO,
-            daily_price_high: Decimal::ZERO,
-            daily_price_change: Decimal::ZERO,
-            daily_chart: Default::default(),
-        }];
+        let details = vec![stub_spot_detail("ETH/USDC", 2048)];
 
         register_spot_order_book_details(&registry, &details);
 
         assert_eq!(
-            registry.market_index(&instrument_id("USDC-SPOT")),
+            registry.market_index(&instrument_id("ETH/USDC-SPOT")),
             Some(2048)
         );
     }

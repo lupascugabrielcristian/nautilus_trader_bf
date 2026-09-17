@@ -39,9 +39,14 @@
 #![deny(clippy::missing_errors_doc)]
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
+#![allow(
+    clippy::assert_is_empty,
+    reason = "`assert!(x.is_empty())` is clearer than comparing against an empty value"
+)]
 
 pub mod backend;
 pub mod capture;
+pub mod codec;
 pub mod entry;
 pub mod error;
 pub mod hash;
@@ -56,6 +61,7 @@ pub mod snapshot;
 pub mod verifier;
 pub mod writer;
 
+mod format;
 mod wire;
 
 pub use backend::{

@@ -40,7 +40,7 @@ pub use data::{DataResponse, SubscribeCommand, UnsubscribeCommand};
 pub use execution::ExecutionReport;
 
 // TODO: Refine this to reduce disparity between enum sizes
-#[expect(
+#[allow(
     clippy::large_enum_variant,
     reason = "event enum keeps all data variants in one routing type"
 )]
@@ -48,7 +48,8 @@ pub use execution::ExecutionReport;
 pub enum DataEvent {
     Response(DataResponse),
     Data(Data),
-    Instrument(InstrumentAny), // TODO: Eventually this can be `Data` once Cython is gone
+    // Kept separate from `Data` pending the decision on generic dispatch versus this routing enum
+    Instrument(InstrumentAny),
     FundingRate(FundingRateUpdate),
     InstrumentStatus(InstrumentStatus),
     OptionGreeks(OptionGreeks),
@@ -57,8 +58,20 @@ pub enum DataEvent {
     DeFi(nautilus_model::defi::data::DefiData),
 }
 
+/// System command variants routed to a live node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
+pub enum SystemCommand {
+    ReconnectSocket(system::ReconnectSocket),
+}
+
+/// System event variants routed to a live node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
+pub enum SystemEvent {
+    SocketState(system::SocketStateChange),
+}
+
 /// Execution event variants for order events and reports.
-#[expect(clippy::large_enum_variant)]
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Display)]
 pub enum ExecutionEvent {
     Order(OrderEventAny),

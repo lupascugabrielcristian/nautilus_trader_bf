@@ -12,7 +12,7 @@ keywords.workspace = true
 documentation.workspace = true
 repository.workspace = true
 homepage.workspace = true
-publish = false # Do not publish to crates.io (ever)
+publish = false # Never publish to crates.io
 
 [lints]
 workspace = true
@@ -29,7 +29,6 @@ arrow = [
   "nautilus-serialization/arrow",
 ]
 betfair = ["dep:nautilus-betfair", "nautilus-betfair/python"]
-cython-compat = []
 defi = [
   "dep:nautilus-blockchain",
   "nautilus-backtest/defi",
@@ -74,15 +73,10 @@ extension-module = [
   "nautilus-trading/extension-module",
   "pyo3/extension-module",
 ]
-ffi = [
-  "nautilus-common/ffi",
-  "nautilus-core/ffi",
-  "nautilus-model/ffi",
-  "nautilus-persistence/ffi",
-]
 high-precision = [
   "nautilus-model/high-precision",
   "nautilus-serialization/high-precision",
+  "nautilus-testkit/high-precision",
   "nautilus-betfair?/high-precision",
   "nautilus-binance/high-precision",
   "nautilus-bitmex/high-precision",
@@ -101,6 +95,7 @@ high-precision = [
   "nautilus-tardis/high-precision",
 ]
 hypersync = ["defi", "nautilus-blockchain/hypersync"]
+mimalloc = ["dep:mimalloc"]
 postgres = ["nautilus-infrastructure/postgres"]
 redis = ["nautilus-infrastructure/redis"]
 tracing-bridge = ["nautilus-common/tracing-bridge"]
@@ -133,7 +128,10 @@ nautilus-persistence = { workspace = true, features = ["python"] }
 nautilus-portfolio = { workspace = true, features = ["python"] }
 nautilus-risk = { workspace = true, features = ["python"] }
 nautilus-serialization = { workspace = true, features = ["python"] }
-nautilus-testkit = { workspace = true, features = ["python"] }
+nautilus-system = { workspace = true, features = ["python"] }
+nautilus-testkit = { workspace = true, default-features = false, features = [
+  "python",
+] }
 nautilus-trading = { workspace = true, features = ["python"] }
 
 # Adapters
@@ -161,6 +159,20 @@ nautilus-tardis = { workspace = true, features = ["python", "replay"] }
 
 pyo3 = { workspace = true }
 pyo3-stub-gen = { workspace = true }
+
+# local_dynamic_tls avoids exhausting static TLS space when the extension is dlopen'd
+[target.'cfg(target_os = "macos")'.dependencies]
+# v2 avoids conflicting with PyArrow's independent mimalloc instance on macOS;
+# remove it once libmimalloc-sys bundles native mimalloc v3.4.4 or later
+mimalloc = { workspace = true, features = [
+  "local_dynamic_tls",
+  "v2",
+], optional = true }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+mimalloc = { workspace = true, features = [
+  "local_dynamic_tls",
+], optional = true }
 
 # Run with `cargo run --bin python-stub-gen`
 [[bin]]

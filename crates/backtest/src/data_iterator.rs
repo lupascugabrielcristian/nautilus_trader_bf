@@ -128,7 +128,7 @@ impl BacktestDataIterator {
 
     fn add_stream(&mut self, name: &str, data: Vec<Data>, append_data: bool) {
         let priority = if let Some(p) = self.priorities.get(name) {
-            // Replace existing stream – remove previous traces then re-insert below.
+            // Replace existing stream - remove previous traces then re-insert below.
             *p
         } else {
             self.next_priority_counter += 1;
@@ -181,6 +181,18 @@ impl BacktestDataIterator {
             *idx = 0;
         }
         self.rebuild_heap();
+    }
+
+    /// Returns the next backtest data element without advancing the stream cursor.
+    pub(crate) fn peek(&self) -> Option<&Data> {
+        if let Some(p) = self.single_priority {
+            let data = self.streams.get(&p)?;
+            let idx = *self.indices.get(&p)?;
+            return data.get(idx);
+        }
+
+        let entry = self.heap.peek()?;
+        self.streams.get(&entry.priority)?.get(entry.index)
     }
 
     /// Returns the next backtest data element across all streams in replay order.
@@ -240,7 +252,7 @@ impl BacktestDataIterator {
     fn rebuild_heap(&mut self) {
         self.heap.clear();
 
-        // Determine if we’re in single-stream mode
+        // Determine if we're in single-stream mode
         if self.streams.len() == 1 {
             self.single_priority = self.streams.keys().next().copied();
             return;
@@ -341,6 +353,17 @@ mod tests {
     }
 
     #[rstest]
+    fn test_peek_does_not_consume_single_stream_item() {
+        let mut it = BacktestDataIterator::new();
+        it.add_data("s", vec![quote("A.B", 1), quote("A.B", 2)], true);
+
+        assert_eq!(it.peek().unwrap().ts_init(), UnixNanos::from(1));
+        assert_eq!(it.peek().unwrap().ts_init(), UnixNanos::from(1));
+        assert_eq!(it.next().unwrap().ts_init(), UnixNanos::from(1));
+        assert_eq!(it.peek().unwrap().ts_init(), UnixNanos::from(2));
+    }
+
+    #[rstest]
     fn test_single_stream_sorts_unsorted_input() {
         let mut it = BacktestDataIterator::new();
         it.add_data(
@@ -359,6 +382,19 @@ mod tests {
         it.add_data("s2", vec![quote("C.D", 2), quote("C.D", 3)], false);
 
         assert_eq!(collect_ts(&mut it), vec![1, 2, 3, 4]);
+    }
+
+    #[rstest]
+    fn test_peek_does_not_consume_multi_stream_heap_item() {
+        let mut it = BacktestDataIterator::new();
+        it.add_data("s1", vec![quote("A.B", 1), quote("A.B", 4)], true);
+        it.add_data("s2", vec![quote("C.D", 2), quote("C.D", 3)], true);
+
+        assert_eq!(it.peek().unwrap().ts_init(), UnixNanos::from(1));
+        assert_eq!(it.peek().unwrap().ts_init(), UnixNanos::from(1));
+        assert_eq!(it.next().unwrap().ts_init(), UnixNanos::from(1));
+        assert_eq!(it.peek().unwrap().ts_init(), UnixNanos::from(2));
+        assert_eq!(collect_ts(&mut it), vec![2, 3, 4]);
     }
 
     #[rstest]
@@ -629,7 +665,7 @@ mod tests {
 
     #[rstest]
     fn test_equal_timestamps_across_many_streams_preserves_priority_order() {
-        // All items at the same timestamp — ordering is strictly by priority
+        // All items at the same timestamp - ordering is strictly by priority
         let mut it = BacktestDataIterator::new();
         it.add_data("s1", vec![quote("A.B", 50)], true);
         it.add_data("s2", vec![quote("C.D", 50)], true);

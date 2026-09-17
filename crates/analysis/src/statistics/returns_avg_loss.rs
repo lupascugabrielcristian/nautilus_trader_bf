@@ -19,11 +19,15 @@ use nautilus_model::position::Position;
 
 use crate::{Returns, statistic::PortfolioStatistic};
 
+/// Calculates the arithmetic mean of the negative portfolio returns.
+///
+/// Zero returns are excluded (neither wins nor losses). Returns `NaN` for an
+/// empty series or when there are no negative returns.
 #[repr(C)]
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.analysis", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.analysis", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",

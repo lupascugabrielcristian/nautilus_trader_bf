@@ -60,8 +60,8 @@ use nautilus_model::{
         position::snapshot::PositionSnapshot,
     },
     identifiers::{
-        AccountId, ClientId, ClientOrderId, ComponentId, InstrumentId, PositionId, StrategyId,
-        TradeId, TraderId, Venue, VenueOrderId,
+        AccountId, ActorId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId,
+        TraderId, Venue, VenueOrderId,
     },
     instruments::{CurrencyPair, InstrumentAny, SyntheticInstrument, stubs::audusd_sim},
     orderbook::OrderBook,
@@ -460,7 +460,7 @@ fn kernel_start_restores_parent_cache_snapshot_and_replays_tail() {
     let position = Position::new(&instrument_any, fill.into());
     let mut snapshot_cache = Cache::default();
     let snapshot_ref = snapshot_cache
-        .snapshot_position(&position)
+        .snapshot_position_encoded(&position)
         .expect("snapshot position");
     let anchored_state = cash_account_state_million_usd("100 USD", "0 USD", "100 USD");
     let replayed_state = cash_account_state_million_usd("200 USD", "0 USD", "200 USD");
@@ -549,7 +549,7 @@ fn kernel_start_replays_configured_run_without_recovered_parent() {
     let position = Position::new(&instrument_any, fill.into());
     let mut snapshot_cache = Cache::default();
     let snapshot_ref = snapshot_cache
-        .snapshot_position(&position)
+        .snapshot_position_encoded(&position)
         .expect("snapshot position");
     let anchored_state = cash_account_state_million_usd("100 USD", "0 USD", "100 USD");
     let replayed_state = cash_account_state_million_usd("200 USD", "0 USD", "200 USD");
@@ -957,7 +957,7 @@ fn kernel_start_restore_failure_does_not_open_new_run(
     let position = Position::new(&instrument_any, fill.into());
     let mut snapshot_cache = Cache::default();
     let snapshot_ref = snapshot_cache
-        .snapshot_position(&position)
+        .snapshot_position_encoded(&position)
         .expect("snapshot position");
     let anchored_state = cash_account_state_million_usd("100 USD", "0 USD", "100 USD");
     let content_hash = if bad_hash {
@@ -1052,7 +1052,7 @@ fn kernel_start_restores_parent_cache_from_injected_database() {
     let position = Position::new(&instrument_any, fill.into());
     let mut snapshot_cache = Cache::default();
     let snapshot_ref = snapshot_cache
-        .snapshot_position(&position)
+        .snapshot_position_encoded(&position)
         .expect("snapshot position");
     let anchored_state = cash_account_state_million_usd("100 USD", "0 USD", "100 USD");
     let replayed_state = cash_account_state_million_usd("200 USD", "0 USD", "200 USD");
@@ -1157,7 +1157,7 @@ fn kernel_start_db_load_error_leaves_run_unopened() {
     let position = Position::new(&instrument_any, fill.into());
     let mut snapshot_cache = Cache::default();
     let snapshot_ref = snapshot_cache
-        .snapshot_position(&position)
+        .snapshot_position_encoded(&position)
         .expect("snapshot position");
     let anchored_state = cash_account_state_million_usd("100 USD", "0 USD", "100 USD");
 
@@ -1314,7 +1314,7 @@ impl CacheDatabaseAdapter for StubCacheDatabase {
         Ok(None)
     }
 
-    fn load_actor(&self, _component_id: &ComponentId) -> anyhow::Result<AHashMap<String, Bytes>> {
+    fn load_actor(&self, _actor_id: &ActorId) -> anyhow::Result<AHashMap<String, Bytes>> {
         Ok(AHashMap::new())
     }
 
@@ -1435,7 +1435,7 @@ impl CacheDatabaseAdapter for StubCacheDatabase {
         Ok(())
     }
 
-    fn delete_actor(&self, _component_id: &ComponentId) -> anyhow::Result<()> {
+    fn delete_actor(&self, _actor_id: &ActorId) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -1473,7 +1473,7 @@ impl CacheDatabaseAdapter for StubCacheDatabase {
 
     fn update_actor(
         &self,
-        _component_id: &ComponentId,
+        _actor_id: &ActorId,
         _state: &AHashMap<String, Bytes>,
     ) -> anyhow::Result<()> {
         Ok(())

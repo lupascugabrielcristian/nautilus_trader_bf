@@ -62,6 +62,10 @@
     clippy::cast_sign_loss,
     reason = "analysis math casts between usize/i32/i64/f64 with values bounded by sample counts"
 )]
+#![allow(
+    clippy::assert_is_empty,
+    reason = "`assert!(x.is_empty())` is clearer than comparing against an empty value"
+)]
 #![cfg_attr(
     test,
     allow(
@@ -72,8 +76,11 @@
 )]
 
 pub mod analyzer;
+pub mod snapshot;
 pub mod statistic;
 pub mod statistics;
+
+pub use snapshot::PortfolioStatistics;
 
 #[cfg(feature = "python")]
 pub mod python;

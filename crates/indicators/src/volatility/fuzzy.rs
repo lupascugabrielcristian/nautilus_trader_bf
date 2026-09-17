@@ -32,7 +32,7 @@ use crate::indicator::Indicator;
         eq,
         eq_int,
         hash,
-        module = "nautilus_trader.core.nautilus_pyo3.indicators",
+        module = "nautilus_trader.indicators",
         from_py_object,
     )
 )]
@@ -59,7 +59,7 @@ pub enum CandleBodySize {
         eq,
         eq_int,
         hash,
-        module = "nautilus_trader.core.nautilus_pyo3.indicators",
+        module = "nautilus_trader.indicators",
         from_py_object,
     )
 )]
@@ -84,7 +84,7 @@ pub enum CandleDirection {
         eq,
         eq_int,
         hash,
-        module = "nautilus_trader.core.nautilus_pyo3.indicators",
+        module = "nautilus_trader.indicators",
         from_py_object,
     )
 )]
@@ -113,7 +113,7 @@ pub enum CandleSize {
         eq,
         eq_int,
         hash,
-        module = "nautilus_trader.core.nautilus_pyo3.indicators",
+        module = "nautilus_trader.indicators",
         from_py_object,
     )
 )]
@@ -132,10 +132,7 @@ pub enum CandleWickSize {
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.indicators",
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.indicators", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -154,7 +151,7 @@ impl Display for FuzzyCandle {
         write!(
             f,
             "{}({},{},{},{})",
-            self.direction, self.size, self.body_size, self.lower_wick_size, self.upper_wick_size
+            self.direction, self.size, self.body_size, self.upper_wick_size, self.lower_wick_size
         )
     }
 }
@@ -184,7 +181,7 @@ const MAX_CAPACITY: usize = 1024;
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.indicators")
+    pyo3::pyclass(module = "nautilus_trader.indicators")
 )]
 #[cfg_attr(
     feature = "python",
@@ -252,6 +249,14 @@ impl Indicator for FuzzyCandlesticks {
         self.body_percents.clear();
         self.upper_wick_percents.clear();
         self.lower_wick_percents.clear();
+        self.value = FuzzyCandle::new(
+            CandleDirection::None,
+            CandleSize::None,
+            CandleBodySize::None,
+            CandleWickSize::None,
+            CandleWickSize::None,
+        );
+        self.vector = Vec::new();
         self.last_open = 0.0;
         self.last_high = 0.0;
         self.last_close = 0.0;
@@ -324,6 +329,17 @@ impl FuzzyCandlesticks {
         self.last_low = low;
 
         let total = (high - low).abs();
+
+        // Bound the rolling windows to `period`. Without this the fixed-capacity deques
+        // grow to their 1024 capacity, so the means (sum / period) and standard
+        // deviations are computed over far more than `period` candles.
+        if self.lengths.len() == self.period {
+            self.lengths.pop_front();
+            self.body_percents.pop_front();
+            self.upper_wick_percents.pop_front();
+            self.lower_wick_percents.pop_front();
+        }
+
         let _ = self.lengths.push_back(total);
 
         if total == 0.0 {
@@ -382,24 +398,7 @@ impl FuzzyCandlesticks {
     }
 
     pub fn reset(&mut self) {
-        self.lengths.clear();
-        self.body_percents.clear();
-        self.upper_wick_percents.clear();
-        self.lower_wick_percents.clear();
-        self.value = FuzzyCandle::new(
-            CandleDirection::None,
-            CandleSize::None,
-            CandleBodySize::None,
-            CandleWickSize::None,
-            CandleWickSize::None,
-        );
-        self.vector = Vec::new();
-        self.last_open = 0.0;
-        self.last_high = 0.0;
-        self.last_close = 0.0;
-        self.last_low = 0.0;
-        self.has_inputs = false;
-        self.initialized = false;
+        Indicator::reset(self);
     }
 
     fn fuzzify_direction(open: f64, close: f64) -> CandleDirection {
@@ -521,6 +520,22 @@ mod tests {
     };
 
     #[rstest]
+    fn test_fuzzy_candle_display_orders_wicks_upper_then_lower() {
+        // Regression: `Display` emitted the wick sizes in the opposite order to the
+        // struct definition, the constructor and `__repr__`, so an upper-heavy candle
+        // rendered as a lower-heavy one.
+        let candle = FuzzyCandle::new(
+            CandleDirection::Bull,
+            CandleSize::Medium,
+            CandleBodySize::Small,
+            CandleWickSize::Large,
+            CandleWickSize::None,
+        );
+
+        assert_eq!(format!("{candle}"), "BULL(MEDIUM,SMALL,LARGE,NONE)");
+    }
+
+    #[rstest]
     fn test_psl_initialized(fuzzy_candlesticks_10: FuzzyCandlesticks) {
         let display_str = format!("{fuzzy_candlesticks_10}");
         assert_eq!(display_str, "FuzzyCandlesticks(10,0.1,0.15,0.2,0.3)");
@@ -618,9 +633,55 @@ mod tests {
     }
 
     #[rstest]
-    fn test_reset(mut fuzzy_candlesticks_10: FuzzyCandlesticks) {
-        fuzzy_candlesticks_10.update_raw(151.6, 156.4, 151.0, 155.8);
-        fuzzy_candlesticks_10.reset();
+    fn test_windows_bounded_to_period(mut fuzzy_candlesticks_10: FuzzyCandlesticks) {
+        // Regression: the four rolling windows must stay bounded to `period`. Previously
+        // the fixed-capacity deques grew to their 1024 capacity, so the means
+        // (sum / period) and standard deviations were computed over far more than
+        // `period` candles.
+        let bars = [
+            (150.25, 153.4, 148.1, 152.75),
+            (152.8, 155.2, 151.3, 151.95),
+            (151.9, 152.85, 147.6, 148.2),
+            (148.3, 150.75, 146.9, 150.4),
+            (150.5, 154.3, 149.8, 153.9),
+            (153.95, 155.8, 152.2, 152.6),
+            (152.7, 153.4, 148.5, 149.1),
+            (149.2, 151.9, 147.3, 151.5),
+            (151.6, 156.4, 151.0, 155.8),
+            (155.9, 157.2, 153.7, 154.3),
+            (154.3, 158.0, 153.0, 157.2),
+            (157.2, 159.5, 155.1, 156.0),
+            (156.0, 156.9, 152.4, 153.1),
+            (153.1, 155.0, 150.2, 154.8),
+            (154.8, 157.7, 154.0, 156.9),
+        ];
+
+        for (open, high, low, close) in bars {
+            fuzzy_candlesticks_10.update_raw(open, high, low, close);
+        }
+
+        assert!(fuzzy_candlesticks_10.initialized());
+        assert_eq!(fuzzy_candlesticks_10.lengths.len(), 10);
+        assert_eq!(fuzzy_candlesticks_10.body_percents.len(), 10);
+        assert_eq!(fuzzy_candlesticks_10.upper_wick_percents.len(), 10);
+        assert_eq!(fuzzy_candlesticks_10.lower_wick_percents.len(), 10);
+    }
+
+    #[rstest]
+    #[case::inherent(FuzzyCandlesticks::reset)]
+    #[case::indicator(<FuzzyCandlesticks as Indicator>::reset)]
+    fn test_reset(
+        #[case] reset: fn(&mut FuzzyCandlesticks),
+        mut fuzzy_candlesticks_10: FuzzyCandlesticks,
+    ) {
+        for _ in 0..10 {
+            fuzzy_candlesticks_10.update_raw(151.6, 156.4, 151.0, 155.8);
+        }
+        assert!(fuzzy_candlesticks_10.initialized);
+        assert!(!fuzzy_candlesticks_10.vector.is_empty());
+
+        reset(&mut fuzzy_candlesticks_10);
+
         assert_eq!(fuzzy_candlesticks_10.lengths.len(), 0);
         assert_eq!(fuzzy_candlesticks_10.body_percents.len(), 0);
         assert_eq!(fuzzy_candlesticks_10.upper_wick_percents.len(), 0);

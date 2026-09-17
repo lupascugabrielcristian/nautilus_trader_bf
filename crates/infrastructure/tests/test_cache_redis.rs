@@ -23,13 +23,16 @@ mod serial_tests {
     use bytes::Bytes;
     use nautilus_common::{
         cache::{Cache, CacheConfig, database::CacheDatabaseAdapter},
-        msgbus::database::DatabaseConfig,
         testing::wait_until_async,
     };
     use nautilus_core::{UUID4, UnixNanos};
     use nautilus_infrastructure::redis::{
-        cache::{RedisCacheDatabase, RedisCacheDatabaseAdapter},
+        cache::{RedisCacheConfig, RedisCacheDatabase, RedisCacheDatabaseAdapter},
         queries::DatabaseQueries,
+    };
+    use nautilus_live::{
+        config::{LiveExecutionEngineConfig, LiveNodeConfig},
+        node::LiveNode,
     };
     use nautilus_model::{
         accounts::AccountAny,
@@ -40,12 +43,16 @@ mod serial_tests {
         enums::{OrderSide, OrderStatus, OrderType},
         events::{
             AccountState, OrderEventAny, OrderFilled, OrderSnapshot,
-            account::stubs::{cash_account_state_multi, cash_account_state_multi_changed_btc},
+            account::stubs::{
+                cash_account_state_multi, cash_account_state_multi_changed_btc,
+                wallet_account_state, wallet_account_state_changed,
+            },
+            order::spec::OrderFillVoidedSpec,
             position::snapshot::PositionSnapshot,
         },
         identifiers::{
-            AccountId, ClientId, ClientOrderId, ComponentId, PositionId, StrategyId, TradeId,
-            TraderId, VenueOrderId,
+            AccountId, ActorId, ClientId, ClientOrderId, PositionId, StrategyId, TradeId, TraderId,
+            VenueOrderId,
         },
         instruments::{
             Instrument, InstrumentAny, SyntheticInstrument, stubs::crypto_perpetual_ethusdt,
@@ -59,6 +66,16 @@ mod serial_tests {
     fn redis_test_mutex() -> &'static tokio::sync::Mutex<()> {
         static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    fn redis_cache_config() -> RedisCacheConfig {
+        RedisCacheConfig {
+            host: Some("localhost".to_string()),
+            port: Some(6379),
+            connection_timeout: 1,
+            number_of_retries: 0,
+            ..Default::default()
+        }
     }
 
     async fn get_redis_cache_adapter()
@@ -78,26 +95,15 @@ mod serial_tests {
         let trader_id = TraderId::from("test-trader");
         let instance_id = UUID4::new();
 
-        // Create a Redis database config
-        let config = CacheConfig {
-            database: Some(DatabaseConfig {
-                database_type: "redis".to_string(),
-                host: Some("localhost".to_string()),
-                port: Some(6379),
-                username: None,
-                password: None,
-                ssl: false,
-                connection_timeout: 20,
-                response_timeout: 20,
-                number_of_retries: 100,
-                exponent_base: 2,
-                max_delay: 1000,
-                factor: 2,
-            }),
-            ..Default::default()
-        };
-
-        let database = RedisCacheDatabase::new(trader_id, instance_id, config).await?;
+        let config = CacheConfig::default();
+        let database =
+            RedisCacheDatabase::new(trader_id, instance_id, config, redis_cache_config())
+                .await
+                .map_err(|e| {
+                    std::io::Error::other(format!(
+                        "A running Redis service is required for this test: {e}"
+                    ))
+                })?;
 
         let adapter = RedisCacheDatabaseAdapter { database };
 
@@ -255,6 +261,39 @@ mod serial_tests {
         }
 
         // Final cleanup
+        let mut adapter = adapter;
+        adapter.flush().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_delete_account_event_is_a_no_op() {
+        let _guard = redis_test_mutex().lock().await;
+        let adapter = get_redis_cache_adapter()
+            .await
+            .expect("Failed to create adapter");
+
+        let account_id = AccountId::new("BINANCE-001");
+        let event_id = UUID4::new().to_string();
+        let account_key = format!("{}:accounts:{account_id}", adapter.database.trader_key);
+
+        let mut conn = adapter.database.con.clone();
+        let _: () = conn.set(&account_key, "test_data").await.unwrap();
+        let exists_before: bool = conn.exists(&account_key).await.unwrap();
+        assert!(exists_before);
+
+        adapter
+            .delete_account_event(&account_id, &event_id)
+            .unwrap();
+
+        // Deletion is dispatched asynchronously, so allow a real delete to land before asserting
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let exists_after: bool = conn.exists(&account_key).await.unwrap();
+        assert!(
+            exists_after,
+            "delete_account_event is a documented no-op pending redesign"
+        );
+
         let mut adapter = adapter;
         adapter.flush().unwrap();
     }
@@ -601,27 +640,14 @@ mod serial_tests {
         let instance_id = UUID4::new();
 
         let config = CacheConfig {
-            database: Some(DatabaseConfig {
-                database_type: "redis".to_string(),
-                host: Some("localhost".to_string()),
-                port: Some(6379),
-                username: None,
-                password: None,
-                ssl: false,
-                connection_timeout: 20,
-                response_timeout: 20,
-                number_of_retries: 100,
-                exponent_base: 2,
-                max_delay: 1000,
-                factor: 2,
-            }),
             buffer_interval_ms: Some(50),
             ..Default::default()
         };
 
-        let mut database = RedisCacheDatabase::new(trader_id, instance_id, config)
-            .await
-            .expect("Failed to create database");
+        let mut database =
+            RedisCacheDatabase::new(trader_id, instance_id, config, redis_cache_config())
+                .await
+                .expect("Failed to create database");
         database.flushdb().await;
 
         let trader_key = database.trader_key.clone();
@@ -664,27 +690,14 @@ mod serial_tests {
         let instance_id = UUID4::new();
 
         let config = CacheConfig {
-            database: Some(DatabaseConfig {
-                database_type: "redis".to_string(),
-                host: Some("localhost".to_string()),
-                port: Some(6379),
-                username: None,
-                password: None,
-                ssl: false,
-                connection_timeout: 20,
-                response_timeout: 20,
-                number_of_retries: 100,
-                exponent_base: 2,
-                max_delay: 1000,
-                factor: 2,
-            }),
             buffer_interval_ms: Some(0),
             ..Default::default()
         };
 
-        let mut database = RedisCacheDatabase::new(trader_id, instance_id, config)
-            .await
-            .expect("Failed to create database");
+        let mut database =
+            RedisCacheDatabase::new(trader_id, instance_id, config, redis_cache_config())
+                .await
+                .expect("Failed to create database");
         database.flushdb().await;
 
         let trader_key = database.trader_key.clone();
@@ -726,27 +739,14 @@ mod serial_tests {
         let instance_id = UUID4::new();
 
         let config = CacheConfig {
-            database: Some(DatabaseConfig {
-                database_type: "redis".to_string(),
-                host: Some("localhost".to_string()),
-                port: Some(6379),
-                username: None,
-                password: None,
-                ssl: false,
-                connection_timeout: 20,
-                response_timeout: 20,
-                number_of_retries: 100,
-                exponent_base: 2,
-                max_delay: 1000,
-                factor: 2,
-            }),
             buffer_interval_ms: Some(10000),
             ..Default::default()
         };
 
-        let mut database = RedisCacheDatabase::new(trader_id, instance_id, config)
-            .await
-            .expect("Failed to create database");
+        let mut database =
+            RedisCacheDatabase::new(trader_id, instance_id, config, redis_cache_config())
+                .await
+                .expect("Failed to create database");
         database.flushdb().await;
 
         let trader_key = database.trader_key.clone();
@@ -866,6 +866,74 @@ mod serial_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_index_order_clients_batch_survives_restart() {
+        let _guard = redis_test_mutex().lock().await;
+        let mut adapter = get_redis_cache_adapter()
+            .await
+            .expect("Failed to create adapter");
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let client_a = ClientId::new("CLIENT-A");
+        let client_b = ClientId::new("CLIENT-B");
+        let order_1 = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.0"))
+            .client_order_id(ClientOrderId::new("O-REDIS-ORIGIN-001"))
+            .build();
+        let order_2 = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("1.0"))
+            .client_order_id(ClientOrderId::new("O-REDIS-ORIGIN-002"))
+            .build();
+        let claims = [
+            (order_1.client_order_id(), client_a),
+            (order_2.client_order_id(), client_b),
+        ];
+
+        adapter.add_instrument(&instrument).unwrap();
+        adapter.add_order(&order_1, None).unwrap();
+        adapter.add_order(&order_2, None).unwrap();
+        adapter.index_order_clients(&claims).unwrap();
+
+        wait_until_async(
+            || async {
+                let index = adapter.load_index_order_client().unwrap();
+                adapter
+                    .load_order(&order_1.client_order_id())
+                    .await
+                    .unwrap()
+                    .is_some()
+                    && adapter
+                        .load_order(&order_2.client_order_id())
+                        .await
+                        .unwrap()
+                        .is_some()
+                    && index.get(&order_1.client_order_id()) == Some(&client_a)
+                    && index.get(&order_2.client_order_id()) == Some(&client_b)
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let restarted_adapter = connect_redis_cache_adapter()
+            .await
+            .expect("Failed to create adapter");
+        let mut cache = Cache::new(None, Some(Box::new(restarted_adapter)));
+        cache.cache_orders().await.unwrap();
+        cache.build_index();
+
+        assert!(cache.order(&order_1.client_order_id()).is_some());
+        assert!(cache.order(&order_2.client_order_id()).is_some());
+        assert_eq!(cache.client_id(&order_1.client_order_id()), Some(&client_a));
+        assert_eq!(cache.client_id(&order_2.client_order_id()), Some(&client_b));
+
+        cache.dispose();
+        adapter.flush().unwrap();
+        adapter.close().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_restart_recovery_restores_order_indexes() {
         let _guard = redis_test_mutex().lock().await;
         let adapter = get_redis_cache_adapter()
@@ -948,7 +1016,7 @@ mod serial_tests {
         position.apply(&close_fill);
         adapter.update_position(&position).unwrap();
 
-        let actor_id = ComponentId::new("ACTOR-001");
+        let actor_id = ActorId::new("ACTOR-001");
         assert!(adapter.load_actor(&actor_id).unwrap().is_empty());
         let mut actor_state = AHashMap::new();
         actor_state.insert("A".to_string(), Bytes::from_static(b"1"));
@@ -1177,8 +1245,89 @@ mod serial_tests {
         );
         assert_eq!(
             cache.account(&account.id()).map(|loaded| loaded.cloned()),
-            Some(account)
+            Some(account.clone())
         );
+
+        let restarted_node_adapter = connect_redis_cache_adapter()
+            .await
+            .expect("Failed to create adapter");
+        let config = LiveNodeConfig {
+            trader_id: TraderId::from("test-trader"),
+            timeout_connection: Duration::ZERO,
+            timeout_disconnection: Duration::ZERO,
+            delay_post_stop: Duration::ZERO,
+            exec_engine: LiveExecutionEngineConfig {
+                reconciliation: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut node = LiveNode::build("RedisRestartNode".to_string(), Some(config)).unwrap();
+        node.set_cache_database(Box::new(restarted_node_adapter))
+            .unwrap();
+        node.start().await.unwrap();
+
+        {
+            let node_cache = node.kernel().cache();
+            let node_cache = node_cache.borrow();
+            assert_eq!(
+                node_cache.position_id(&order_1.client_order_id()),
+                Some(&position.id)
+            );
+            assert_eq!(
+                node_cache.client_id(&order_1.client_order_id()),
+                Some(&client_id)
+            );
+            assert!(node_cache.order(&order_1.client_order_id()).is_some());
+            assert!(node_cache.position(&position.id).is_some());
+            assert_eq!(
+                node_cache
+                    .order(&order_1.client_order_id())
+                    .map(|order| order.status()),
+                Some(OrderStatus::Accepted)
+            );
+            assert_eq!(
+                node_cache
+                    .account(&account.id())
+                    .map(|loaded| loaded.cloned()),
+                Some(account.clone())
+            );
+        }
+
+        node.stop().await.unwrap();
+        node.dispose();
+
+        let disabled_node_adapter = connect_redis_cache_adapter()
+            .await
+            .expect("Failed to create adapter");
+        let disabled_config = LiveNodeConfig {
+            trader_id: TraderId::from("test-trader"),
+            timeout_connection: Duration::ZERO,
+            timeout_disconnection: Duration::ZERO,
+            delay_post_stop: Duration::ZERO,
+            exec_engine: LiveExecutionEngineConfig {
+                load_cache: false,
+                reconciliation: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut disabled_node =
+            LiveNode::build("RedisLoadDisabledNode".to_string(), Some(disabled_config)).unwrap();
+        disabled_node
+            .set_cache_database(Box::new(disabled_node_adapter))
+            .unwrap();
+        disabled_node.start().await.unwrap();
+        let order_loaded_when_disabled = disabled_node
+            .kernel()
+            .cache()
+            .borrow()
+            .order(&order_1.client_order_id())
+            .is_some();
+        disabled_node.stop().await.unwrap();
+        disabled_node.dispose();
+
+        assert!(!order_loaded_when_disabled);
 
         adapter.delete_actor(&actor_id).unwrap();
         adapter.delete_strategy(&strategy_id).unwrap();
@@ -1191,7 +1340,104 @@ mod serial_tests {
         )
         .await;
 
+        let flush_node_adapter = connect_redis_cache_adapter()
+            .await
+            .expect("Failed to create adapter");
+        let flush_config = LiveNodeConfig {
+            trader_id: TraderId::from("test-trader"),
+            cache: Some(CacheConfig {
+                flush_on_start: true,
+                ..Default::default()
+            }),
+            timeout_connection: Duration::ZERO,
+            timeout_disconnection: Duration::ZERO,
+            delay_post_stop: Duration::ZERO,
+            exec_engine: LiveExecutionEngineConfig {
+                reconciliation: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut flush_node =
+            LiveNode::build("RedisFlushNode".to_string(), Some(flush_config)).unwrap();
+        flush_node
+            .set_cache_database(Box::new(flush_node_adapter))
+            .unwrap();
+        let flush_handle = flush_node.handle();
+
+        tokio::spawn(async move {
+            wait_until_async(
+                || async { flush_handle.is_running() },
+                Duration::from_secs(5),
+            )
+            .await;
+            flush_handle.stop();
+        });
+        flush_node.run().await.unwrap();
+        let order_loaded_after_flush = flush_node
+            .kernel()
+            .cache()
+            .borrow()
+            .order(&order_1.client_order_id())
+            .is_some();
+        flush_node.dispose();
+
+        assert!(!order_loaded_after_flush);
+
         let mut adapter = adapter;
+        adapter.flush().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_add_and_update_wallet_account() {
+        let _guard = redis_test_mutex().lock().await;
+        let mut adapter = get_redis_cache_adapter()
+            .await
+            .expect("Failed to create adapter");
+
+        // Distinct account ID: the recovery test above shares this trader's keyspace
+        let mut init_state = wallet_account_state();
+        init_state.account_id = AccountId::from("WALLET-001");
+        let mut account = AccountAny::try_from_state(init_state).unwrap();
+        adapter.add_account(&account).unwrap();
+
+        wait_until_async(
+            || async { adapter.load_account(&account.id()).await.unwrap().is_some() },
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let loaded = adapter.load_account(&account.id()).await.unwrap().unwrap();
+        assert!(matches!(loaded, AccountAny::Wallet(_)));
+        assert_eq!(
+            serde_json::to_string(&loaded).unwrap(),
+            serde_json::to_string(&account).unwrap()
+        );
+
+        let mut changed_state = wallet_account_state_changed();
+        changed_state.account_id = AccountId::from("WALLET-001");
+        account.apply(changed_state).unwrap();
+        adapter.update_account(&account).unwrap();
+
+        wait_until_async(
+            || async {
+                adapter
+                    .load_account(&account.id())
+                    .await
+                    .unwrap()
+                    .is_some_and(|loaded| loaded.events().len() >= 2)
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let loaded = adapter.load_account(&account.id()).await.unwrap().unwrap();
+        assert!(matches!(loaded, AccountAny::Wallet(_)));
+        assert_eq!(
+            serde_json::to_string(&loaded).unwrap(),
+            serde_json::to_string(&account).unwrap()
+        );
+
         adapter.flush().unwrap();
     }
 
@@ -1420,7 +1666,7 @@ mod serial_tests {
         ) else {
             unreachable!();
         };
-        let reopened_position = Position::new(&instrument, reopen_fill);
+        let reopened_position = Position::new(&instrument, reopen_fill.clone());
         adapter.add_position(&reopened_position).unwrap();
 
         let key = format!(
@@ -1431,33 +1677,30 @@ mod serial_tests {
         let positions_closed_key =
             format!("{}:index:positions_closed", adapter.database.trader_key);
         let con = adapter.database.con.clone();
-        let trader_key = adapter.database.trader_key.clone();
         let encoding = adapter.database.get_encoding();
         let expected_position = reopened_position.clone();
         let wait_key = key.clone();
         let wait_positions_open_key = positions_open_key.clone();
         let wait_positions_closed_key = positions_closed_key.clone();
+        let reopen_event_id = reopen_fill.event_id;
 
         wait_until_async(
             move || {
                 let con = con.clone();
-                let trader_key = trader_key.clone();
                 let key = wait_key.clone();
                 let positions_open_key = wait_positions_open_key.clone();
                 let positions_closed_key = wait_positions_closed_key.clone();
                 let expected_position = expected_position.clone();
                 async move {
                     let mut conn = con.clone();
-                    DatabaseQueries::load_position(
-                        &con,
-                        &trader_key,
-                        &expected_position.id,
-                        encoding,
-                    )
-                    .await
-                    .unwrap()
-                    .is_some_and(|loaded| loaded == expected_position)
-                        && conn.llen::<_, usize>(&key).await.unwrap_or(0) == 1
+                    let frames: Vec<Bytes> = conn.lrange(&key, 0, -1).await.unwrap_or_default();
+
+                    if frames.len() != 1 {
+                        return false;
+                    }
+                    let fill: OrderFilled =
+                        DatabaseQueries::deserialize_payload(encoding, &frames[0]).unwrap();
+                    fill.event_id == reopen_event_id
                         && conn
                             .sismember::<_, _, bool>(
                                 &positions_open_key,
@@ -1554,6 +1797,94 @@ mod serial_tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("E-1"));
+
+        let mut adapter = adapter;
+        adapter.flush().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_position_uses_latest_fill_void_snapshot() {
+        let _guard = redis_test_mutex().lock().await;
+        let adapter = get_redis_cache_adapter()
+            .await
+            .expect("Failed to create adapter");
+
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.0"))
+            .client_order_id(ClientOrderId::new("O-VOID-SNAPSHOT"))
+            .build();
+        let position_id = PositionId::new("P-VOID-SNAPSHOT");
+        let trade_id = TradeId::new("E-VOID-SNAPSHOT");
+        let OrderEventAny::Filled(fill) = TestOrderEventStubs::filled(
+            &order,
+            &instrument,
+            Some(trade_id),
+            Some(position_id),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ) else {
+            unreachable!();
+        };
+        let mut position = Position::new(&instrument, fill.clone());
+
+        adapter.add_instrument(&instrument).unwrap();
+        adapter.add_position(&position).unwrap();
+
+        for voided_qty in [Quantity::from("0.2"), Quantity::from("0.5")] {
+            let event = OrderFillVoidedSpec::builder()
+                .trader_id(fill.trader_id)
+                .strategy_id(fill.strategy_id)
+                .instrument_id(fill.instrument_id)
+                .client_order_id(fill.client_order_id)
+                .venue_order_id(fill.venue_order_id)
+                .account_id(fill.account_id)
+                .trade_id(fill.trade_id)
+                .voided_qty(voided_qty)
+                .order_side(fill.order_side)
+                .order_type(fill.order_type)
+                .last_px(fill.last_px)
+                .currency(fill.currency)
+                .liquidity_side(fill.liquidity_side)
+                .position_id(position_id)
+                .build();
+            position.apply_fill_void(event, voided_qty, None).unwrap();
+            adapter.update_position(&position).unwrap();
+        }
+        adapter
+            .snapshot_position_state(&position, UnixNanos::from(2_000_000_000), None)
+            .unwrap();
+
+        let snapshot_key = format!(
+            "{}:snapshots:positions:{position_id}",
+            adapter.database.trader_key,
+        );
+        wait_until_async(
+            || async {
+                let mut conn = adapter.database.con.clone();
+                let snapshot_count = conn
+                    .llen::<_, usize>(&snapshot_key)
+                    .await
+                    .unwrap_or_default();
+                snapshot_count == 3
+                    && adapter.load_position(&position_id).await.unwrap().as_ref()
+                        == Some(&position)
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let loaded = adapter.load_position(&position_id).await.unwrap().unwrap();
+
+        assert_eq!(loaded.quantity, Quantity::from("0.5"));
+        assert_eq!(loaded.fill_voids.len(), 2);
+        assert_eq!(loaded, position);
 
         let mut adapter = adapter;
         adapter.flush().unwrap();

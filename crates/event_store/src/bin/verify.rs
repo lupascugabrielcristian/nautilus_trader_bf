@@ -17,7 +17,7 @@ use std::{
     any::Any,
     env,
     ffi::OsStr,
-    io,
+    io::{self, Read},
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     process::{Command, ExitCode, Output, Stdio},
@@ -152,7 +152,29 @@ fn verify_run_file_inner(path: &Path) -> ExitCode {
     match Verifier::open_redb_file(path).and_then(|verifier| verifier.verify()) {
         Ok(report) => match scan_marker_sidecar(path, &report) {
             Ok(markers) => print_report(&report, &markers),
-            Err((marker_path, err)) => print_marker_error(marker_path.as_path(), &err),
+            Err((marker_path, err)) => {
+                if report.is_clean() {
+                    return print_marker_error(marker_path.as_path(), &err);
+                }
+
+                // Relay the entry findings before the marker error so a failing
+                // sidecar cannot mask them.
+                println!(
+                    "corrupt run_id={} status={:?} high_watermark={} entries_scanned={} findings={} markers=error quarantine=not-performed",
+                    report.run_id,
+                    report.status,
+                    report.high_watermark,
+                    report.entries_scanned,
+                    report.findings.len(),
+                );
+
+                for finding in &report.findings {
+                    print_finding(finding);
+                }
+
+                print_marker_error(marker_path.as_path(), &err);
+                ExitCode::from(EXIT_CORRUPT)
+            }
         },
         Err(e) => print_error(path, &e),
     }
@@ -300,6 +322,9 @@ fn print_finding(finding: &VerifyFinding) {
             embedded_seq,
         } => {
             println!("- seq mismatch at table key {table_key}: embedded seq was {embedded_seq}");
+        }
+        VerifyFinding::Undecodable { seq, reason } => {
+            println!("- undecodable entry at seq {seq}: {reason}");
         }
         VerifyFinding::IndexDrift { kind, key, drift } => {
             print_index_drift(*kind, key, *drift);
@@ -459,20 +484,47 @@ fn run_worker(path: &Path) -> io::Result<WorkerOutput> {
     let timeout = worker_timeout();
     let deadline = Instant::now() + timeout;
 
-    loop {
-        if child.try_wait()?.is_some() {
-            return child.wait_with_output().map(WorkerOutput::Exited);
+    // A report larger than the OS pipe buffer would otherwise block mid-print
+    // and be killed as a timeout.
+    let stdout_drain = spawn_pipe_drain(child.stdout.take());
+    let stderr_drain = spawn_pipe_drain(child.stderr.take());
+
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
         }
 
         if Instant::now() >= deadline {
             let _ = child.kill();
-            return child
-                .wait_with_output()
-                .map(|output| WorkerOutput::TimedOut { output, timeout });
+            timed_out = true;
+            break child.wait()?;
         }
 
         thread::sleep(WORKER_POLL_INTERVAL);
+    };
+
+    let output = Output {
+        status,
+        stdout: stdout_drain.join().unwrap_or_default(),
+        stderr: stderr_drain.join().unwrap_or_default(),
+    };
+
+    if timed_out {
+        Ok(WorkerOutput::TimedOut { output, timeout })
+    } else {
+        Ok(WorkerOutput::Exited(output))
     }
+}
+
+fn spawn_pipe_drain<R: Read + Send + 'static>(pipe: Option<R>) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    })
 }
 
 fn relay_output(output: &Output) {

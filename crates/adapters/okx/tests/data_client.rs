@@ -15,25 +15,47 @@
 
 //! Integration tests for `OKXDataClient`.
 
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    num::NonZeroUsize,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use axum::{
     Router,
-    extract::Query,
+    extract::{
+        Query, State,
+        ws::{WebSocket, WebSocketUpgrade},
+    },
     http::StatusCode,
-    response::{IntoResponse, Json},
+    response::{IntoResponse, Json, Response},
     routing::get,
 };
+use futures_util::StreamExt;
 use nautilus_common::{
     clients::DataClient,
     live::runner::replace_data_event_sender,
     messages::{
         DataEvent, DataResponse,
-        data::{InstrumentResponse, InstrumentsResponse, RequestInstrument, RequestInstruments},
+        data::{
+            BookResponse, InstrumentResponse, InstrumentsResponse, RequestBookSnapshot,
+            RequestInstrument, RequestInstruments,
+        },
     },
+    testing::wait_until_async,
 };
-use nautilus_core::{UUID4, UnixNanos};
-use nautilus_model::{identifiers::InstrumentId, instruments::InstrumentAny};
+use nautilus_core::{Params, UUID4, UnixNanos};
+use nautilus_model::{
+    identifiers::InstrumentId,
+    instruments::{Instrument, InstrumentAny},
+    types::{Price, Quantity},
+};
 use nautilus_okx::{
     common::{
         consts::{OKX_CLIENT_ID, resolve_book_depth},
@@ -42,12 +64,14 @@ use nautilus_okx::{
     config::OKXDataClientConfig,
     data::OKXDataClient,
 };
+use nautilus_testkit::events::{collect_data_events_until_response, drain_data_events};
 use rstest::rstest;
 use serde_json::{Value, json};
 
 #[derive(Clone, Default)]
 struct TestServerState {
     instrument_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
+    rpi_book_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
     spread_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
     fail_spreads: bool,
 }
@@ -77,6 +101,7 @@ fn spread_response(params: &HashMap<String, String>) -> Value {
 
 fn create_router(state: TestServerState) -> Router {
     let instruments_state = state.clone();
+    let rpi_book_state = state.clone();
     let spreads_state = state;
 
     Router::new()
@@ -87,6 +112,16 @@ fn create_router(state: TestServerState) -> Router {
                 async move {
                     state.instrument_queries.lock().await.push(params);
                     Json(load_test_data("http_get_instruments_spot.json")).into_response()
+                }
+            }),
+        )
+        .route(
+            "/api/v5/market/books-rpi",
+            get(move |Query(params): Query<HashMap<String, String>>| {
+                let state = rpi_book_state.clone();
+                async move {
+                    state.rpi_book_queries.lock().await.push(params);
+                    Json(load_test_data("http_get_rpi_order_book.json")).into_response()
                 }
             }),
         )
@@ -125,6 +160,39 @@ async fn start_test_server(state: TestServerState) -> SocketAddr {
     addr
 }
 
+#[derive(Clone, Default)]
+struct WsTeardownState {
+    opened: Arc<AtomicUsize>,
+    closed: Arc<AtomicUsize>,
+}
+
+async fn handle_public_ws_upgrade(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<WsTeardownState>>,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_public_ws_socket(socket, state))
+}
+
+async fn handle_public_ws_socket(mut socket: WebSocket, state: Arc<WsTeardownState>) {
+    state.opened.fetch_add(1, Ordering::Relaxed);
+    while socket.next().await.is_some() {}
+    state.closed.fetch_add(1, Ordering::Relaxed);
+}
+
+async fn start_data_session_failure_server() -> (SocketAddr, Arc<WsTeardownState>) {
+    let ws_state = Arc::new(WsTeardownState::default());
+    let router = create_router(TestServerState::default()).route(
+        "/ws/public",
+        get(handle_public_ws_upgrade).with_state(Arc::clone(&ws_state)),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind failed");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move { axum::serve(listener, router).await.expect("serve failed") });
+    (addr, ws_state)
+}
+
 fn create_test_data_client(
     addr: SocketAddr,
     load_spreads: bool,
@@ -154,16 +222,38 @@ fn create_test_data_client(
     (client, rx)
 }
 
-async fn drain_data_events(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
-    timeout: Duration,
-) -> Vec<DataEvent> {
-    let mut events = Vec::new();
-    let deadline = tokio::time::Instant::now() + timeout;
-    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
-        events.push(event);
+#[tokio::test]
+async fn test_failed_connect_tears_down_public_websocket_before_retry() {
+    let (addr, ws_state) = start_data_session_failure_server().await;
+    let (mut client, _rx) = create_test_data_client(addr, true);
+
+    for attempt in 1..=2 {
+        let error = client.connect().await.unwrap_err();
+        assert!(
+            error.to_string().contains("business websocket"),
+            "expected business WebSocket failure after public transport started: {error}"
+        );
+
+        wait_until_async(
+            || {
+                let ws_state = Arc::clone(&ws_state);
+                async move { ws_state.closed.load(Ordering::Relaxed) >= attempt }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(
+            ws_state.opened.load(Ordering::Relaxed),
+            attempt,
+            "each connect attempt must open a fresh public WebSocket"
+        );
+        assert_eq!(
+            ws_state.closed.load(Ordering::Relaxed),
+            attempt,
+            "failed connect must close the public WebSocket before retry"
+        );
     }
-    events
 }
 
 fn request_instruments() -> RequestInstruments {
@@ -207,6 +297,13 @@ fn instrument_response(events: &[DataEvent]) -> Option<&InstrumentResponse> {
     })
 }
 
+fn book_response(events: &[DataEvent]) -> Option<&BookResponse> {
+    events.iter().find_map(|event| match event {
+        DataEvent::Response(DataResponse::Book(response)) => Some(response),
+        _ => None,
+    })
+}
+
 #[rstest]
 #[case::depth_0_passes_through(0, 0)]
 #[case::depth_400_passes_through(400, 400)]
@@ -232,12 +329,24 @@ async fn test_request_instruments_includes_spreads_when_enabled() {
     let addr = start_test_server(state.clone()).await;
     let (client, mut rx) = create_test_data_client(addr, true);
 
+    let request = request_instruments();
+    let request_id = request.request_id;
     client
-        .request_instruments(request_instruments())
+        .request_instruments(request)
         .expect("request_instruments");
 
-    let events = drain_data_events(&mut rx, Duration::from_secs(5)).await;
+    let events =
+        collect_data_events_until_response(&mut rx, request_id, Duration::from_secs(5)).await;
     let response = instruments_response(&events);
+    let rpi_instrument = response
+        .data
+        .iter()
+        .find(|instrument| instrument.id() == InstrumentId::from("BTC-USD.OKX"))
+        .expect("BTC-USD instrument");
+    let InstrumentAny::CurrencyPair(rpi_pair) = rpi_instrument else {
+        panic!("expected BTC-USD currency pair");
+    };
+    let rpi_info = rpi_pair.info.as_ref().expect("RPI spacing info");
     let spread_ids = response
         .data
         .iter()
@@ -250,6 +359,8 @@ async fn test_request_instruments_includes_spreads_when_enabled() {
     let spread_queries = state.spread_queries.lock().await;
 
     assert_eq!(spread_ids.len(), 2);
+    assert_eq!(rpi_info.get_u64("okx_rpi_min_level"), Some(5));
+    assert_eq!(rpi_info.get_str("okx_rpi_min_px_band"), Some("20"));
     assert!(spread_ids.contains(&"ETH-USD-SWAP_ETH-USD-231229.OKX".to_string()));
     assert!(spread_ids.contains(&"BTC-USDT_BTC-USDT-SWAP.OKX".to_string()));
     assert_eq!(instrument_queries.len(), 1);
@@ -274,11 +385,14 @@ async fn test_request_instruments_continues_when_spread_endpoint_fails() {
     let addr = start_test_server(state.clone()).await;
     let (client, mut rx) = create_test_data_client(addr, true);
 
+    let request = request_instruments();
+    let request_id = request.request_id;
     client
-        .request_instruments(request_instruments())
+        .request_instruments(request)
         .expect("request_instruments");
 
-    let events = drain_data_events(&mut rx, Duration::from_secs(5)).await;
+    let events =
+        collect_data_events_until_response(&mut rx, request_id, Duration::from_secs(5)).await;
     let response = instruments_response(&events);
     let spread_count = response
         .data
@@ -304,11 +418,14 @@ async fn test_request_instrument_returns_spread_when_enabled() {
     let addr = start_test_server(state.clone()).await;
     let (client, mut rx) = create_test_data_client(addr, true);
 
+    let request = request_instrument("BTC-USDT_BTC-USDT-SWAP.OKX");
+    let request_id = request.request_id;
     client
-        .request_instrument(request_instrument("BTC-USDT_BTC-USDT-SWAP.OKX"))
+        .request_instrument(request)
         .expect("request_instrument");
 
-    let events = drain_data_events(&mut rx, Duration::from_secs(5)).await;
+    let events =
+        collect_data_events_until_response(&mut rx, request_id, Duration::from_secs(5)).await;
     let response = instrument_response(&events).expect("spread response must be emitted");
     let spread_queries = state.spread_queries.lock().await;
 
@@ -338,9 +455,70 @@ async fn test_request_instrument_emits_no_spread_when_disabled() {
         .request_instrument(request_instrument("BTC-USDT_BTC-USDT-SWAP.OKX"))
         .expect("request_instrument");
 
+    // This path emits no response, so retain a bounded absence window.
     let events = drain_data_events(&mut rx, Duration::from_secs(1)).await;
     let spread_queries = state.spread_queries.lock().await;
 
     assert!(instrument_response(&events).is_none());
     assert_eq!(spread_queries.len(), 1);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_rpi_request_book_snapshot_routes_to_rpi_endpoint() {
+    let state = TestServerState::default();
+    let addr = start_test_server(state.clone()).await;
+    let (client, mut rx) = create_test_data_client(addr, false);
+
+    let instruments_request = request_instruments();
+    let instruments_request_id = instruments_request.request_id;
+    client
+        .request_instruments(instruments_request)
+        .expect("request instruments");
+    let _ =
+        collect_data_events_until_response(&mut rx, instruments_request_id, Duration::from_secs(5))
+            .await;
+
+    let mut params = Params::new();
+    params.insert("rpi".to_string(), json!(true));
+    let request = RequestBookSnapshot::new(
+        InstrumentId::from("BTC-USD.OKX"),
+        NonZeroUsize::new(2),
+        Some(*OKX_CLIENT_ID),
+        UUID4::new(),
+        UnixNanos::default(),
+        Some(params),
+    );
+    let request_id = request.request_id;
+    client
+        .request_book_snapshot(request)
+        .expect("request RPI book snapshot");
+
+    let events =
+        collect_data_events_until_response(&mut rx, request_id, Duration::from_secs(5)).await;
+    let response = book_response(&events).expect("RPI book response");
+    let queries = state.rpi_book_queries.lock().await;
+
+    assert_eq!(response.instrument_id, InstrumentId::from("BTC-USD.OKX"));
+    assert_eq!(response.data.bids(None).count(), 2);
+    assert_eq!(response.data.asks(None).count(), 2);
+    assert_eq!(response.data.best_bid_price(), Some(Price::from("64619.9")));
+    assert_eq!(response.data.best_ask_price(), Some(Price::from("64620")));
+    assert_eq!(
+        response.data.best_bid_size().expect("best bid quantity"),
+        Quantity::from("3.48451281")
+    );
+    assert_eq!(
+        response
+            .params
+            .as_ref()
+            .and_then(|params| params.get_bool("rpi")),
+        Some(true)
+    );
+    assert_eq!(queries.len(), 1);
+    assert_eq!(
+        queries[0].get("instId").map(String::as_str),
+        Some("BTC-USD")
+    );
+    assert_eq!(queries[0].get("sz").map(String::as_str), Some("2"));
 }

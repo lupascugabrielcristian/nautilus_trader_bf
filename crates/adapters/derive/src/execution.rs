@@ -25,44 +25,52 @@
 
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
 
-use ahash::AHashSet;
+use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use async_trait::async_trait;
 use nautilus_common::{
+    cache::ORDER_NOT_FOUND,
     clients::ExecutionClient,
-    live::{get_runtime, runner::get_exec_event_sender},
-    messages::execution::{
-        BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-        GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
-        ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+    live::runner::get_exec_event_sender,
+    messages::{
+        ExecutionReport,
+        execution::{
+            BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
+            GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
+            ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+        },
     },
 };
 use nautilus_core::{
-    AtomicMap, MUTEX_POISONED, UUID4, UnixNanos,
+    AtomicMap, Params, UUID4, UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
-use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
+use nautilus_live::{
+    ExecutionClientCore, ExecutionEventEmitter, SocketControl,
+    task::{TaskGroup, TaskGroupGuard},
+};
 use nautilus_model::{
     accounts::AccountAny,
     data::QuoteTick,
-    enums::{OmsType, OrderSide, OrderStatus, OrderType, PositionSideSpecified},
+    enums::{OmsType, OrderSide, OrderStatus, OrderType, PositionSide},
     events::{
         OrderAccepted, OrderCanceled, OrderEventAny, OrderExpired, OrderFilled, OrderRejected,
     },
-    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, Symbol, Venue, VenueOrderId},
-    instruments::InstrumentAny,
-    orders::Order,
+    identifiers::{
+        AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Symbol, Venue, VenueOrderId,
+    },
+    instruments::{Instrument, InstrumentAny},
+    orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Price, Quantity},
 };
 use rust_decimal::Decimal;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
@@ -74,28 +82,34 @@ use crate::{
         },
         credential::DeriveCredential,
         enums::{DeriveInstrumentType, DeriveOrderSide},
-        parse::{derive_rejection_due_post_only, format_instrument_id, format_venue_symbol},
+        parse::{
+            derive_order_type_to_nautilus_for_order, derive_rejection_due_post_only,
+            format_instrument_id, format_venue_symbol,
+        },
         retry::{http_retry_config, is_write_outcome_ambiguous_ws},
     },
-    config::DeriveExecClientConfig,
+    config::DeriveExecutionClientConfig,
     http::{
         DeriveCredentials, DeriveHttpClient,
-        models::{DeriveInstrument, DeriveOrder, DeriveTrade},
+        models::{DeriveInstrument, DeriveOrder, DeriveReplaceOutcome, DeriveTrade},
         parse::{
-            parse_derive_order_to_report, parse_derive_position_to_report,
-            parse_derive_subaccount_to_balances, parse_derive_trade_to_fill_report,
+            parse_derive_order_to_report_with_precision,
+            parse_derive_position_to_report_with_precision, parse_derive_subaccount_to_balances,
+            parse_derive_trade_to_fill_report_with_precision,
         },
         query::{
-            DeriveCancelAllParams, DeriveCancelParams, DeriveCancelTriggerOrderParams,
-            DeriveGetOpenOrdersParams, DeriveGetOrderHistoryParams, DeriveGetOrderParams,
-            DeriveGetPositionsParams, DeriveGetSubaccountParams, DeriveGetTradeHistoryParams,
-            DeriveGetTriggerOrdersParams, order_replace_to_derive_payload, order_to_derive_payload,
-            trigger_order_to_derive_payload,
+            DeriveCancelByInstrumentParams, DeriveCancelByLabelParams, DeriveCancelParams,
+            DeriveCancelTriggerOrderParams, DeriveGetOpenOrdersParams, DeriveGetOrderHistoryParams,
+            DeriveGetOrderParams, DeriveGetPositionsParams, DeriveGetSubaccountParams,
+            DeriveGetTradeHistoryParams, DeriveGetTriggerOrdersParams,
+            order_replace_to_derive_payload, order_to_derive_payload,
+            trigger_order_to_derive_payload, validate_order_support,
+            validate_trigger_order_support,
         },
     },
     signing::{
         context::{SigningContext, resolve_signing_context},
-        nonce::NonceManager,
+        nonce::{NonceError, NonceManager},
     },
     websocket::{
         DeriveOrdersSubscriptionData, DeriveTradesSubscriptionData, DeriveWebSocketClient,
@@ -116,7 +130,7 @@ const DERIVE_PRIVATE_PAGE_SIZE: u32 = 500;
 pub struct DeriveExecutionClient {
     core: ExecutionClientCore,
     clock: &'static AtomicTime,
-    config: DeriveExecClientConfig,
+    config: DeriveExecutionClientConfig,
     credential: DeriveCredential,
     emitter: ExecutionEventEmitter,
     http_client: DeriveHttpClient,
@@ -125,10 +139,11 @@ pub struct DeriveExecutionClient {
     instruments: Arc<AtomicMap<InstrumentId, DeriveInstrument>>,
     nonce_manager: Arc<NonceManager>,
     signing: SigningContext,
-    is_connected: AtomicBool,
+    is_connected: Arc<AtomicBool>,
     cancellation_token: CancellationToken,
-    pending_tasks: Mutex<Vec<JoinHandle<()>>>,
-    ws_stream_handle: Mutex<Option<JoinHandle<()>>>,
+    session_tasks: TaskGroup,
+    pending_tasks: TaskGroup,
+    shutdown_errors: Vec<String>,
     dispatch_state: Arc<WsDispatchState>,
 }
 
@@ -144,10 +159,16 @@ impl DeriveExecutionClient {
     /// # Errors
     ///
     /// Returns an error when:
+    /// - `max_fee_per_contract` is missing or not greater than zero.
     /// - Required credentials are not provided via config or environment.
     /// - Signing constants are still placeholders or cannot be parsed as hex.
     /// - The HTTP or WebSocket client cannot be constructed.
-    pub fn new(core: ExecutionClientCore, config: DeriveExecClientConfig) -> anyhow::Result<Self> {
+    pub fn new(
+        core: ExecutionClientCore,
+        config: DeriveExecutionClientConfig,
+    ) -> anyhow::Result<Self> {
+        config.validate()?;
+
         let credential = DeriveCredential::resolve(
             config.wallet_address.clone(),
             config.session_key.clone(),
@@ -179,14 +200,24 @@ impl DeriveExecutionClient {
             credential.session_key(),
         )
         .context("failed to build Derive WebSocket credentials")?;
-        let ws_client = DeriveWebSocketClient::with_credentials(
+        let mut ws_client = DeriveWebSocketClient::with_credentials(
             Some(config.ws_url()),
             config.environment,
             config.transport_backend,
             config.proxy_url.clone(),
             ws_credentials,
             config.max_matching_requests_per_second,
-        );
+            config.max_per_instrument_matching_requests_per_second,
+        )
+        .with_socket_control(SocketControl::new(
+            core.client_id,
+            Some(*DERIVE_VENUE),
+            "derive-user-streams",
+        ));
+
+        if let Some(secs) = config.ws_timeout_secs {
+            ws_client.set_request_timeout(Duration::from_secs(secs));
+        }
         // The handle shares the client's command channel, which survives the
         // reconnect swap, so it stays valid for the client's lifetime.
         let ws_exec = ws_client.execution_handle();
@@ -202,6 +233,9 @@ impl DeriveExecutionClient {
             core.base_currency,
         );
 
+        let session_tasks = TaskGroup::new();
+        let pending_tasks = TaskGroup::new();
+
         Ok(Self {
             core,
             clock,
@@ -214,10 +248,11 @@ impl DeriveExecutionClient {
             instruments: Arc::new(AtomicMap::new()),
             nonce_manager: Arc::new(NonceManager::new()),
             signing,
-            is_connected: AtomicBool::new(false),
+            is_connected: Arc::new(AtomicBool::new(false)),
             cancellation_token: CancellationToken::new(),
-            pending_tasks: Mutex::new(Vec::new()),
-            ws_stream_handle: Mutex::new(None),
+            session_tasks,
+            pending_tasks,
+            shutdown_errors: Vec::new(),
             dispatch_state: Arc::new(WsDispatchState::new()),
         })
     }
@@ -230,7 +265,7 @@ impl DeriveExecutionClient {
 
     /// Returns a reference to the resolved configuration.
     #[must_use]
-    pub fn config(&self) -> &DeriveExecClientConfig {
+    pub fn config(&self) -> &DeriveExecutionClientConfig {
         &self.config
     }
 
@@ -245,6 +280,16 @@ impl DeriveExecutionClient {
     /// re-querying the venue.
     pub fn cache_instrument(&self, instrument: DeriveInstrument) {
         let instrument_id = format_instrument_id(instrument.instrument_name);
+        if let (Ok(price_increment), Ok(size_increment)) = (
+            Price::from_decimal(instrument.tick_size),
+            Quantity::from_decimal(instrument.amount_step),
+        ) {
+            self.dispatch_state.register_instrument_precision(
+                instrument_id,
+                price_increment.precision,
+                size_increment.precision,
+            );
+        }
         self.instruments.insert(instrument_id, instrument);
     }
 
@@ -253,23 +298,44 @@ impl DeriveExecutionClient {
     where
         F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
     {
-        let runtime = get_runtime();
-        let handle = runtime.spawn(async move {
+        let future = async move {
             if let Err(e) = fut.await {
                 log::warn!("{description} failed: {e:?}");
             }
-        });
+        };
 
-        let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
-        tasks.retain(|handle| !handle.is_finished());
-        tasks.push(handle);
+        if let Err(e) = self.pending_tasks.spawn(future) {
+            log::warn!("Skipping Derive {description} after shutdown began: {e}");
+        }
     }
 
     fn abort_pending_tasks(&self) {
-        let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
-        for handle in tasks.drain(..) {
-            handle.abort();
-        }
+        self.pending_tasks.begin_shutdown();
+    }
+
+    fn abort_session_tasks(&self) {
+        self.session_tasks.begin_shutdown();
+        self.ws_client.begin_shutdown();
+    }
+
+    async fn await_pending_tasks(&self) -> anyhow::Result<()> {
+        self.pending_tasks.begin_shutdown();
+        self.pending_tasks
+            .finish_shutdown(Duration::from_secs(1), Duration::from_secs(2))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to terminate Derive execution tasks: {e}"))?;
+        Ok(())
+    }
+
+    async fn await_session_tasks(&self) -> anyhow::Result<()> {
+        self.session_tasks.begin_shutdown();
+        self.session_tasks
+            .finish_shutdown(Duration::from_secs(1), Duration::from_secs(2))
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to terminate Derive execution session tasks: {e}")
+            })?;
+        Ok(())
     }
 
     async fn ensure_instruments_initialized(&self) -> anyhow::Result<()> {
@@ -282,20 +348,20 @@ impl DeriveExecutionClient {
         Ok(())
     }
 
+    fn reconciliation_context(&self) -> DeriveReconciliationContext {
+        DeriveReconciliationContext {
+            http_client: self.http_client.clone(),
+            emitter: self.emitter.clone(),
+            client_id: self.core.client_id,
+            account_id: self.core.account_id,
+            subaccount_id: self.credential.subaccount_id(),
+            clock: self.clock,
+            dispatch_state: Arc::clone(&self.dispatch_state),
+        }
+    }
+
     async fn refresh_account_state(&self) -> anyhow::Result<()> {
-        let value = self
-            .http_client
-            .get_subaccount(&DeriveGetSubaccountParams::new(
-                self.credential.subaccount_id(),
-            ))
-            .await
-            .context("failed to fetch Derive subaccount snapshot")?;
-        let (balances, margins) = parse_derive_subaccount_to_balances(&value)
-            .context("failed to parse Derive subaccount balances")?;
-        let ts_event = self.clock.get_time_ns();
-        self.emitter
-            .emit_account_state(balances, margins, true, ts_event);
-        Ok(())
+        self.reconciliation_context().refresh_account_state().await
     }
 
     /// Blocks until the account appears in the cache, or `timeout_secs` elapses.
@@ -337,27 +403,51 @@ impl DeriveExecutionClient {
     /// cancels the shared cancellation token, aborts the WS dispatch task,
     /// and closes the WS client. Used when initial account state cannot be
     /// loaded so that the next `connect()` call starts from a clean slate.
-    async fn teardown_partial_connect(&mut self) {
+    async fn teardown_partial_connect(&mut self) -> anyhow::Result<()> {
         self.cancellation_token.cancel();
-
-        if let Some(handle) = self.ws_stream_handle.lock().expect(MUTEX_POISONED).take() {
-            handle.abort();
-        }
+        self.abort_session_tasks();
+        self.abort_pending_tasks();
 
         if let Err(e) = self.ws_client.disconnect().await {
-            log::warn!("Error tearing down Derive WebSocket after connect failure: {e}");
+            self.shutdown_errors
+                .push(format!("Derive WebSocket shutdown failed: {e}"));
         }
-        self.abort_pending_tasks();
+        let (session_result, pending_result) =
+            tokio::join!(self.await_session_tasks(), self.await_pending_tasks());
+        self.core.set_disconnected();
+        self.is_connected.store(false, Ordering::Release);
+
+        if let Err(e) = session_result {
+            self.shutdown_errors.push(e.to_string());
+        }
+
+        if let Err(e) = pending_result {
+            self.shutdown_errors.push(e.to_string());
+        }
+
+        if !self.shutdown_errors.is_empty() {
+            anyhow::bail!(std::mem::take(&mut self.shutdown_errors).join("; "));
+        }
+        Ok(())
     }
 
-    fn start_ws_dispatch(&self, rx: tokio::sync::mpsc::UnboundedReceiver<DeriveWsMessage>) {
+    fn start_ws_dispatch(
+        &self,
+        rx: tokio::sync::mpsc::UnboundedReceiver<DeriveWsMessage>,
+    ) -> anyhow::Result<()> {
         let emitter = self.emitter.clone();
         let account_id = self.core.account_id;
         let clock = self.clock;
         let cancellation = self.cancellation_token.clone();
         let dispatch_state = self.dispatch_state.clone();
+        let reconciliation = self.reconciliation_context();
+        let is_connected = Arc::clone(&self.is_connected);
+        let session_spawner = self
+            .session_tasks
+            .spawner()
+            .map_err(|e| anyhow::anyhow!("Derive session task admission is closed: {e}"))?;
 
-        let handle = get_runtime().spawn(async move {
+        self.session_tasks.spawn(async move {
             let mut rx = rx;
 
             loop {
@@ -366,6 +456,46 @@ impl DeriveExecutionClient {
                     () = cancellation.cancelled() => break,
                     maybe = rx.recv() => {
                         match maybe {
+                            Some(DeriveWsMessage::Reconnected) => {
+                                let context = reconciliation.clone();
+                                let task_cancellation = cancellation.clone();
+
+                                if let Err(e) = session_spawner.spawn(async move {
+                                    tokio::select! {
+                                        () = task_cancellation.cancelled() => {}
+                                        result = context.recover_after_reconnect() => {
+                                            if let Err(e) = result {
+                                                log::warn!("Derive post-reconnect recovery failed: {e:?}");
+                                            }
+                                        }
+                                    }
+                                }) {
+                                    log::warn!("Skipping Derive reconnect recovery after shutdown began: {e}");
+                                }
+                            }
+                            Some(DeriveWsMessage::SessionRecoveryFailed(reason)) => {
+                                is_connected.store(false, Ordering::Release);
+                                log::error!("Derive execution WebSocket recovery failed: {reason}");
+                            }
+                            Some(DeriveWsMessage::Subscription(payload))
+                                if payload.channel.as_str().ends_with(".balances") =>
+                            {
+                                let context = reconciliation.clone();
+                                let task_cancellation = cancellation.clone();
+
+                                if let Err(e) = session_spawner.spawn(async move {
+                                    tokio::select! {
+                                        () = task_cancellation.cancelled() => {}
+                                        result = context.refresh_account_state() => {
+                                            if let Err(e) = result {
+                                                log::warn!("Derive balance update refresh failed: {e:?}");
+                                            }
+                                        }
+                                    }
+                                }) {
+                                    log::warn!("Skipping Derive account refresh after shutdown began: {e}");
+                                }
+                            }
                             Some(message) => handle_ws_message(
                                 message,
                                 &emitter,
@@ -378,8 +508,8 @@ impl DeriveExecutionClient {
                     }
                 }
             }
-        });
-        *self.ws_stream_handle.lock().expect(MUTEX_POISONED) = Some(handle);
+        })?;
+        Ok(())
     }
 }
 
@@ -437,14 +567,11 @@ impl ExecutionClient for DeriveExecutionClient {
         log::info!("Stopping Derive execution client");
 
         self.cancellation_token.cancel();
-
-        if let Some(handle) = self.ws_stream_handle.lock().expect(MUTEX_POISONED).take() {
-            handle.abort();
-        }
+        self.abort_session_tasks();
         self.abort_pending_tasks();
 
-        self.core.set_disconnected();
         self.core.set_stopped();
+        self.core.set_disconnected();
         self.is_connected.store(false, Ordering::Release);
 
         log::info!("Derive execution client stopped");
@@ -452,15 +579,36 @@ impl ExecutionClient for DeriveExecutionClient {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
-        if self.is_connected() {
+        if self.is_connected()
+            && !self.cancellation_token.is_cancelled()
+            && self.session_tasks.is_open()
+            && self.pending_tasks.is_open()
+        {
             return Ok(());
         }
 
         log::info!("Connecting Derive execution client");
 
-        if self.cancellation_token.is_cancelled() {
+        if self.cancellation_token.is_cancelled()
+            || !self.session_tasks.is_open()
+            || !self.pending_tasks.is_open()
+        {
+            self.teardown_partial_connect().await?;
+            self.session_tasks
+                .start_generation()
+                .map_err(|e| anyhow::anyhow!("Failed to start Derive session generation: {e}"))?;
+            self.pending_tasks
+                .start_generation()
+                .map_err(|e| anyhow::anyhow!("Failed to start Derive task generation: {e}"))?;
             self.cancellation_token = CancellationToken::new();
         }
+        let cancellation_token = self.cancellation_token.clone();
+        let ws_shutdown = self.ws_client.shutdown_handle();
+        let setup_guard =
+            TaskGroupGuard::new(&[&self.session_tasks, &self.pending_tasks], move || {
+                cancellation_token.cancel();
+                ws_shutdown.begin_shutdown();
+            });
 
         self.ensure_instruments_initialized()
             .await
@@ -470,10 +618,15 @@ impl ExecutionClient for DeriveExecutionClient {
             .connect()
             .await
             .context("failed to connect Derive WebSocket")?;
-        let rx = self
-            .ws_client
-            .take_event_receiver()
-            .context("Derive execution WS event receiver not initialized")?;
+        let Some(rx) = self.ws_client.take_event_receiver() else {
+            let e = anyhow::anyhow!("Derive execution WS event receiver not initialized");
+            if let Err(teardown_error) = self.teardown_partial_connect().await {
+                return Err(e.context(format!(
+                    "Derive execution startup teardown failed: {teardown_error}"
+                )));
+            }
+            return Err(e);
+        };
 
         let subaccount_id = self.credential.subaccount_id();
         let channels = vec![
@@ -483,10 +636,23 @@ impl ExecutionClient for DeriveExecutionClient {
         ];
 
         if let Err(e) = self.ws_client.subscribe_channels(channels).await {
-            log::warn!("Derive private WS subscriptions failed: {e}");
+            log::warn!("Derive private WS subscriptions failed: {e}; tearing down");
+            if let Err(teardown_error) = self.teardown_partial_connect().await {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "Derive execution startup teardown failed: {teardown_error}"
+                )));
+            }
+            return Err(anyhow::Error::new(e).context("failed Derive private WS subscriptions"));
         }
 
-        self.start_ws_dispatch(rx);
+        if let Err(e) = self.start_ws_dispatch(rx) {
+            if let Err(teardown_error) = self.teardown_partial_connect().await {
+                return Err(e.context(format!(
+                    "Derive execution startup teardown failed: {teardown_error}"
+                )));
+            }
+            return Err(e.context("failed to register Derive execution WebSocket dispatch task"));
+        }
 
         // Fail-fast if the initial account snapshot cannot load: without it,
         // `await_account_registered` would block the full timeout window and
@@ -494,7 +660,11 @@ impl ExecutionClient for DeriveExecutionClient {
         // already started so the caller does not leak the dispatch task.
         if let Err(e) = self.refresh_account_state().await {
             log::warn!("Initial Derive account state refresh failed: {e}; tearing down");
-            self.teardown_partial_connect().await;
+            if let Err(teardown_error) = self.teardown_partial_connect().await {
+                return Err(e.context(format!(
+                    "Derive execution startup teardown failed: {teardown_error}"
+                )));
+            }
             return Err(e.context("failed initial Derive account state refresh"));
         }
 
@@ -503,12 +673,17 @@ impl ExecutionClient for DeriveExecutionClient {
             .await
         {
             log::warn!("Derive account did not register in time: {e}; tearing down");
-            self.teardown_partial_connect().await;
+            if let Err(teardown_error) = self.teardown_partial_connect().await {
+                return Err(e.context(format!(
+                    "Derive execution startup teardown failed: {teardown_error}"
+                )));
+            }
             return Err(e.context("failed waiting for Derive account registration"));
         }
 
         self.core.set_connected();
         self.is_connected.store(true, Ordering::Release);
+        setup_guard.disarm();
         log::info!(
             "Connected Derive execution client ({:?})",
             self.config.environment
@@ -517,24 +692,8 @@ impl ExecutionClient for DeriveExecutionClient {
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
-        if !self.is_connected() {
-            return Ok(());
-        }
-
         log::info!("Disconnecting Derive execution client");
-        self.cancellation_token.cancel();
-
-        if let Err(e) = self.ws_client.disconnect().await {
-            log::warn!("Error while disconnecting Derive execution WebSocket: {e}");
-        }
-
-        if let Some(handle) = self.ws_stream_handle.lock().expect(MUTEX_POISONED).take() {
-            handle.abort();
-        }
-        self.abort_pending_tasks();
-
-        self.core.set_disconnected();
-        self.is_connected.store(false, Ordering::Release);
+        self.teardown_partial_connect().await?;
         log::info!("Derive execution client disconnected");
         Ok(())
     }
@@ -545,13 +704,19 @@ impl ExecutionClient for DeriveExecutionClient {
         margins: Vec<MarginBalance>,
         reported: bool,
         ts_event: UnixNanos,
+        info: Option<Params>,
     ) -> anyhow::Result<()> {
         self.emitter
-            .emit_account_state(balances, margins, reported, ts_event);
+            .emit_account_state(balances, margins, reported, ts_event, info);
         Ok(())
     }
 
-    fn on_instrument(&mut self, _instrument: InstrumentAny) {
+    fn on_instrument(&mut self, instrument: InstrumentAny) {
+        self.dispatch_state.register_instrument_precision(
+            instrument.id(),
+            instrument.price_precision(),
+            instrument.size_precision(),
+        );
         // The exec-side instrument cache holds `DeriveInstrument` records so
         // signing can pull `base_asset_address` / `base_asset_sub_id`; the
         // generic `InstrumentAny` shape published on the bus does not carry
@@ -674,8 +839,16 @@ impl ExecutionClient for DeriveExecutionClient {
             return Ok(None);
         }
 
+        let (price_precision, size_precision) =
+            report_precision(&self.dispatch_state, order.instrument_name.as_str());
         let ts_init = self.clock.get_time_ns();
-        let mut report = parse_derive_order_to_report(&order, self.core.account_id, ts_init)?;
+        let mut report = parse_derive_order_to_report_with_precision(
+            &order,
+            self.core.account_id,
+            price_precision,
+            size_precision,
+            ts_init,
+        )?;
         // Prefer the parsed label (the venue's source of truth); only stamp
         // the cmd's id when the venue order has no label at all.
         if report.client_order_id.is_none()
@@ -690,294 +863,64 @@ impl ExecutionClient for DeriveExecutionClient {
         &self,
         cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        let subaccount_id = self.credential.subaccount_id();
-        let instrument_name = cmd.instrument_id.map(|id| id.symbol.as_str().to_string());
-
-        // open_only routes to private/get_open_orders and
-        // private/get_trigger_orders regardless of window; the venue
-        // endpoints have no time bound but the caller's start/end is applied
-        // below. For full history we walk private/get_order_history pages,
-        // scoped to the optional window.
-        let orders: Vec<DeriveOrder> = if cmd.open_only {
-            let mut orders = self
-                .http_client
-                .get_open_orders(&DeriveGetOpenOrdersParams::new(subaccount_id))
-                .await?
-                .orders;
-            orders.extend(
-                self.http_client
-                    .get_trigger_orders(&DeriveGetTriggerOrdersParams::new(subaccount_id))
-                    .await?
-                    .orders,
-            );
-            orders
-        } else {
-            let start_ms = cmd.start.map(|t| t.as_millis() as i64);
-            let end_ms = cmd.end.map(|t| t.as_millis() as i64);
-            let mut page: u32 = 1;
-            let mut collected: Vec<DeriveOrder> = Vec::new();
-
-            loop {
-                let mut params =
-                    DeriveGetOrderHistoryParams::new(subaccount_id, page, DERIVE_PRIVATE_PAGE_SIZE)
-                        .with_window(start_ms, end_ms);
-
-                if let Some(name) = instrument_name.as_deref() {
-                    params = params.with_instrument_name(name);
-                }
-
-                let result = self.http_client.get_order_history(&params).await?;
-                let total_pages = result.pagination.num_pages;
-                collected.extend(result.orders);
-
-                if (page as i64) >= total_pages || total_pages == 0 {
-                    break;
-                }
-                page += 1;
-            }
-            collected
-        };
-
-        let ts_init = self.clock.get_time_ns();
-        let start_ms = cmd.start.map(|t| t.as_millis() as i64);
-        let end_ms = cmd.end.map(|t| t.as_millis() as i64);
-        let mut reports = Vec::with_capacity(orders.len());
-        for order in orders {
-            if let Some(instrument_id) = cmd.instrument_id
-                && InstrumentId::new(Symbol::new(order.instrument_name.as_str()), *DERIVE_VENUE)
-                    != instrument_id
-            {
-                continue;
-            }
-            // open_only routed via private/get_open_orders ignores time bounds
-            // at the venue level; apply the command's window here so callers
-            // asking for "open orders since X" get exactly that.
-            if let Some(start) = start_ms
-                && order.last_update_timestamp < start
-            {
-                continue;
-            }
-
-            if let Some(end) = end_ms
-                && order.last_update_timestamp > end
-            {
-                continue;
-            }
-
-            match parse_derive_order_to_report(&order, self.core.account_id, ts_init) {
-                Ok(report) => reports.push(report),
-                Err(e) => log::warn!("Skipping order in status report: {e}"),
-            }
-        }
-        Ok(reports)
+        self.reconciliation_context()
+            .generate_order_status_reports(cmd, false)
+            .await
     }
 
     async fn generate_fill_reports(
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        let instrument_name = cmd.instrument_id.map(|id| id.symbol.as_str().to_string());
-        let mut page: u32 = 1;
-        let mut all_trades: Vec<DeriveTrade> = Vec::new();
-
-        loop {
-            let mut params = DeriveGetTradeHistoryParams::new(
-                self.credential.subaccount_id(),
-                page,
-                DERIVE_PRIVATE_PAGE_SIZE,
-            )
-            .with_window(
-                cmd.start.map(|t| t.as_millis() as i64),
-                cmd.end.map(|t| t.as_millis() as i64),
-            );
-
-            if let Some(name) = instrument_name.as_deref() {
-                params = params.with_instrument_name(name);
-            }
-
-            let result = self.http_client.get_private_trade_history(&params).await?;
-            let total_pages = result.pagination.num_pages;
-            all_trades.extend(result.trades);
-
-            if (page as i64) >= total_pages || total_pages == 0 {
-                break;
-            }
-            page += 1;
-        }
-
-        let ts_init = self.clock.get_time_ns();
-        let fee_currency = Currency::USDC();
-        let venue_order_id_filter = cmd
-            .venue_order_id
-            .as_ref()
-            .map(|id| id.as_str().to_string());
-        let mut reports = Vec::with_capacity(all_trades.len());
-        for trade in all_trades {
-            if let Some(target) = venue_order_id_filter.as_deref()
-                && trade.order_id != target
-            {
-                continue;
-            }
-
-            match parse_derive_trade_to_fill_report(
-                &trade,
-                self.core.account_id,
-                fee_currency,
-                ts_init,
-            ) {
-                Ok(Some(report)) => {
-                    // Cross-source dedup against the WS dispatch path: if the
-                    // live stream already emitted this trade, the reconciler
-                    // should not see it again.
-                    if self.dispatch_state.check_and_insert_trade(report.trade_id) {
-                        log::debug!(
-                            "Skipping duplicate Derive fill (trade_id={}) in generate_fill_reports",
-                            report.trade_id,
-                        );
-                        continue;
-                    }
-                    reports.push(report);
-                }
-                Ok(None) => {}
-                Err(e) => log::warn!("Skipping trade in fill report: {e}"),
-            }
-        }
-        Ok(reports)
+        self.reconciliation_context()
+            .generate_fill_reports(cmd)
+            .await
     }
 
     async fn generate_position_status_reports(
         &self,
         cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        let positions = self
-            .http_client
-            .get_positions(&DeriveGetPositionsParams::new(
-                self.credential.subaccount_id(),
-            ))
-            .await?
-            .positions;
-        let ts_init = self.clock.get_time_ns();
-        let mut reports = Vec::with_capacity(positions.len());
-        for position in positions {
-            if let Some(target) = cmd.instrument_id
-                && InstrumentId::new(
-                    Symbol::new(position.instrument_name.as_str()),
-                    *DERIVE_VENUE,
-                ) != target
-            {
-                continue;
-            }
-
-            match parse_derive_position_to_report(&position, self.core.account_id, ts_init) {
-                Ok(report) => reports.push(report),
-                Err(e) => log::warn!("Skipping position in status report: {e}"),
-            }
-        }
-        Ok(reports)
+        let snapshot = self
+            .reconciliation_context()
+            .generate_position_status_snapshot(cmd)
+            .await?;
+        Ok(snapshot.reports)
     }
 
     async fn generate_mass_status(
         &self,
         lookback_mins: Option<u64>,
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
-        log::info!("Generating ExecutionMassStatus (lookback_mins={lookback_mins:?})");
-
-        let ts_now = self.clock.get_time_ns();
-        let start = lookback_mins.map(|mins| {
-            let lookback_ns = mins.saturating_mul(60).saturating_mul(1_000_000_000);
-            UnixNanos::from(ts_now.as_u64().saturating_sub(lookback_ns))
-        });
-
-        let open_order_cmd = GenerateOrderStatusReports::new(
-            UUID4::new(),
-            ts_now,
-            true,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-        let history_order_cmd = GenerateOrderStatusReports::new(
-            UUID4::new(),
-            ts_now,
-            false,
-            None,
-            start,
-            None,
-            None,
-            None,
-        );
-        let fill_cmd =
-            GenerateFillReports::new(UUID4::new(), ts_now, None, None, start, None, None, None);
-        let position_cmd =
-            GeneratePositionStatusReports::new(UUID4::new(), ts_now, None, None, None, None, None);
-
-        let (history_order_reports, open_order_reports, fill_reports, position_reports) = tokio::try_join!(
-            self.generate_order_status_reports(&history_order_cmd),
-            self.generate_order_status_reports(&open_order_cmd),
-            self.generate_fill_reports(fill_cmd),
-            self.generate_position_status_reports(&position_cmd),
-        )?;
-
-        log::info!(
-            "Received {} historical OrderStatusReports",
-            history_order_reports.len()
-        );
-        log::info!(
-            "Received {} open OrderStatusReports",
-            open_order_reports.len()
-        );
-        log::info!("Received {} FillReports", fill_reports.len());
-        log::info!("Received {} PositionReports", position_reports.len());
-
-        let mut touched_instruments = AHashSet::new();
-
-        for report in history_order_reports
-            .iter()
-            .chain(open_order_reports.iter())
-        {
-            touched_instruments.insert(report.instrument_id);
-        }
-
-        for report in &fill_reports {
-            touched_instruments.insert(report.instrument_id);
-        }
-
-        let mut mass_status = ExecutionMassStatus::new(
-            self.core.client_id,
-            self.core.account_id,
-            *DERIVE_VENUE,
-            ts_now,
-            None,
-        );
-
-        mass_status.add_order_reports(history_order_reports);
-        mass_status.add_order_reports(open_order_reports);
-        mass_status.add_fill_reports(fill_reports);
-        mass_status.add_position_reports(position_reports);
-        add_missing_flat_position_reports(
-            &mut mass_status,
-            self.core.account_id,
-            touched_instruments,
-            ts_now,
-        );
-
-        Ok(Some(mass_status))
+        Box::pin(
+            self.reconciliation_context()
+                .generate_mass_status(lookback_mins),
+        )
+        .await
+        .map(Some)
     }
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
-        let order = self
-            .core
-            .cache()
-            .order(&cmd.client_order_id)
-            .map(|o| o.clone())
-            .ok_or_else(|| {
-                anyhow::anyhow!("Order not found in cache for {}", cmd.client_order_id)
-            })?;
+        let order = self.core.cache().try_order_owned(&cmd.client_order_id)?;
 
         if order.is_closed() {
             log::warn!("Cannot submit closed order {}", order.client_order_id());
+            return Ok(());
+        }
+
+        // Deny before emit_order_submitted so unsupported fields never
+        // surface as venue rejections.
+        let is_trigger_order = is_derive_trigger_order_type(order.order_type());
+        let support = if is_trigger_order {
+            validate_trigger_order_support(&order)
+        } else {
+            validate_order_support(&order)
+        };
+
+        if let Err(e) = support {
+            let reason = e.to_string();
+            log::warn!("Cannot submit order {}: {reason}", order.client_order_id());
+            self.emitter.emit_order_denied(&order, &reason);
             return Ok(());
         }
 
@@ -1000,7 +943,6 @@ impl ExecutionClient for DeriveExecutionClient {
         }
 
         // Keep the existing OrderDenied path here, then refresh before signing
-        let is_trigger_order = is_derive_trigger_order_type(order.order_type());
         let market_quote = if order.order_type() == OrderType::Market {
             match self.core.cache().quote(&cmd.instrument_id) {
                 Some(_) => Some(()),
@@ -1175,8 +1117,47 @@ impl ExecutionClient for DeriveExecutionClient {
                 None
             };
 
+            let matching_reservation = match ws_exec
+                .reserve_matching_request(
+                    if is_trigger_order {
+                        "private/trigger_order"
+                    } else {
+                        "private/order"
+                    },
+                    &instrument.instrument_name,
+                )
+                .await
+            {
+                Ok(reservation) => reservation,
+                Err(e) => {
+                    let (reason, due_post_only) = ws_rejection_reason(&e);
+                    log::warn!(
+                        "Cannot reserve Derive order quota for {}: {reason}",
+                        order_for_task.client_order_id(),
+                    );
+                    dispatch_state.forget(&order_for_task.client_order_id());
+                    let ts = clock.get_time_ns();
+                    emitter.emit_order_rejected(
+                        &order_for_task,
+                        &reason,
+                        ts,
+                        due_post_only,
+                    );
+                    return Ok(());
+                }
+            };
+
             if is_trigger_order {
-                let nonce = nonce_manager.next_nonce(&wallet_str, signing.subaccount_id)?;
+                let nonce = match resolve_submit_nonce(
+                    nonce_manager.next_nonce(&wallet_str, signing.subaccount_id),
+                    &emitter,
+                    &dispatch_state,
+                    &order_for_task,
+                    clock,
+                ) {
+                    Some(nonce) => nonce,
+                    None => return Ok(()),
+                };
                 let expiry = trigger_order_signature_expiry(clock);
                 let payload = match trigger_order_to_derive_payload(
                     &order_for_task,
@@ -1226,7 +1207,10 @@ impl ExecutionClient for DeriveExecutionClient {
                     payload.order.trigger_type,
                 );
 
-                match ws_exec.submit_trigger_order(&payload).await {
+                match ws_exec
+                    .submit_trigger_order_after_rate_limit(&payload, matching_reservation)
+                    .await
+                {
                     Ok(order) => {
                         let venue_order_id = VenueOrderId::new(order.order_id.as_str());
                         dispatch_state.record_venue_order_id(
@@ -1293,7 +1277,16 @@ impl ExecutionClient for DeriveExecutionClient {
                         return Ok(());
                     }
                 };
-            let nonce = nonce_manager.next_nonce(&wallet_str, signing.subaccount_id)?;
+            let nonce = match resolve_submit_nonce(
+                nonce_manager.next_nonce(&wallet_str, signing.subaccount_id),
+                &emitter,
+                &dispatch_state,
+                &order_for_task,
+                clock,
+            ) {
+                Some(nonce) => nonce,
+                None => return Ok(()),
+            };
             let payload = match order_to_derive_payload(
                 &order_for_task,
                 &instrument,
@@ -1338,7 +1331,10 @@ impl ExecutionClient for DeriveExecutionClient {
 
             // Discard the result (and any `trades` it carries): fills arrive on
             // the `.trades` channel and are deduped by trade id.
-            match ws_exec.submit_order(&payload).await {
+            match ws_exec
+                .submit_order_after_rate_limit(&payload, matching_reservation)
+                .await
+            {
                 Ok(_) => {
                     log::debug!(
                         "Order submitted: client_order_id={}",
@@ -1386,23 +1382,18 @@ impl ExecutionClient for DeriveExecutionClient {
     }
 
     fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
-        let Some(venue_order_id) = cmd.venue_order_id else {
-            log::warn!(
-                "Derive cancel_order requires venue_order_id (client_order_id={})",
-                cmd.client_order_id,
-            );
-            return Ok(());
-        };
+        let http_client = self.http_client.clone();
         let ws_exec = self.ws_exec.clone();
         let subaccount_id = self.credential.subaccount_id();
         let venue_symbol = format_venue_symbol(&cmd.instrument_id)?.to_string();
-        let voi = venue_order_id.to_string();
         let emitter = self.emitter.clone();
         let clock = self.clock;
+        let account_id = self.core.account_id;
+        let dispatch_state = self.dispatch_state.clone();
         let strategy_id = cmd.strategy_id;
         let instrument_id = cmd.instrument_id;
         let client_order_id = cmd.client_order_id;
-        let stale_venue_order_id = venue_order_id;
+        let venue_order_id = cmd.venue_order_id;
         let is_trigger_order = self
             .core
             .cache()
@@ -1410,26 +1401,124 @@ impl ExecutionClient for DeriveExecutionClient {
             .is_some_and(|order| is_derive_trigger_order_type(order.order_type()));
 
         self.spawn_task("cancel_order", async move {
-            let outcome = if is_trigger_order {
-                ws_exec
-                    .cancel_trigger_order(&DeriveCancelTriggerOrderParams::new(
-                        subaccount_id,
-                        voi.as_str(),
-                    ))
-                    .await
-                    .map(|_| ())
-            } else {
-                ws_exec
+            let outcome = match venue_order_id {
+                Some(venue_order_id) if is_trigger_order => {
+                    ws_exec
+                        .cancel_trigger_order(&DeriveCancelTriggerOrderParams::new(
+                            subaccount_id,
+                            venue_order_id.as_str(),
+                        ))
+                        .await
+                        .map(Some)
+                }
+                Some(venue_order_id) => ws_exec
                     .cancel_order(&DeriveCancelParams::new(
                         subaccount_id,
                         venue_symbol.as_str(),
-                        voi.as_str(),
+                        venue_order_id.as_str(),
                     ))
                     .await
+                    .map(|()| None),
+                None if is_trigger_order => {
+                    let trigger_orders = match http_client
+                        .get_trigger_orders(&DeriveGetTriggerOrdersParams::new(subaccount_id))
+                        .await
+                    {
+                        Ok(result) => result.orders,
+                        Err(e) => {
+                            let reason = format!("failed to resolve trigger order by label: {e}");
+                            log::warn!("Cannot cancel trigger order {client_order_id}: {reason}");
+                            emitter.emit_order_cancel_rejected_event(
+                                strategy_id,
+                                instrument_id,
+                                client_order_id,
+                                None,
+                                &reason,
+                                clock.get_time_ns(),
+                            );
+                            return Ok(());
+                        }
+                    };
+                    let Some(trigger_order) = trigger_orders.into_iter().find(|order| {
+                        order.label.as_str() == client_order_id.as_str()
+                            && order.instrument_name.as_str() == venue_symbol
+                    }) else {
+                        let reason = "trigger order not found for client_order_id";
+                        log::warn!("Cannot cancel trigger order {client_order_id}: {reason}");
+                        emitter.emit_order_cancel_rejected_event(
+                            strategy_id,
+                            instrument_id,
+                            client_order_id,
+                            None,
+                            reason,
+                            clock.get_time_ns(),
+                        );
+                        return Ok(());
+                    };
+                    ws_exec
+                        .cancel_trigger_order(&DeriveCancelTriggerOrderParams::new(
+                            subaccount_id,
+                            trigger_order.order_id.as_str(),
+                        ))
+                        .await
+                        .map(Some)
+                }
+                None => ws_exec
+                    .cancel_by_label(&DeriveCancelByLabelParams::new(
+                        subaccount_id,
+                        client_order_id.as_str(),
+                    ))
+                    .await
+                    .map(|result| {
+                        if result.cancelled_orders == 0 {
+                            let reason = "no open order matched the client_order_id label";
+                            log::debug!(
+                                "Derive rejected cancel for {client_order_id}: {reason}"
+                            );
+                            let ts = clock.get_time_ns();
+                            emitter.emit_order_cancel_rejected_event(
+                                strategy_id,
+                                instrument_id,
+                                client_order_id,
+                                None,
+                                reason,
+                                ts,
+                            );
+                        }
+                        None
+                    }),
             };
 
             match outcome {
-                Ok(()) => {}
+                Ok(Some(canceled_order)) => {
+                    let canceled_venue_order_id =
+                        VenueOrderId::new(canceled_order.order_id.as_str());
+                    let ts = clock.get_time_ns();
+
+                    ensure_canceled_emitted(
+                        &emitter,
+                        &dispatch_state,
+                        client_order_id,
+                        OrderIdentity {
+                            instrument_id,
+                            strategy_id,
+                            order_side: match canceled_order.direction {
+                                DeriveOrderSide::Buy => OrderSide::Buy,
+                                DeriveOrderSide::Sell => OrderSide::Sell,
+                            },
+                            order_type: derive_order_type_to_nautilus_for_order(
+                                canceled_order.order_type,
+                                canceled_order.trigger_type,
+                            ),
+                        },
+                        canceled_venue_order_id,
+                        account_id,
+                        ts,
+                        ts,
+                    );
+                    dispatch_state.forget(&client_order_id);
+                }
+                Ok(None) => {}
                 // See docs/integrations/derive.md "Order rejection semantics".
                 Err(e) if is_write_outcome_ambiguous_ws(&e) => {
                     log::warn!(
@@ -1444,7 +1533,7 @@ impl ExecutionClient for DeriveExecutionClient {
                         strategy_id,
                         instrument_id,
                         client_order_id,
-                        Some(stale_venue_order_id),
+                        venue_order_id,
                         &reason,
                         ts,
                     );
@@ -1463,12 +1552,8 @@ impl ExecutionClient for DeriveExecutionClient {
         let side_filter = cmd.order_side;
 
         self.spawn_task("cancel_all_orders", async move {
-            // The venue endpoint scopes by instrument only, so when the
-            // caller asks for a single side we list open orders (an idempotent
-            // private read kept on HTTP), filter by side, and cancel each one
-            // over the WebSocket. Calling `cancel_all` directly would drop both
-            // sides and violate the command's filter.
-            if matches!(side_filter, OrderSide::Buy | OrderSide::Sell) {
+            // Preserve the requested side because Derive bulk cancellation has no side filter
+            if let Some(side_filter) = side_filter {
                 let open_params = DeriveGetOpenOrdersParams::new(subaccount_id);
                 let mut orders = match http_client.get_open_orders(&open_params).await {
                     Ok(v) => v,
@@ -1531,17 +1616,7 @@ impl ExecutionClient for DeriveExecutionClient {
                         );
                     }
                 }
-            } else if let Err(e) = ws_exec
-                .cancel_all_orders(
-                    &DeriveCancelAllParams::new(subaccount_id)
-                        .with_instrument_name(venue_symbol.as_str()),
-                )
-                .await
-            {
-                log::warn!("Derive cancel_all_orders failed for {venue_symbol}: {e}");
-            }
-
-            if !matches!(side_filter, OrderSide::Buy | OrderSide::Sell) {
+            } else {
                 let trigger_orders = match http_client
                     .get_trigger_orders(&DeriveGetTriggerOrdersParams::new(subaccount_id))
                     .await
@@ -1551,7 +1626,7 @@ impl ExecutionClient for DeriveExecutionClient {
                         log::warn!(
                             "Derive cancel_all_orders: failed to list trigger orders for {venue_symbol}: {e}",
                         );
-                        return Ok(());
+                        Vec::new()
                     }
                 };
 
@@ -1571,6 +1646,22 @@ impl ExecutionClient for DeriveExecutionClient {
                             "Derive cancel_all_orders: trigger cancel for {} failed: {e}",
                             order.order_id,
                         );
+                    }
+                }
+
+                match ws_exec
+                    .cancel_by_instrument(&DeriveCancelByInstrumentParams::new(
+                        subaccount_id,
+                        venue_symbol.as_str(),
+                    ))
+                    .await
+                {
+                    Ok(result) if result.cancelled_orders == 0 => {
+                        log::debug!("No open orders to cancel for {venue_symbol}");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::warn!("Derive cancel_all_orders failed for {venue_symbol}: {e}");
                     }
                 }
             }
@@ -1603,13 +1694,8 @@ impl ExecutionClient for DeriveExecutionClient {
             return Ok(());
         };
 
-        let Some(order) = self
-            .core
-            .cache()
-            .order(&cmd.client_order_id)
-            .map(|o| o.clone())
-        else {
-            let reason = "order not found in cache";
+        let Ok(order) = self.core.cache().try_order_owned(&cmd.client_order_id) else {
+            let reason = ORDER_NOT_FOUND;
             log::warn!("Cannot modify order {}: {reason}", cmd.client_order_id);
             self.emitter.emit_order_modify_rejected_event(
                 cmd.strategy_id,
@@ -1654,6 +1740,7 @@ impl ExecutionClient for DeriveExecutionClient {
         let instrument_id = cmd.instrument_id;
         let client_order_id = cmd.client_order_id;
         let stale_venue_order_id = venue_order_id;
+        let account_id = self.core.account_id;
         let voi_str = venue_order_id.to_string();
 
         self.spawn_task("modify_order", async move {
@@ -1669,6 +1756,27 @@ impl ExecutionClient for DeriveExecutionClient {
                 Err(e) => {
                     let reason = format!("instrument resolution failed: {e}");
                     log::warn!("Cannot modify order {client_order_id}: {reason}");
+                    let ts = clock.get_time_ns();
+                    emitter.emit_order_modify_rejected_event(
+                        strategy_id,
+                        instrument_id,
+                        client_order_id,
+                        Some(stale_venue_order_id),
+                        &reason,
+                        ts,
+                    );
+                    return Ok(());
+                }
+            };
+
+            let matching_reservation = match ws_exec
+                .reserve_matching_request("private/replace", &instrument.instrument_name)
+                .await
+            {
+                Ok(reservation) => reservation,
+                Err(e) => {
+                    let (reason, _) = ws_rejection_reason(&e);
+                    log::warn!("Cannot reserve Derive replace quota for {client_order_id}: {reason}");
                     let ts = clock.get_time_ns();
                     emitter.emit_order_modify_rejected_event(
                         strategy_id,
@@ -1699,7 +1807,18 @@ impl ExecutionClient for DeriveExecutionClient {
                     return Ok(());
                 }
             };
-            let nonce = nonce_manager.next_nonce(&wallet_str, signing.subaccount_id)?;
+            let nonce = match resolve_modify_nonce(
+                nonce_manager.next_nonce(&wallet_str, signing.subaccount_id),
+                &emitter,
+                strategy_id,
+                instrument_id,
+                client_order_id,
+                stale_venue_order_id,
+                clock,
+            ) {
+                Some(nonce) => nonce,
+                None => return Ok(()),
+            };
 
             let payload = match order_replace_to_derive_payload(
                 &order_for_task,
@@ -1738,16 +1857,37 @@ impl ExecutionClient for DeriveExecutionClient {
             // it arrives before this response.
             dispatch_state.mark_pending_modify(client_order_id, stale_venue_order_id);
 
-            match ws_exec.modify_order(&payload).await {
-                Ok(order) => {
+            let outcome = ws_exec
+                .modify_order_after_rate_limit(&payload, matching_reservation)
+                .await;
+
+            if let Err(e) = &outcome
+                && is_write_outcome_ambiguous_ws(e)
+            {
+                dispatch_state.clear_pending_modify(&client_order_id);
+                log::warn!(
+                    "Derive modify for {client_order_id} returned ambiguous WS outcome: {e}; awaiting reconciliation",
+                );
+                return Ok(());
+            }
+
+            match outcome {
+                Ok(DeriveReplaceOutcome::Replaced(order)) => {
                     let new_voi = VenueOrderId::new(order.order_id.as_str());
+
+                    if !dispatch_state.take_pending_modify(
+                        &client_order_id,
+                        stale_venue_order_id,
+                        Some(new_voi),
+                    ) {
+                        log::debug!(
+                            "Skipping private/replace response event for {client_order_id}: an incoming terminal frame already resolved the modify",
+                        );
+                        return Ok(());
+                    }
                     log::debug!(
                         "Order replaced: client_order_id={client_order_id}, new venue_order_id={new_voi}",
                     );
-                    // Rebind before clearing the marker so a later cancel-of-old
-                    // stays suppressed by the bound-id check.
-                    dispatch_state.record_venue_order_id(client_order_id, new_voi);
-                    dispatch_state.clear_pending_modify(&client_order_id);
                     let ts = clock.get_time_ns();
                     emitter.emit_order_updated(
                         &order_for_task,
@@ -1759,15 +1899,57 @@ impl ExecutionClient for DeriveExecutionClient {
                         ts,
                     );
                 }
-                // See docs/integrations/derive.md "Order rejection semantics".
-                Err(e) if is_write_outcome_ambiguous_ws(&e) => {
-                    dispatch_state.clear_pending_modify(&client_order_id);
+                Ok(DeriveReplaceOutcome::Canceled {
+                    cancelled_order,
+                    create_order_error,
+                }) => {
+                    if !dispatch_state.take_pending_modify(
+                        &client_order_id,
+                        stale_venue_order_id,
+                        None,
+                    ) {
+                        log::debug!(
+                            "Skipping partial private/replace response for {client_order_id}: an incoming terminal frame already resolved the modify",
+                        );
+                        return Ok(());
+                    }
+
                     log::warn!(
-                        "Derive modify for {client_order_id} returned ambiguous WS outcome: {e}; awaiting reconciliation",
+                        "Derive cancelled {client_order_id} ({}) but did not create its replacement: JSON-RPC {}: {}",
+                        cancelled_order.order_id,
+                        create_order_error.code,
+                        create_order_error.message,
                     );
+                    let ts = clock.get_time_ns();
+
+                    ensure_canceled_emitted(
+                        &emitter,
+                        &dispatch_state,
+                        client_order_id,
+                        OrderIdentity {
+                            instrument_id,
+                            strategy_id,
+                            order_side: order_for_task.order_side(),
+                            order_type: order_for_task.order_type(),
+                        },
+                        stale_venue_order_id,
+                        account_id,
+                        ts,
+                        ts,
+                    );
+                    dispatch_state.forget(&client_order_id);
                 }
                 Err(e) => {
-                    dispatch_state.clear_pending_modify(&client_order_id);
+                    if !dispatch_state.take_pending_modify(
+                        &client_order_id,
+                        stale_venue_order_id,
+                        None,
+                    ) {
+                        log::debug!(
+                            "Skipping private/replace rejection for {client_order_id}: an incoming terminal frame already resolved the modify",
+                        );
+                        return Ok(());
+                    }
                     let (reason, _) = ws_rejection_reason(&e);
                     log::debug!("Derive rejected modify for {client_order_id}: {reason}");
                     let ts = clock.get_time_ns();
@@ -1795,9 +1977,9 @@ impl ExecutionClient for DeriveExecutionClient {
             let subaccount = http_client
                 .get_subaccount(&DeriveGetSubaccountParams::new(subaccount_id))
                 .await?;
-            let (balances, margins) = parse_derive_subaccount_to_balances(&subaccount)?;
+            let (balances, margins, info) = parse_derive_subaccount_to_balances(&subaccount)?;
             let ts_event = clock.get_time_ns();
-            emitter.emit_account_state(balances, margins, true, ts_event);
+            emitter.emit_account_state(balances, margins, true, ts_event, Some(info));
             Ok(())
         });
         Ok(())
@@ -1816,6 +1998,7 @@ impl ExecutionClient for DeriveExecutionClient {
         let account_id = self.core.account_id;
         let emitter = self.emitter.clone();
         let clock = self.clock;
+        let dispatch_state = Arc::clone(&self.dispatch_state);
         let voi = venue_order_id.to_string();
 
         self.spawn_task("query_order", async move {
@@ -1850,13 +2033,445 @@ impl ExecutionClient for DeriveExecutionClient {
                     }
                 }
             };
+
+            let (price_precision, size_precision) =
+                report_precision(&dispatch_state, order.instrument_name.as_str());
             let ts_init = clock.get_time_ns();
-            let report = parse_derive_order_to_report(&order, account_id, ts_init)?;
+            let report = parse_derive_order_to_report_with_precision(
+                &order,
+                account_id,
+                price_precision,
+                size_precision,
+                ts_init,
+            )?;
             emitter.send_order_status_report(report);
             Ok(())
         });
         Ok(())
     }
+}
+
+#[derive(Clone)]
+struct DeriveReconciliationContext {
+    http_client: DeriveHttpClient,
+    emitter: ExecutionEventEmitter,
+    client_id: ClientId,
+    account_id: AccountId,
+    subaccount_id: u64,
+    clock: &'static AtomicTime,
+    dispatch_state: Arc<WsDispatchState>,
+}
+
+impl DeriveReconciliationContext {
+    async fn refresh_account_state(&self) -> anyhow::Result<()> {
+        let value = self
+            .http_client
+            .get_subaccount(&DeriveGetSubaccountParams::new(self.subaccount_id))
+            .await
+            .context("failed to fetch Derive subaccount snapshot")?;
+        let (balances, margins, info) = parse_derive_subaccount_to_balances(&value)
+            .context("failed to parse Derive subaccount balances")?;
+        let ts_event = self.clock.get_time_ns();
+        self.emitter
+            .emit_account_state(balances, margins, true, ts_event, Some(info));
+        Ok(())
+    }
+
+    async fn recover_after_reconnect(&self) -> anyhow::Result<()> {
+        self.refresh_account_state().await?;
+        let mass_status = Box::pin(self.generate_mass_status(None)).await?;
+        let order_count = mass_status.order_reports().len();
+        let fill_count: usize = mass_status.fill_reports().values().map(Vec::len).sum();
+        let position_count = mass_status.position_reports().len();
+        self.emitter
+            .send_execution_report(ExecutionReport::MassStatus(Box::new(mass_status)));
+        log::info!(
+            "Derive post-reconnect reconciliation submitted: orders={order_count}, fills={fill_count}, positions={position_count}",
+        );
+        Ok(())
+    }
+
+    async fn generate_order_status_reports(
+        &self,
+        cmd: &GenerateOrderStatusReports,
+        normalize_history_client_order_ids: bool,
+    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        let instrument_name = cmd.instrument_id.map(|id| id.symbol.as_str().to_string());
+        let orders: Vec<DeriveOrder> = if cmd.open_only {
+            let mut orders = self
+                .http_client
+                .get_open_orders(&DeriveGetOpenOrdersParams::new(self.subaccount_id))
+                .await?
+                .orders;
+            orders.extend(
+                self.http_client
+                    .get_trigger_orders(&DeriveGetTriggerOrdersParams::new(self.subaccount_id))
+                    .await?
+                    .orders,
+            );
+            orders
+        } else {
+            let start_ms = cmd.start.map(|t| t.as_millis() as i64);
+            let end_ms = cmd.end.map(|t| t.as_millis() as i64);
+            let mut page: u32 = 1;
+            let mut collected = Vec::new();
+
+            loop {
+                let mut params = DeriveGetOrderHistoryParams::new(
+                    self.subaccount_id,
+                    page,
+                    DERIVE_PRIVATE_PAGE_SIZE,
+                )
+                .with_window(start_ms, end_ms);
+
+                if let Some(name) = instrument_name.as_deref() {
+                    params = params.with_instrument_name(name);
+                }
+
+                let result = self.http_client.get_order_history(&params).await?;
+                let total_pages = result.pagination.num_pages;
+                collected.extend(result.orders);
+
+                if (page as i64) >= total_pages || total_pages == 0 {
+                    break;
+                }
+                page += 1;
+            }
+            collected
+        };
+
+        let ts_init = self.clock.get_time_ns();
+        let start_ms = cmd.start.map(|t| t.as_millis() as i64);
+        let end_ms = cmd.end.map(|t| t.as_millis() as i64);
+
+        let orders: Vec<DeriveOrder> = orders
+            .into_iter()
+            .filter(|order| {
+                cmd.instrument_id.is_none_or(|instrument_id| {
+                    InstrumentId::new(Symbol::new(order.instrument_name.as_str()), *DERIVE_VENUE)
+                        == instrument_id
+                }) && start_ms.is_none_or(|start| order.last_update_timestamp >= start)
+                    && end_ms.is_none_or(|end| order.last_update_timestamp <= end)
+            })
+            .collect();
+
+        let ambiguous_client_order_ids = if normalize_history_client_order_ids {
+            ambiguous_history_client_order_ids(&orders)
+        } else {
+            AHashSet::new()
+        };
+
+        let mut reports = Vec::with_capacity(orders.len());
+
+        for order in orders {
+            let (price_precision, size_precision) =
+                report_precision(&self.dispatch_state, order.instrument_name.as_str());
+            match parse_derive_order_to_report_with_precision(
+                &order,
+                self.account_id,
+                price_precision,
+                size_precision,
+                ts_init,
+            ) {
+                Ok(mut report) => {
+                    if report.client_order_id.is_some_and(|client_order_id| {
+                        ambiguous_client_order_ids.contains(&client_order_id)
+                    }) {
+                        report.client_order_id = None;
+                    }
+                    reports.push(report);
+                }
+                Err(e) => log::warn!("Skipping order in status report: {e}"),
+            }
+        }
+        Ok(reports)
+    }
+
+    async fn generate_fill_reports(
+        &self,
+        cmd: GenerateFillReports,
+    ) -> anyhow::Result<Vec<FillReport>> {
+        let instrument_name = cmd.instrument_id.map(|id| id.symbol.as_str().to_string());
+        let mut page: u32 = 1;
+        let mut all_trades: Vec<DeriveTrade> = Vec::new();
+
+        loop {
+            let mut params = DeriveGetTradeHistoryParams::new(
+                self.subaccount_id,
+                page,
+                DERIVE_PRIVATE_PAGE_SIZE,
+            )
+            .with_window(
+                cmd.start.map(|t| t.as_millis() as i64),
+                cmd.end.map(|t| t.as_millis() as i64),
+            );
+
+            if let Some(name) = instrument_name.as_deref() {
+                params = params.with_instrument_name(name);
+            }
+
+            let result = self.http_client.get_private_trade_history(&params).await?;
+            let total_pages = result.pagination.num_pages;
+            all_trades.extend(result.trades);
+
+            if (page as i64) >= total_pages || total_pages == 0 {
+                break;
+            }
+            page += 1;
+        }
+
+        let ts_init = self.clock.get_time_ns();
+
+        let venue_order_id_filter = cmd
+            .venue_order_id
+            .as_ref()
+            .map(|id| id.as_str().to_string());
+
+        let mut reports = Vec::with_capacity(all_trades.len());
+
+        for trade in all_trades {
+            if let Some(target) = venue_order_id_filter.as_deref()
+                && trade.order_id != target
+            {
+                continue;
+            }
+
+            let (price_precision, size_precision) =
+                report_precision(&self.dispatch_state, trade.instrument_name.as_str());
+            match parse_derive_trade_to_fill_report_with_precision(
+                &trade,
+                self.account_id,
+                Currency::USDC(),
+                price_precision,
+                size_precision,
+                ts_init,
+            ) {
+                Ok(Some(report)) => {
+                    if self.dispatch_state.contains_trade(&report.trade_id) {
+                        log::debug!(
+                            "Skipping duplicate Derive fill (trade_id={}) in generate_fill_reports",
+                            report.trade_id,
+                        );
+                        continue;
+                    }
+                    reports.push(report);
+                }
+                Ok(None) => {}
+                Err(e) => log::warn!("Skipping trade in fill report: {e}"),
+            }
+        }
+        Ok(reports)
+    }
+
+    async fn generate_position_status_snapshot(
+        &self,
+        cmd: &GeneratePositionStatusReports,
+    ) -> anyhow::Result<PositionStatusSnapshot> {
+        let positions = self
+            .http_client
+            .get_positions(&DeriveGetPositionsParams::new(self.subaccount_id))
+            .await?
+            .positions;
+        let ts_init = self.clock.get_time_ns();
+        let mut reports = Vec::with_capacity(positions.len());
+        let mut instruments = AHashSet::with_capacity(positions.len());
+
+        for position in positions {
+            let instrument_id = format_instrument_id(position.instrument_name.as_str());
+            if let Some(target) = cmd.instrument_id
+                && instrument_id != target
+            {
+                continue;
+            }
+
+            instruments.insert(instrument_id);
+
+            let (_, size_precision) =
+                report_precision(&self.dispatch_state, position.instrument_name.as_str());
+            match parse_derive_position_to_report_with_precision(
+                &position,
+                self.account_id,
+                size_precision,
+                ts_init,
+            ) {
+                Ok(report) => reports.push(report),
+                Err(e) => log::warn!("Skipping position in status report: {e}"),
+            }
+        }
+
+        Ok(PositionStatusSnapshot {
+            reports,
+            instruments,
+        })
+    }
+
+    async fn generate_mass_status(
+        &self,
+        lookback_mins: Option<u64>,
+    ) -> anyhow::Result<ExecutionMassStatus> {
+        log::info!("Generating ExecutionMassStatus (lookback_mins={lookback_mins:?})");
+
+        let ts_now = self.clock.get_time_ns();
+        let start = lookback_mins.map(|mins| {
+            let lookback_ns = mins.saturating_mul(60).saturating_mul(1_000_000_000);
+            UnixNanos::from(ts_now.as_u64().saturating_sub(lookback_ns))
+        });
+        let open_order_cmd = GenerateOrderStatusReports::new(
+            UUID4::new(),
+            ts_now,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let history_order_cmd = GenerateOrderStatusReports::new(
+            UUID4::new(),
+            ts_now,
+            false,
+            None,
+            start,
+            None,
+            None,
+            None,
+        );
+        let fill_cmd =
+            GenerateFillReports::new(UUID4::new(), ts_now, None, None, start, None, None, None);
+        let position_cmd =
+            GeneratePositionStatusReports::new(UUID4::new(), ts_now, None, None, None, None, None);
+
+        let (history_order_reports, open_order_reports, mut fill_reports, position_snapshot) = tokio::try_join!(
+            self.generate_order_status_reports(&history_order_cmd, true),
+            self.generate_order_status_reports(&open_order_cmd, false),
+            self.generate_fill_reports(fill_cmd),
+            self.generate_position_status_snapshot(&position_cmd),
+        )?;
+        let detached_history_order_ids: AHashSet<VenueOrderId> = history_order_reports
+            .iter()
+            .filter(|report| report.client_order_id.is_none())
+            .map(|report| report.venue_order_id)
+            .collect();
+
+        for report in &mut fill_reports {
+            if detached_history_order_ids.contains(&report.venue_order_id) {
+                report.client_order_id = None;
+            }
+        }
+
+        log::info!(
+            "Received {} historical OrderStatusReports",
+            history_order_reports.len()
+        );
+        log::info!(
+            "Received {} open OrderStatusReports",
+            open_order_reports.len()
+        );
+        log::info!("Received {} FillReports", fill_reports.len());
+        log::info!(
+            "Received {} PositionReports",
+            position_snapshot.reports.len()
+        );
+
+        let mut touched_instruments = AHashSet::new();
+
+        for report in history_order_reports
+            .iter()
+            .chain(open_order_reports.iter())
+        {
+            touched_instruments.insert(report.instrument_id);
+        }
+
+        for report in &fill_reports {
+            touched_instruments.insert(report.instrument_id);
+        }
+
+        let PositionStatusSnapshot {
+            reports: position_reports,
+            instruments: position_instruments,
+        } = position_snapshot;
+        let mut mass_status =
+            ExecutionMassStatus::new(self.client_id, self.account_id, *DERIVE_VENUE, ts_now, None);
+        mass_status.add_order_reports(history_order_reports);
+        mass_status.add_order_reports(open_order_reports);
+        mass_status.add_fill_reports(fill_reports);
+        mass_status.add_position_reports(position_reports);
+
+        add_missing_flat_position_reports(
+            &mut mass_status,
+            self.account_id,
+            touched_instruments,
+            &position_instruments,
+            ts_now,
+        );
+
+        Ok(mass_status)
+    }
+}
+
+fn ambiguous_history_client_order_ids(orders: &[DeriveOrder]) -> AHashSet<ClientOrderId> {
+    let mut orders_by_label: AHashMap<Ustr, AHashMap<&str, Option<&str>>> = AHashMap::new();
+
+    for order in orders {
+        if order.label.is_empty() {
+            continue;
+        }
+        orders_by_label
+            .entry(order.label)
+            .or_default()
+            .insert(order.order_id.as_str(), order.replaced_order_id.as_deref());
+    }
+
+    let mut ambiguous_client_order_ids = AHashSet::new();
+
+    for (label, orders_by_id) in orders_by_label {
+        if orders_by_id.len() < 2 {
+            continue;
+        }
+
+        let predecessors: AHashMap<&str, &str> = orders_by_id
+            .iter()
+            .filter_map(|(order_id, replaced_order_id)| {
+                let replaced_order_id = (*replaced_order_id)?;
+                orders_by_id
+                    .contains_key(replaced_order_id)
+                    .then_some((*order_id, replaced_order_id))
+            })
+            .collect();
+        let predecessor_ids: AHashSet<&str> = predecessors.values().copied().collect();
+        let heads: Vec<&str> = orders_by_id
+            .keys()
+            .copied()
+            .filter(|order_id| !predecessor_ids.contains(order_id))
+            .collect();
+
+        // One client order may own several venue IDs only when they form one linear replace chain
+        let is_linear_chain = predecessors.len() + 1 == orders_by_id.len()
+            && predecessor_ids.len() == predecessors.len()
+            && heads.len() == 1
+            && {
+                let mut visited = AHashSet::new();
+                let mut current = Some(heads[0]);
+                while let Some(order_id) = current {
+                    if !visited.insert(order_id) {
+                        break;
+                    }
+                    current = predecessors.get(order_id).copied();
+                }
+                visited.len() == orders_by_id.len()
+            };
+
+        if !is_linear_chain {
+            ambiguous_client_order_ids.insert(ClientOrderId::new(label.as_str()));
+        }
+    }
+
+    ambiguous_client_order_ids
+}
+
+struct PositionStatusSnapshot {
+    reports: Vec<PositionStatusReport>,
+    instruments: AHashSet<InstrumentId>,
 }
 
 // Reason text and post-only classification for a definitive WS write failure.
@@ -1875,21 +2490,20 @@ fn add_missing_flat_position_reports(
     mass_status: &mut ExecutionMassStatus,
     account_id: AccountId,
     touched_instruments: AHashSet<InstrumentId>,
+    position_instruments: &AHashSet<InstrumentId>,
     ts_init: UnixNanos,
 ) {
-    let active_position_instruments: AHashSet<InstrumentId> =
-        mass_status.position_reports().keys().copied().collect();
     let mut flat_reports = Vec::new();
 
     for instrument_id in touched_instruments {
-        if active_position_instruments.contains(&instrument_id) {
+        if position_instruments.contains(&instrument_id) {
             continue;
         }
 
         flat_reports.push(PositionStatusReport::new(
             account_id,
             instrument_id,
-            PositionSideSpecified::Flat,
+            PositionSide::Flat,
             Quantity::from("0"),
             ts_init,
             ts_init,
@@ -1908,6 +2522,16 @@ fn add_missing_flat_position_reports(
     }
 }
 
+fn report_precision(
+    dispatch_state: &WsDispatchState,
+    instrument_name: &str,
+) -> (Option<u8>, Option<u8>) {
+    let instrument_id = format_instrument_id(instrument_name);
+    dispatch_state
+        .instrument_precision(&instrument_id)
+        .map_or((None, None), |(price, size)| (Some(price), Some(size)))
+}
+
 fn handle_ws_message(
     message: DeriveWsMessage,
     emitter: &ExecutionEventEmitter,
@@ -1917,7 +2541,9 @@ fn handle_ws_message(
 ) {
     let payload = match message {
         DeriveWsMessage::Subscription(payload) => payload,
-        DeriveWsMessage::Authenticated | DeriveWsMessage::Reconnected => return,
+        DeriveWsMessage::Authenticated
+        | DeriveWsMessage::Reconnected
+        | DeriveWsMessage::SessionRecoveryFailed(_) => return,
     };
 
     let is_orders_channel = payload.channel.as_str().ends_with(".orders");
@@ -1926,13 +2552,25 @@ fn handle_ws_message(
     if is_orders_channel {
         let data = match serde_json::from_str::<DeriveOrdersSubscriptionData>(payload.data.get()) {
             Ok(data) => data,
-            Err(_) => return,
+            Err(e) => {
+                log::warn!(
+                    "Failed to decode Derive orders frame on channel {}: {e}",
+                    payload.channel,
+                );
+                return;
+            }
         };
         dispatch_orders_payload(data, emitter, account_id, clock, dispatch_state);
     } else if is_trades_channel {
         let data = match serde_json::from_str::<DeriveTradesSubscriptionData>(payload.data.get()) {
             Ok(data) => data,
-            Err(_) => return,
+            Err(e) => {
+                log::warn!(
+                    "Failed to decode Derive trades frame on channel {}: {e}",
+                    payload.channel,
+                );
+                return;
+            }
         };
         dispatch_trades_payload(data, emitter, account_id, clock, dispatch_state);
     }
@@ -1952,8 +2590,17 @@ pub fn dispatch_orders_payload(
     dispatch_state: &WsDispatchState,
 ) {
     let ts_init = clock.get_time_ns();
+
     for order in data.orders {
-        let report = match parse_derive_order_to_report(&order, account_id, ts_init) {
+        let (price_precision, size_precision) =
+            report_precision(dispatch_state, order.instrument_name.as_str());
+        let report = match parse_derive_order_to_report_with_precision(
+            &order,
+            account_id,
+            price_precision,
+            size_precision,
+            ts_init,
+        ) {
             Ok(report) => report,
             Err(e) => {
                 log::warn!("Failed to parse Derive order WS update: {e}");
@@ -1991,10 +2638,20 @@ pub fn dispatch_trades_payload(
     clock: &'static AtomicTime,
     dispatch_state: &WsDispatchState,
 ) {
-    let ts_init = clock.get_time_ns();
     let fee_currency = Currency::USDC();
+    let ts_init = clock.get_time_ns();
+
     for trade in data.trades {
-        match parse_derive_trade_to_fill_report(&trade, account_id, fee_currency, ts_init) {
+        let (price_precision, size_precision) =
+            report_precision(dispatch_state, trade.instrument_name.as_str());
+        match parse_derive_trade_to_fill_report_with_precision(
+            &trade,
+            account_id,
+            fee_currency,
+            price_precision,
+            size_precision,
+            ts_init,
+        ) {
             Ok(Some(report)) => {
                 if dispatch_state.check_and_insert_trade(report.trade_id) {
                     log::debug!(
@@ -2069,6 +2726,35 @@ fn ensure_accepted_emitted(
     emitter.send_order_event(OrderEventAny::Accepted(accepted));
 }
 
+#[expect(clippy::too_many_arguments)]
+fn ensure_canceled_emitted(
+    emitter: &ExecutionEventEmitter,
+    dispatch_state: &WsDispatchState,
+    client_order_id: ClientOrderId,
+    identity: OrderIdentity,
+    venue_order_id: VenueOrderId,
+    account_id: AccountId,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) {
+    if dispatch_state.mark_canceled(client_order_id) {
+        return;
+    }
+    let canceled = OrderCanceled::new(
+        emitter.trader_id(),
+        identity.strategy_id,
+        identity.instrument_id,
+        client_order_id,
+        UUID4::new(),
+        ts_event,
+        ts_init,
+        false,
+        Some(venue_order_id),
+        Some(account_id),
+    );
+    emitter.send_order_event(OrderEventAny::Canceled(canceled));
+}
+
 fn emit_tracked_order_event(
     emitter: &ExecutionEventEmitter,
     dispatch_state: &WsDispatchState,
@@ -2097,11 +2783,22 @@ fn emit_tracked_order_event(
     if let Some(bound) = dispatch_state.bound_venue_order_id(&client_order_id)
         && bound != venue_order_id
     {
-        log::debug!(
-            "Skipping stale {:?} for {client_order_id}: venue_order_id={venue_order_id} superseded by {bound}",
+        let terminal = matches!(
             report.order_status,
+            OrderStatus::Canceled | OrderStatus::Expired | OrderStatus::Rejected
         );
-        return;
+
+        if dispatch_state.bind_incoming_modify(client_order_id, venue_order_id, terminal) {
+            log::debug!(
+                "Bound incoming replacement for {client_order_id}: venue_order_id={venue_order_id}",
+            );
+        } else {
+            log::debug!(
+                "Skipping stale {:?} for {client_order_id}: venue_order_id={venue_order_id} superseded by {bound}",
+                report.order_status,
+            );
+            return;
+        }
     }
 
     match report.order_status {
@@ -2154,19 +2851,16 @@ fn emit_tracked_order_event(
                 ts_accepted,
                 ts_init,
             );
-            let canceled = OrderCanceled::new(
-                emitter.trader_id(),
-                identity.strategy_id,
-                identity.instrument_id,
+            ensure_canceled_emitted(
+                emitter,
+                dispatch_state,
                 client_order_id,
-                UUID4::new(),
+                identity,
+                venue_order_id,
+                account_id,
                 ts_event,
                 ts_init,
-                false,
-                Some(venue_order_id),
-                Some(account_id),
             );
-            emitter.send_order_event(OrderEventAny::Canceled(canceled));
             dispatch_state.forget(&client_order_id);
         }
         OrderStatus::Expired => {
@@ -2266,6 +2960,7 @@ fn emit_tracked_fill(
         false,
         report.venue_position_id,
         Some(report.commission),
+        None,
     );
     emitter.send_order_event(OrderEventAny::Filled(filled));
 }
@@ -2292,8 +2987,6 @@ fn market_order_limit_price(
     let raw = match side {
         OrderSide::Buy => quote.ask_price.as_decimal() * (one + bps / scale),
         OrderSide::Sell => quote.bid_price.as_decimal() * (one - bps / scale),
-        // NoOrderSide is rejected upstream by `order_side_to_derive`.
-        OrderSide::NoOrderSide => return None,
     };
     let rounded = round_to_tick(raw, tick_size, side);
     if rounded <= Decimal::ZERO {
@@ -2314,7 +3007,6 @@ fn trigger_market_limit_price(
     let raw = match side {
         OrderSide::Buy => trigger_price * (one + bps / scale),
         OrderSide::Sell => trigger_price * (one - bps / scale),
-        OrderSide::NoOrderSide => return None,
     };
     let rounded = round_to_tick(raw, tick_size, side);
     if rounded <= Decimal::ZERO {
@@ -2336,6 +3028,52 @@ fn is_derive_trigger_order_type(order_type: OrderType) -> bool {
 fn trigger_order_signature_expiry(clock: &'static AtomicTime) -> i64 {
     let now_secs = (clock.get_time_ns().as_u64() / 1_000_000_000) as i64;
     now_secs + TRIGGER_ORDER_SIGNATURE_TTL.as_secs() as i64
+}
+
+fn resolve_submit_nonce(
+    nonce: Result<u64, NonceError>,
+    emitter: &ExecutionEventEmitter,
+    dispatch_state: &WsDispatchState,
+    order: &OrderAny,
+    clock: &'static AtomicTime,
+) -> Option<u64> {
+    match nonce {
+        Ok(nonce) => Some(nonce),
+        Err(e) => {
+            let reason = format!("nonce allocation failed: {e}");
+            log::warn!("Cannot submit order {}: {reason}", order.client_order_id());
+            dispatch_state.forget(&order.client_order_id());
+            emitter.emit_order_rejected(order, &reason, clock.get_time_ns(), false);
+            None
+        }
+    }
+}
+
+fn resolve_modify_nonce(
+    nonce: Result<u64, NonceError>,
+    emitter: &ExecutionEventEmitter,
+    strategy_id: StrategyId,
+    instrument_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    clock: &'static AtomicTime,
+) -> Option<u64> {
+    match nonce {
+        Ok(nonce) => Some(nonce),
+        Err(e) => {
+            let reason = format!("nonce allocation failed: {e}");
+            log::warn!("Cannot modify order {client_order_id}: {reason}");
+            emitter.emit_order_modify_rejected_event(
+                strategy_id,
+                instrument_id,
+                client_order_id,
+                Some(venue_order_id),
+                &reason,
+                clock.get_time_ns(),
+            );
+            None
+        }
+    }
 }
 
 fn normal_order_signature_expiry(
@@ -2400,7 +3138,6 @@ fn round_to_tick(value: Decimal, tick_size: Decimal, side: OrderSide) -> Decimal
     let ticks = match side {
         OrderSide::Buy => ratio.ceil(),
         OrderSide::Sell => ratio.floor(),
-        OrderSide::NoOrderSide => ratio.round(),
     };
     ticks * tick_size
 }
@@ -2426,20 +3163,28 @@ async fn cached_or_fetch_instrument(
 mod tests {
     use std::{cell::RefCell, rc::Rc};
 
-    use nautilus_common::{cache::Cache, messages::ExecutionEvent};
+    use nautilus_common::{
+        cache::Cache,
+        messages::{ExecutionEvent, ExecutionReport},
+    };
     use nautilus_core::UnixNanos;
     use nautilus_live::ExecutionClientCore;
     use nautilus_model::{
         data::QuoteTick,
         enums::{AccountType, OmsType, TimeInForce},
         identifiers::{AccountId, ClientId, InstrumentId, StrategyId, TraderId},
+        orders::OrderTestBuilder,
         types::{Price, Quantity},
     };
     use rstest::rstest;
     use rust_decimal_macros::dec;
 
     use super::*;
-    use crate::common::{consts::DERIVE, enums::DeriveEnvironment};
+    use crate::common::{
+        consts::DERIVE,
+        enums::{DeriveEnvironment, DeriveOrderStatus, DeriveOrderType},
+        parse::parse_derive_instrument_any,
+    };
 
     const TEST_WALLET: &str = "0x0000000000000000000000000000000000001234";
     const TEST_SESSION_KEY: &str =
@@ -2460,8 +3205,8 @@ mod tests {
         )
     }
 
-    fn test_config() -> DeriveExecClientConfig {
-        DeriveExecClientConfig {
+    fn test_config() -> DeriveExecutionClientConfig {
+        DeriveExecutionClientConfig {
             wallet_address: Some(TEST_WALLET.to_string()),
             session_key: Some(TEST_SESSION_KEY.to_string()),
             subaccount_id: Some(TEST_SUBACCOUNT),
@@ -2473,7 +3218,8 @@ mod tests {
                 "0x1111111111111111111111111111111111111111111111111111111111111111".to_string(),
             ),
             trade_module_address: Some("0x000000000000000000000000000000000000bbbb".to_string()),
-            ..DeriveExecClientConfig::default()
+            max_fee_per_contract: Some(dec!(1000)),
+            ..DeriveExecutionClientConfig::default()
         }
     }
 
@@ -2570,6 +3316,22 @@ mod tests {
     }
 
     #[rstest]
+    #[case(None, "max_fee_per_contract is required")]
+    #[case(Some(dec!(0)), "max_fee_per_contract must be greater than zero")]
+    #[case(Some(dec!(-1)), "max_fee_per_contract must be greater than zero")]
+    fn test_new_rejects_invalid_max_fee_per_contract(
+        #[case] max_fee_per_contract: Option<Decimal>,
+        #[case] expected: &str,
+    ) {
+        let mut config = test_config();
+        config.max_fee_per_contract = max_fee_per_contract;
+
+        let err = DeriveExecutionClient::new(test_core(), config).expect_err("must reject");
+
+        assert_eq!(err.to_string(), expected);
+    }
+
+    #[rstest]
     #[case(OrderType::StopMarket, true)]
     #[case(OrderType::StopLimit, true)]
     #[case(OrderType::MarketIfTouched, true)]
@@ -2580,6 +3342,87 @@ mod tests {
     #[case(OrderType::TrailingStopMarket, false)]
     fn test_is_derive_trigger_order_type(#[case] order_type: OrderType, #[case] expected: bool) {
         assert_eq!(is_derive_trigger_order_type(order_type), expected);
+    }
+
+    #[rstest]
+    fn test_resolve_submit_nonce_emits_rejection_and_forgets_identity() {
+        let clock = get_atomic_clock_realtime();
+        let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
+        let strategy_id = StrategyId::from("S-1");
+        let client_order_id = ClientOrderId::from("NONCE-SUBMIT-1");
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(TraderId::from("TRADER-001"))
+            .strategy_id(strategy_id)
+            .instrument_id(instrument_id)
+            .client_order_id(client_order_id)
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .price(Price::from("3500.00"))
+            .build();
+        let identity = OrderIdentity {
+            instrument_id,
+            strategy_id,
+            order_side: OrderSide::Buy,
+            order_type: OrderType::Limit,
+        };
+        let state = WsDispatchState::new();
+        state.register_identity(client_order_id, identity);
+        let (emitter, mut rx) = test_emitter(clock);
+
+        let nonce = resolve_submit_nonce(
+            Err(NonceError::ClockBeforeEpoch),
+            &emitter,
+            &state,
+            &order,
+            clock,
+        );
+        let event = rx.try_recv().expect("OrderRejected event");
+
+        assert!(nonce.is_none());
+        assert!(state.identity(&client_order_id).is_none());
+        if let ExecutionEvent::Order(OrderEventAny::Rejected(rejected)) = event {
+            assert_eq!(rejected.client_order_id, client_order_id);
+            assert_eq!(
+                rejected.reason.as_str(),
+                "nonce allocation failed: system clock is before UNIX epoch",
+            );
+        } else {
+            panic!("expected OrderRejected, event was {event:?}");
+        }
+    }
+
+    #[rstest]
+    fn test_resolve_modify_nonce_emits_modify_rejection() {
+        let clock = get_atomic_clock_realtime();
+        let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
+        let strategy_id = StrategyId::from("S-1");
+        let client_order_id = ClientOrderId::from("NONCE-MODIFY-1");
+        let venue_order_id = VenueOrderId::from("ord-nonce-modify-1");
+        let (emitter, mut rx) = test_emitter(clock);
+
+        let nonce = resolve_modify_nonce(
+            Err(NonceError::ClockBeforeEpoch),
+            &emitter,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            venue_order_id,
+            clock,
+        );
+        let event = rx.try_recv().expect("OrderModifyRejected event");
+
+        assert!(nonce.is_none());
+
+        if let ExecutionEvent::Order(OrderEventAny::ModifyRejected(rejected)) = event {
+            assert_eq!(rejected.client_order_id, client_order_id);
+            assert_eq!(rejected.venue_order_id, Some(venue_order_id));
+            assert_eq!(
+                rejected.reason.as_str(),
+                "nonce allocation failed: system clock is before UNIX epoch",
+            );
+        } else {
+            panic!("expected OrderModifyRejected, event was {event:?}");
+        }
     }
 
     #[rstest]
@@ -2667,6 +3510,90 @@ mod tests {
     }
 
     #[rstest]
+    fn test_cache_instrument_registers_report_precision() {
+        let client = DeriveExecutionClient::new(test_core(), test_config()).unwrap();
+        let instrument = sample_derive_instrument();
+        let instrument_id = format_instrument_id(instrument.instrument_name.as_str());
+
+        client.cache_instrument(instrument);
+
+        assert_eq!(
+            client.dispatch_state.instrument_precision(&instrument_id),
+            Some((2, 3)),
+        );
+    }
+
+    #[rstest]
+    fn test_order_dispatch_uses_registered_instrument_precision() {
+        let clock = get_atomic_clock_realtime();
+        let client = test_client_with_instrument();
+
+        let mut order: DeriveOrder = serde_json::from_str(include_str!(
+            "../test_data/perps/http_order_eth_partially_filled.json"
+        ))
+        .unwrap();
+        order.amount = Decimal::from_str_exact("25.000").unwrap();
+        order.filled_amount = Decimal::from_str_exact("5.000").unwrap();
+        order.limit_price = Decimal::from_str_exact("25.000").unwrap();
+        order.order_status = DeriveOrderStatus::Open;
+        order.order_type = DeriveOrderType::Limit;
+
+        let (emitter, mut rx) = test_emitter(clock);
+        dispatch_orders_payload(
+            DeriveOrdersSubscriptionData {
+                orders: vec![order],
+            },
+            &emitter,
+            AccountId::from("DERIVE-001"),
+            clock,
+            &client.dispatch_state,
+        );
+
+        let event = rx.try_recv().unwrap();
+        let ExecutionEvent::Report(ExecutionReport::Order(report)) = event else {
+            panic!("Expected OrderStatusReport");
+        };
+        assert_eq!(report.price, Some(Price::from("25.00")));
+        assert_eq!(report.price.unwrap().precision, 2);
+        assert_eq!(report.quantity, Quantity::from("25.000"));
+        assert_eq!(report.quantity.precision, 3);
+        assert_eq!(report.filled_qty, Quantity::from("5.000"));
+        assert_eq!(report.filled_qty.precision, 3);
+    }
+
+    #[rstest]
+    fn test_trade_dispatch_uses_registered_instrument_precision() {
+        let clock = get_atomic_clock_realtime();
+        let client = test_client_with_instrument();
+        let mut trade: DeriveTrade = serde_json::from_str(include_str!(
+            "../test_data/perps/http_private_trade_eth.json"
+        ))
+        .unwrap();
+        trade.trade_amount = Decimal::from_str_exact("25.000").unwrap();
+        trade.trade_price = Decimal::from_str_exact("25.000").unwrap();
+
+        let (emitter, mut rx) = test_emitter(clock);
+        dispatch_trades_payload(
+            DeriveTradesSubscriptionData {
+                trades: vec![trade],
+            },
+            &emitter,
+            AccountId::from("DERIVE-001"),
+            clock,
+            &client.dispatch_state,
+        );
+
+        let event = rx.try_recv().unwrap();
+        let ExecutionEvent::Report(ExecutionReport::Fill(report)) = event else {
+            panic!("Expected FillReport");
+        };
+        assert_eq!(report.last_px, Price::from("25.00"));
+        assert_eq!(report.last_px.precision, 2);
+        assert_eq!(report.last_qty, Quantity::from("25.000"));
+        assert_eq!(report.last_qty.precision, 3);
+    }
+
+    #[rstest]
     fn test_emit_tracked_event_suppresses_in_flight_replace_cancel_leg() {
         // Derive's `private/replace` cancels the old order; the `.orders`
         // cancel-of-old leg can arrive before `modify_order` rebinds the order,
@@ -2692,7 +3619,7 @@ mod tests {
             instrument_id,
             Some(cid),
             stale_voi,
-            OrderSide::Buy,
+            OrderSide::Buy.into(),
             OrderType::Limit,
             TimeInForce::Gtc,
             OrderStatus::Canceled,
@@ -2704,22 +3631,9 @@ mod tests {
             None,
         );
 
-        let new_emitter = || {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            let mut emitter = ExecutionEventEmitter::new(
-                clock,
-                TraderId::from("TRADER-001"),
-                account_id,
-                AccountType::Margin,
-                Some(Currency::USDC()),
-            );
-            emitter.set_sender(tx);
-            (emitter, rx)
-        };
-
         // Marker targets the cancel's venue order id and no bound id is
         // recorded, so suppression can only come from the in-flight branch.
-        let (emitter, mut rx) = new_emitter();
+        let (emitter, mut rx) = test_emitter(clock);
         let state = WsDispatchState::new();
         state.mark_pending_modify(cid, stale_voi);
         emit_tracked_order_event(
@@ -2735,7 +3649,7 @@ mod tests {
 
         // A marker for a different venue order id must not suppress: the guard
         // keys on the specific id, so the cancel-of-old still terminates.
-        let (emitter, mut rx) = new_emitter();
+        let (emitter, mut rx) = test_emitter(clock);
         let state = WsDispatchState::new();
         state.mark_pending_modify(cid, VenueOrderId::from("ord-other"));
         emit_tracked_order_event(
@@ -2763,5 +3677,72 @@ mod tests {
             saw_canceled,
             "a pending-modify marker for a different venue order id must not suppress",
         );
+    }
+
+    #[rstest]
+    fn test_ensure_canceled_emitted_is_idempotent() {
+        let clock = get_atomic_clock_realtime();
+        let account_id = AccountId::from("DERIVE-001");
+        let client_order_id = ClientOrderId::from("TRIGGER-CANCEL-1");
+        let identity = OrderIdentity {
+            instrument_id: InstrumentId::from("ETH-PERP.DERIVE"),
+            strategy_id: StrategyId::from("S-1"),
+            order_side: OrderSide::Buy,
+            order_type: OrderType::StopMarket,
+        };
+        let venue_order_id = VenueOrderId::from("trigger-cancel-1");
+        let state = WsDispatchState::new();
+        let (emitter, mut rx) = test_emitter(clock);
+
+        for _ in 0..2 {
+            ensure_canceled_emitted(
+                &emitter,
+                &state,
+                client_order_id,
+                identity,
+                venue_order_id,
+                account_id,
+                UnixNanos::from(1_000),
+                UnixNanos::from(1_000),
+            );
+        }
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ExecutionEvent::Order(OrderEventAny::Canceled(_)))
+        ));
+        assert!(rx.try_recv().is_err(), "duplicate OrderCanceled emitted");
+    }
+
+    fn test_emitter(
+        clock: &'static AtomicTime,
+    ) -> (
+        ExecutionEventEmitter,
+        tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut emitter = ExecutionEventEmitter::new(
+            clock,
+            TraderId::from("TRADER-001"),
+            AccountId::from("DERIVE-001"),
+            AccountType::Margin,
+            Some(Currency::USDC()),
+        );
+        emitter.set_sender(tx);
+        (emitter, rx)
+    }
+
+    fn sample_derive_instrument() -> DeriveInstrument {
+        serde_json::from_str(include_str!("../test_data/perps/instrument_eth.json")).unwrap()
+    }
+
+    fn test_client_with_instrument() -> DeriveExecutionClient {
+        let mut client = DeriveExecutionClient::new(test_core(), test_config()).unwrap();
+        let instrument =
+            parse_derive_instrument_any(&sample_derive_instrument(), UnixNanos::default())
+                .unwrap()
+                .unwrap();
+        client.on_instrument(instrument);
+        client
     }
 }

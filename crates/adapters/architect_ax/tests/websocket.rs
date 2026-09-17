@@ -17,15 +17,22 @@
 
 mod common;
 
-use std::{sync::atomic::Ordering, time::Duration};
+use std::{
+    sync::{Mutex, atomic::Ordering},
+    time::Duration,
+};
 
+use log::{Level, LevelFilter, Log, Metadata, Record};
 use nautilus_architect_ax::{
     common::enums::{AxCandleWidth, AxMarketDataLevel},
-    websocket::{data::AxMdWebSocketClient, orders::AxOrdersWebSocketClient},
+    websocket::{
+        data::{AxMdWebSocketClient, AxWsClientError},
+        orders::{AxOrdersWebSocketClient, AxOrdersWsClientError},
+    },
 };
-use nautilus_common::testing::wait_until_async;
+use nautilus_common::{cache::InstrumentLookupError, testing::wait_until_async};
 use nautilus_model::{
-    enums::{OrderSide, OrderType, TimeInForce},
+    enums::{OrderSide, TimeInForce},
     identifiers::{AccountId, ClientOrderId, StrategyId, TraderId, VenueOrderId},
     instruments::Instrument,
     types::{Price, Quantity},
@@ -35,6 +42,143 @@ use rstest::rstest;
 use ustr::Ustr;
 
 use crate::common::server::{create_test_instrument, start_test_server, wait_for_connection};
+
+const SECRET_MARKER: &str = "OUTBOUND_SECRET_MARKER";
+
+struct OutboundLogCapture {
+    messages: Mutex<Vec<(String, String)>>,
+}
+
+static OUTBOUND_LOG_CAPTURE: OutboundLogCapture = OutboundLogCapture {
+    messages: Mutex::new(Vec::new()),
+};
+
+impl OutboundLogCapture {
+    fn clear(&self) {
+        self.messages.lock().unwrap().clear();
+    }
+
+    fn messages(&self) -> Vec<(String, String)> {
+        self.messages.lock().unwrap().clone()
+    }
+}
+
+impl Log for OutboundLogCapture {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        metadata.level() == Level::Trace
+            && matches!(
+                metadata.target(),
+                "nautilus_architect_ax::websocket::data::handler"
+                    | "nautilus_architect_ax::websocket::orders::handler"
+            )
+    }
+
+    fn log(&self, record: &Record<'_>) {
+        if self.enabled(record.metadata()) {
+            let message = record.args().to_string();
+            if message.starts_with("Sending WebSocket payload") {
+                self.messages
+                    .lock()
+                    .unwrap()
+                    .push((record.target().to_string(), message));
+            }
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_outbound_logs_omit_payload_bodies() {
+    log::set_logger(&OUTBOUND_LOG_CAPTURE).expect("test logger already installed");
+    log::set_max_level(LevelFilter::Trace);
+
+    let (addr, state) = start_test_server().await.unwrap();
+    let mut data_client = AxMdWebSocketClient::new(
+        format!("ws://{addr}/md/ws"),
+        SECRET_MARKER.to_string(),
+        30,
+        TransportBackend::default(),
+        None,
+    );
+    let account_id = AccountId::from("AX-001");
+    let trader_id = TraderId::from("TESTER-001");
+    let mut orders_client = AxOrdersWebSocketClient::new(
+        format!("ws://{addr}/orders/ws"),
+        account_id,
+        trader_id,
+        30,
+        TransportBackend::default(),
+        None,
+    );
+
+    data_client.connect().await.unwrap();
+    orders_client.connect(SECRET_MARKER).await.unwrap();
+    OUTBOUND_LOG_CAPTURE.clear();
+
+    data_client.subscribe_quotes(SECRET_MARKER).await.unwrap();
+    orders_client
+        .cancel_order(
+            ClientOrderId::from("SECRET-CANCEL"),
+            Some(VenueOrderId::new(SECRET_MARKER)),
+        )
+        .await
+        .unwrap();
+
+    wait_until_async(
+        || async {
+            state
+                .get_messages()
+                .await
+                .iter()
+                .filter(|message| message.to_string().contains(SECRET_MARKER))
+                .count()
+                == 2
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let wire_messages = state.get_messages().await;
+    let data_len = wire_messages
+        .iter()
+        .find(|message| {
+            message.get("symbol").and_then(|value| value.as_str()) == Some(SECRET_MARKER)
+        })
+        .map(|message| message.to_string().len())
+        .expect("expected marked market data request");
+    let orders_len = wire_messages
+        .iter()
+        .find(|message| message.get("oid").and_then(|value| value.as_str()) == Some(SECRET_MARKER))
+        .map(|message| message.to_string().len())
+        .expect("expected marked order request");
+    let messages = OUTBOUND_LOG_CAPTURE.messages();
+
+    assert!(
+        messages
+            .iter()
+            .all(|(_, message)| !message.contains(SECRET_MARKER)),
+        "outbound logs exposed the secret marker: {messages:?}"
+    );
+    assert!(
+        messages.iter().any(|(target, message)| {
+            target == "nautilus_architect_ax::websocket::data::handler"
+                && message == &format!("Sending WebSocket payload ({data_len} bytes)")
+        }),
+        "market data send metadata missing or inaccurate: {messages:?}"
+    );
+    assert!(
+        messages.iter().any(|(target, message)| {
+            target == "nautilus_architect_ax::websocket::orders::handler"
+                && message == &format!("Sending WebSocket payload ({orders_len} bytes)")
+        }),
+        "orders send metadata missing or inaccurate: {messages:?}"
+    );
+
+    data_client.close().await.expect("close WebSocket client");
+    orders_client.close().await.expect("close WebSocket client");
+}
 
 #[rstest]
 #[tokio::test]
@@ -56,7 +200,7 @@ async fn test_md_client_connection() {
     assert!(client.is_active());
     assert_eq!(*state.connection_count.lock().await, 1);
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -90,18 +234,29 @@ async fn test_md_client_not_active_before_connect() {
 }
 
 #[rstest]
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_md_connection_failure_to_invalid_url() {
+    let url = "ws://127.0.0.1:9999/invalid".to_string();
     let mut client = AxMdWebSocketClient::new(
-        "ws://127.0.0.1:9999/invalid".to_string(),
+        url.clone(),
         "test_token".to_string(),
         30,
         TransportBackend::default(),
         None,
     );
 
-    let result = client.connect().await;
-    assert!(result.is_err());
+    let err = client.connect().await.unwrap_err();
+    let message = err.to_string();
+
+    assert!(matches!(err, AxWsClientError::Transport(_)));
+    assert!(
+        message.starts_with(&format!("Transport error: Failed to connect to {url}: ")),
+        "expected the failure to name the endpoint, was: {message}"
+    );
+    assert!(
+        !message.contains("Connection timeout"),
+        "expected a refused dial rather than a virtual-clock timeout, was: {message}"
+    );
 }
 
 #[rstest]
@@ -123,7 +278,7 @@ async fn test_md_close_sets_closed_flag() {
 
     assert!(!client.is_closed());
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 
     assert!(client.is_closed());
 }
@@ -152,7 +307,7 @@ async fn test_md_disconnect_without_close() {
     // Disconnect doesn't set closed flag
     assert!(!client.is_closed());
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -189,7 +344,7 @@ async fn test_md_subscribe_l1() {
             .any(|s| s.contains("EURUSD-PERP") && s.contains("LEVEL_1"))
     );
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -226,7 +381,7 @@ async fn test_md_subscribe_l2() {
             .any(|s| s.contains("EURUSD-PERP") && s.contains("LEVEL_2"))
     );
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -263,7 +418,88 @@ async fn test_md_subscribe_l3() {
             .any(|s| s.contains("EURUSD-PERP") && s.contains("LEVEL_3"))
     );
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_md_subscribe_trades_uses_trades_level() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let ws_url = format!("ws://{addr}/md/ws");
+
+    let mut client = AxMdWebSocketClient::new(
+        ws_url,
+        "test_token".to_string(),
+        30,
+        TransportBackend::default(),
+        None,
+    );
+
+    client.connect().await.unwrap();
+    wait_for_connection(&state).await;
+
+    client.subscribe_trades("EURUSD-PERP").await.unwrap();
+
+    wait_until_async(
+        || async { !state.subscriptions.lock().await.is_empty() },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let messages = state.get_messages().await;
+    let subscribe = messages
+        .iter()
+        .find(|m| m.get("type").and_then(|v| v.as_str()) == Some("subscribe"))
+        .expect("expected subscribe message");
+
+    assert_eq!(subscribe["symbol"], "EURUSD-PERP");
+    assert_eq!(subscribe["level"], "TRADES");
+    assert!(subscribe.get("trades").is_none());
+    assert!(subscribe.get("ticker").is_none());
+
+    client.close().await.expect("close WebSocket client");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_md_book_subscription_suppresses_unrequested_streams() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let ws_url = format!("ws://{addr}/md/ws");
+
+    let mut client = AxMdWebSocketClient::new(
+        ws_url,
+        "test_token".to_string(),
+        30,
+        TransportBackend::default(),
+        None,
+    );
+
+    client.connect().await.unwrap();
+    wait_for_connection(&state).await;
+
+    client
+        .subscribe_book_deltas("EURUSD-PERP", AxMarketDataLevel::Level2)
+        .await
+        .unwrap();
+
+    wait_until_async(
+        || async { !state.subscriptions.lock().await.is_empty() },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let messages = state.get_messages().await;
+    let subscribe = messages
+        .iter()
+        .find(|m| m.get("type").and_then(|v| v.as_str()) == Some("subscribe"))
+        .expect("expected subscribe message");
+
+    assert_eq!(subscribe["symbol"], "EURUSD-PERP");
+    assert_eq!(subscribe["level"], "LEVEL_2");
+    assert_eq!(subscribe["trades"], false);
+    assert_eq!(subscribe["ticker"], false);
+
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -307,7 +543,7 @@ async fn test_md_subscribe_multiple_symbols() {
     assert!(subs.iter().any(|s| s.contains("ETHUSD-PERP")));
     assert!(subs.iter().any(|s| s.contains("GBPUSD-PERP")));
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -348,7 +584,7 @@ async fn test_md_unsubscribe() {
 
     assert!(state.subscriptions.lock().await.is_empty());
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -374,18 +610,21 @@ async fn test_md_subscribe_candles() {
         .unwrap();
 
     wait_until_async(
-        || async { !state.subscriptions.lock().await.is_empty() },
+        || async {
+            !state.subscriptions.lock().await.is_empty() && client.subscription_count() == 1
+        },
         Duration::from_secs(5),
     )
     .await;
 
     let subs = state.subscriptions.lock().await.clone();
+    assert_eq!(client.subscription_count(), 1);
     assert!(
         subs.iter()
             .any(|s| s.contains("EURUSD-PERP") && s.contains("candle"))
     );
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -411,10 +650,13 @@ async fn test_md_unsubscribe_candles() {
         .unwrap();
 
     wait_until_async(
-        || async { !state.subscriptions.lock().await.is_empty() },
+        || async {
+            !state.subscriptions.lock().await.is_empty() && client.subscription_count() == 1
+        },
         Duration::from_secs(5),
     )
     .await;
+    assert_eq!(client.subscription_count(), 1);
 
     client
         .unsubscribe_candles("EURUSD-PERP", AxCandleWidth::Minutes1)
@@ -422,28 +664,60 @@ async fn test_md_unsubscribe_candles() {
         .unwrap();
 
     wait_until_async(
-        || async { state.subscriptions.lock().await.is_empty() },
+        || async {
+            state.subscriptions.lock().await.is_empty() && client.subscription_count() == 0
+        },
         Duration::from_secs(5),
     )
     .await;
 
     assert!(state.subscriptions.lock().await.is_empty());
+    assert_eq!(client.subscription_count(), 0);
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
 #[tokio::test]
-async fn test_md_subscription_count_starts_at_zero() {
-    let client = AxMdWebSocketClient::new(
-        "ws://localhost:9999/md/ws".to_string(),
+async fn test_md_subscription_count_tracks_confirmed_subscriptions() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let ws_url = format!("ws://{addr}/md/ws");
+
+    let mut client = AxMdWebSocketClient::new(
+        ws_url,
         "test_token".to_string(),
         30,
         TransportBackend::default(),
         None,
     );
 
+    client.connect().await.unwrap();
+    wait_for_connection(&state).await;
+
+    client
+        .subscribe_book_deltas("EURUSD-PERP", AxMarketDataLevel::Level1)
+        .await
+        .unwrap();
+
+    wait_until_async(
+        || async { client.subscription_count() == 1 },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(client.subscription_count(), 1);
+
+    client.unsubscribe_book_deltas("EURUSD-PERP").await.unwrap();
+
+    wait_until_async(
+        || async { client.subscription_count() == 0 },
+        Duration::from_secs(5),
+    )
+    .await;
+
     assert_eq!(client.subscription_count(), 0);
+
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -471,7 +745,7 @@ async fn test_md_ping_pong() {
 
     assert!(state.ping_count.load(Ordering::Relaxed) > 0);
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -510,17 +784,17 @@ async fn test_md_server_disconnect_handling() {
     )
     .await;
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
 #[tokio::test]
-async fn test_md_reconnection_after_disconnect() {
+async fn test_md_reconnect_replays_failed_subscription() {
     let (addr, state) = start_test_server().await.unwrap();
     let ws_url = format!("ws://{addr}/md/ws");
 
     let mut client = AxMdWebSocketClient::new(
-        ws_url.clone(),
+        ws_url,
         "test_token".to_string(),
         30,
         TransportBackend::default(),
@@ -530,8 +804,23 @@ async fn test_md_reconnection_after_disconnect() {
     client.connect().await.unwrap();
     wait_for_connection(&state).await;
 
-    let initial_count = *state.connection_count.lock().await;
-    assert_eq!(initial_count, 1);
+    state
+        .set_subscription_failures(vec!["EURUSD-PERP:LEVEL_2".to_string()])
+        .await;
+    client
+        .subscribe_book_deltas("EURUSD-PERP", AxMarketDataLevel::Level2)
+        .await
+        .unwrap();
+
+    wait_until_async(
+        || async {
+            state.subscription_events().await == vec![("EURUSD-PERP:LEVEL_2".to_string(), false)]
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(client.subscription_count(), 0);
 
     state.disconnect_trigger.store(true, Ordering::Relaxed);
 
@@ -543,21 +832,25 @@ async fn test_md_reconnection_after_disconnect() {
 
     state.reset().await;
 
-    let mut client2 = AxMdWebSocketClient::new(
-        ws_url,
-        "test_token".to_string(),
-        30,
-        TransportBackend::default(),
-        None,
+    wait_until_async(
+        || async { *state.connection_count.lock().await == 1 },
+        Duration::from_secs(10),
+    )
+    .await;
+    wait_until_async(
+        || async { client.subscription_count() == 1 },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert!(client.is_active());
+    assert_eq!(client.subscription_count(), 1);
+    assert_eq!(
+        *state.subscriptions.lock().await,
+        vec!["EURUSD-PERP:LEVEL_2".to_string()]
     );
 
-    client2.connect().await.unwrap();
-    wait_for_connection(&state).await;
-
-    assert!(client2.is_active());
-
-    client.close().await;
-    client2.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -596,7 +889,7 @@ async fn test_md_rapid_subscribe_unsubscribe() {
     )
     .await;
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -684,14 +977,59 @@ async fn test_md_subscribe_quotes_then_book_l2_resubscribes() {
         "expected at least one unsubscribe during level change",
     );
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
 #[tokio::test]
 async fn test_md_subscribe_same_level_is_idempotent() {
-    // Subscribing quotes and then mark_prices leaves effective level at L1;
-    // update_data_subscription should short-circuit without additional traffic.
+    // Mark price and instrument status both require ticker delivery on L1;
+    // update_data_subscription should short-circuit when the payload does not change.
+    let (addr, state) = start_test_server().await.unwrap();
+    let ws_url = format!("ws://{addr}/md/ws");
+
+    let mut client = AxMdWebSocketClient::new(
+        ws_url,
+        "test_token".to_string(),
+        30,
+        TransportBackend::default(),
+        None,
+    );
+    client.connect().await.unwrap();
+    wait_for_connection(&state).await;
+
+    client
+        .subscribe_mark_prices("EURUSD-PERP")
+        .await
+        .expect("Subscribe mark prices failed");
+
+    wait_until_async(
+        || async { !state.subscription_events().await.is_empty() },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let initial_event_count = state.subscription_events().await.len();
+    client
+        .subscribe_instrument_status("EURUSD-PERP")
+        .await
+        .expect("Subscribe instrument status failed");
+
+    // Give the handler a moment to (not) send anything
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let events_after = state.subscription_events().await;
+    assert_eq!(
+        events_after.len(),
+        initial_event_count,
+        "no new subscribe traffic expected, events_after={events_after:?}",
+    );
+
+    client.close().await.expect("close WebSocket client");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_md_subscribe_quotes_then_mark_prices_resubscribes_ticker() {
     let (addr, state) = start_test_server().await.unwrap();
     let ws_url = format!("ws://{addr}/md/ws");
 
@@ -716,22 +1054,46 @@ async fn test_md_subscribe_same_level_is_idempotent() {
     )
     .await;
 
-    let initial_event_count = state.subscription_events().await.len();
     client
         .subscribe_mark_prices("EURUSD-PERP")
         .await
         .expect("Subscribe mark prices failed");
 
-    // Give the handler a moment to (not) send anything
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let events_after = state.subscription_events().await;
-    assert_eq!(
-        events_after.len(),
-        initial_event_count,
-        "no new subscribe traffic expected, events_after={events_after:?}",
+    wait_until_async(
+        || async {
+            state
+                .get_messages()
+                .await
+                .iter()
+                .filter(|m| m.get("type").and_then(|v| v.as_str()) == Some("subscribe"))
+                .count()
+                >= 2
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let messages = state.get_messages().await;
+    let subscribes: Vec<&serde_json::Value> = messages
+        .iter()
+        .filter(|m| m.get("type").and_then(|v| v.as_str()) == Some("subscribe"))
+        .collect();
+
+    assert_eq!(subscribes.len(), 2);
+    assert_eq!(subscribes[0]["level"], "LEVEL_1");
+    assert_eq!(subscribes[0]["trades"], false);
+    assert_eq!(subscribes[0]["ticker"], false);
+    assert_eq!(subscribes[1]["level"], "LEVEL_1");
+    assert_eq!(subscribes[1]["trades"], false);
+    assert_eq!(subscribes[1]["ticker"], true);
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.get("type").and_then(|v| v.as_str()) == Some("unsubscribe")),
+        "expected an unsubscribe during ticker option change",
     );
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -774,14 +1136,12 @@ async fn test_md_unsubscribe_last_data_type_removes_server_subscription() {
 
     assert!(state.subscriptions.lock().await.is_empty());
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
 #[tokio::test]
-async fn test_md_subscribe_same_symbol_different_levels() {
-    // Architect allows only one subscription per symbol - the second subscription
-    // at a different level should be skipped (deduplication)
+async fn test_md_book_level_change_resubscribes() {
     let (addr, state) = start_test_server().await.unwrap();
     let ws_url = format!("ws://{addr}/md/ws");
 
@@ -797,31 +1157,44 @@ async fn test_md_subscribe_same_symbol_different_levels() {
     wait_for_connection(&state).await;
 
     client
-        .subscribe_book_deltas("EURUSD-PERP", AxMarketDataLevel::Level1)
-        .await
-        .unwrap();
-    client
         .subscribe_book_deltas("EURUSD-PERP", AxMarketDataLevel::Level2)
         .await
         .unwrap();
+    client
+        .subscribe_book_deltas("EURUSD-PERP", AxMarketDataLevel::Level3)
+        .await
+        .unwrap();
 
-    // Only one subscription should be sent (L1), L2 should be skipped
     wait_until_async(
-        || async { state.subscriptions.lock().await.len() == 1 },
+        || async {
+            let subscriptions = state.subscriptions.lock().await;
+            subscriptions.len() == 1 && subscriptions[0].contains("LEVEL_3")
+        },
         Duration::from_secs(5),
     )
     .await;
 
     let subs = state.subscriptions.lock().await.clone();
-    assert_eq!(
-        subs.len(),
-        1,
-        "Expected 1 subscription, found {}",
-        subs.len()
-    );
-    assert!(subs.iter().any(|s| s.contains("LEVEL_1")));
+    assert_eq!(subs, vec!["EURUSD-PERP:LEVEL_3"]);
 
-    client.close().await;
+    let messages = state.get_messages().await;
+    let levels = messages
+        .iter()
+        .filter(|message| message.get("type").and_then(|value| value.as_str()) == Some("subscribe"))
+        .filter_map(|message| message.get("level").and_then(|value| value.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(levels, vec!["LEVEL_2", "LEVEL_3"]);
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| {
+                message.get("type").and_then(|value| value.as_str()) == Some("unsubscribe")
+            })
+            .count(),
+        1
+    );
+
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -847,7 +1220,7 @@ async fn test_orders_client_connection() {
     assert!(client.is_active());
     assert_eq!(*state.connection_count.lock().await, 1);
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -905,12 +1278,13 @@ async fn test_orders_client_not_active_before_connect() {
 }
 
 #[rstest]
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_orders_connection_failure_to_invalid_url() {
     let account_id = AccountId::from("AX-001");
     let trader_id = TraderId::from("TESTER-001");
+    let url = "ws://127.0.0.1:9999/invalid".to_string();
     let mut client = AxOrdersWebSocketClient::new(
-        "ws://127.0.0.1:9999/invalid".to_string(),
+        url.clone(),
         account_id,
         trader_id,
         30,
@@ -918,8 +1292,18 @@ async fn test_orders_connection_failure_to_invalid_url() {
         None,
     );
 
-    let result = client.connect("test_token").await;
-    assert!(result.is_err());
+    let err = client.connect("test_token").await.unwrap_err();
+    let message = err.to_string();
+
+    assert!(matches!(err, AxOrdersWsClientError::Transport(_)));
+    assert!(
+        message.starts_with(&format!("Transport error: Failed to connect to {url}: ")),
+        "expected the failure to name the endpoint, was: {message}"
+    );
+    assert!(
+        !message.contains("Connection timeout"),
+        "expected a refused dial rather than a virtual-clock timeout, was: {message}"
+    );
 }
 
 #[rstest]
@@ -944,7 +1328,7 @@ async fn test_orders_close_sets_closed_flag() {
 
     assert!(!client.is_closed());
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 
     assert!(client.is_closed());
 }
@@ -980,11 +1364,9 @@ async fn test_orders_submit_order() {
             instrument.id(),
             ClientOrderId::from("TEST-001"),
             OrderSide::Buy,
-            OrderType::Limit,
             Quantity::from("100"),
             TimeInForce::Gtc,
-            Some(Price::from("50000.00")),
-            None,
+            Price::from("50000.00"),
             false,
         )
         .await
@@ -1009,7 +1391,50 @@ async fn test_orders_submit_order() {
     assert_eq!(place.get("p").and_then(|v| v.as_str()), Some("50000.00"));
     assert_eq!(place.get("tif").and_then(|v| v.as_str()), Some("GTC"));
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_orders_submit_order_missing_cached_instrument_returns_lookup_error() {
+    let account_id = AccountId::from("AX-001");
+    let trader_id = TraderId::from("TESTER-001");
+
+    // No connection or instrument cache: the lookup precedes any network send
+    let client = AxOrdersWebSocketClient::new(
+        "ws://127.0.0.1:9/orders/ws".to_string(),
+        account_id,
+        trader_id,
+        30,
+        TransportBackend::default(),
+        None,
+    );
+
+    let instrument = create_test_instrument("EURUSD-PERP");
+
+    let result = client
+        .submit_order(
+            trader_id,
+            StrategyId::from("TEST-STRATEGY"),
+            instrument.id(),
+            ClientOrderId::from("TEST-001"),
+            OrderSide::Buy,
+            Quantity::from("100"),
+            TimeInForce::Gtc,
+            Price::from("50000.00"),
+            false,
+        )
+        .await;
+
+    let err = result.unwrap_err();
+    assert!(matches!(err, AxOrdersWsClientError::ClientError(_)));
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "Client error: {}",
+            InstrumentLookupError::not_found(instrument.id())
+        )
+    );
 }
 
 #[rstest]
@@ -1039,7 +1464,7 @@ async fn test_orders_cancel_order_rejects_without_venue_order_id() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(state.get_messages().await.is_empty());
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -1085,7 +1510,7 @@ async fn test_orders_cancel_order_with_venue_order_id() {
         .expect("expected a cancel-order message");
     assert_eq!(cancel.get("oid").and_then(|v| v.as_str()), Some("OID-123"));
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -1128,7 +1553,7 @@ async fn test_orders_get_open_orders() {
         Some(request_id)
     );
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -1205,7 +1630,7 @@ async fn test_md_subscription_events_tracking() {
             .any(|(topic, success)| topic.contains("EURUSD-PERP") && *success)
     );
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -1247,7 +1672,7 @@ async fn test_md_subscription_failure_tracking() {
             .any(|(topic, success)| topic.contains("FAIL-SYMBOL") && !*success)
     );
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }
 
 #[rstest]
@@ -1289,8 +1714,8 @@ async fn test_multiple_md_clients() {
 
     assert_eq!(*state.connection_count.lock().await, 2);
 
-    client1.close().await;
-    client2.close().await;
+    client1.close().await.expect("close first client");
+    client2.close().await.expect("close second client");
 }
 
 #[rstest]
@@ -1348,7 +1773,7 @@ async fn test_md_rapid_connect_disconnect() {
 
         assert!(client.is_active());
 
-        client.close().await;
+        client.close().await.expect("close WebSocket client");
 
         wait_until_async(
             || async { *state.connection_count.lock().await == 0 },
@@ -1399,5 +1824,5 @@ async fn test_md_many_subscriptions() {
     let subs = state.subscriptions.lock().await.clone();
     assert!(subs.len() >= symbols.len());
 
-    client.close().await;
+    client.close().await.expect("close WebSocket client");
 }

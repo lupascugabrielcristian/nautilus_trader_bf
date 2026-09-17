@@ -16,7 +16,6 @@
 use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
-    str::FromStr,
 };
 
 use nautilus_core::{
@@ -30,69 +29,13 @@ use nautilus_core::{
         msgpack::{FromMsgPack, ToMsgPack},
     },
 };
-use pyo3::{prelude::*, pyclass::CompareOp, types::PyDict};
+use pyo3::{IntoPyObjectExt, prelude::*, pyclass::CompareOp, types::PyDict};
 use ustr::Ustr;
 
 use crate::{
-    data::status::InstrumentStatus,
-    enums::{FromU16, MarketStatusAction},
-    identifiers::InstrumentId,
+    data::status::InstrumentStatus, enums::MarketStatusAction, identifiers::InstrumentId,
     python::common::PY_MODULE_MODEL,
 };
-
-impl InstrumentStatus {
-    /// Creates a new [`InstrumentStatus`] from a Python object.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `PyErr` if extracting any attribute or converting types fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if converting `action_u16` to `MarketStatusAction` fails.
-    pub fn from_pyobject(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
-        // Fast path: avoid property getters that trigger enum type deadlocks
-        if let Ok(status) = obj.cast::<Self>() {
-            return Ok(*status.borrow());
-        }
-
-        let instrument_id_obj: Bound<'_, PyAny> = obj.getattr("instrument_id")?.extract()?;
-        let instrument_id_str: String = instrument_id_obj.getattr("value")?.extract()?;
-        let instrument_id =
-            InstrumentId::from_str(instrument_id_str.as_str()).map_err(to_pyvalue_err)?;
-
-        let action_obj: Bound<'_, PyAny> = obj.getattr("action")?.extract()?;
-        let action_u16: u16 = action_obj.getattr("value")?.extract()?;
-        let action = MarketStatusAction::from_u16(action_u16).unwrap();
-
-        let ts_event: u64 = obj.getattr("ts_event")?.extract()?;
-        let ts_init: u64 = obj.getattr("ts_init")?.extract()?;
-
-        let reason_str: Option<String> = obj.getattr("reason")?.extract()?;
-        let reason = reason_str.map(|reason_str| Ustr::from(&reason_str));
-
-        let trading_event_str: Option<String> = obj.getattr("trading_event")?.extract()?;
-        let trading_event =
-            trading_event_str.map(|trading_event_str| Ustr::from(&trading_event_str));
-
-        let is_trading: Option<bool> = obj.getattr("is_trading")?.extract()?;
-        let is_quoting: Option<bool> = obj.getattr("is_quoting")?.extract()?;
-        let is_short_sell_restricted: Option<bool> =
-            obj.getattr("is_short_sell_restricted")?.extract()?;
-
-        Ok(Self::new(
-            instrument_id,
-            action,
-            ts_event.into(),
-            ts_init.into(),
-            reason,
-            trading_event,
-            is_trading,
-            is_quoting,
-            is_short_sell_restricted,
-        ))
-    }
-}
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
@@ -229,14 +172,18 @@ impl InstrumentStatus {
 
     /// Return JSON encoded bytes representation of the object.
     #[pyo3(name = "to_json_bytes")]
-    fn py_to_json_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        self.to_json_bytes().unwrap().into_py_any_unwrap(py)
+    fn py_to_json_bytes(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.to_json_bytes()
+            .map_err(to_pyvalue_err)?
+            .into_py_any(py)
     }
 
     /// Return `MsgPack` encoded bytes representation of the object.
     #[pyo3(name = "to_msgpack_bytes")]
-    fn py_to_msgpack_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        self.to_msgpack_bytes().unwrap().into_py_any_unwrap(py)
+    fn py_to_msgpack_bytes(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.to_msgpack_bytes()
+            .map_err(to_pyvalue_err)?
+            .into_py_any(py)
     }
 }
 
@@ -257,7 +204,6 @@ impl InstrumentStatus {
 
 #[cfg(test)]
 mod tests {
-    use nautilus_core::python::IntoPyObjectNautilusExt;
     use pyo3::Python;
     use rstest::rstest;
 
@@ -280,16 +226,6 @@ mod tests {
             let dict = stub_instrument_status.py_to_dict(py).unwrap();
             let parsed = InstrumentStatus::py_from_dict(py, dict).unwrap();
             assert_eq!(parsed, stub_instrument_status);
-        });
-    }
-
-    #[rstest]
-    fn test_from_pyobject(stub_instrument_status: InstrumentStatus) {
-        Python::initialize();
-        Python::attach(|py| {
-            let status_pyobject = stub_instrument_status.into_py_any_unwrap(py);
-            let parsed_status = InstrumentStatus::from_pyobject(status_pyobject.bind(py)).unwrap();
-            assert_eq!(parsed_status, stub_instrument_status);
         });
     }
 }

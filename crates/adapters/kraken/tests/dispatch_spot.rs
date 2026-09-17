@@ -16,8 +16,8 @@
 //! Integration tests for the Kraken Spot v2 WebSocket execution dispatch.
 //!
 //! Validates the two-tier routing contract from
-//! `docs/developer_guide/adapters.md` lines 1232-1296 for the spot product:
-//! tracked orders (registered at submission via `OrderIdentity`) emit typed
+//! `docs/developer_guide/adapters.md#tracked-and-external-execution-updates`:
+//! tracked orders for the spot product (registered at submission via `OrderIdentity`) emit typed
 //! [`OrderEventAny`] events; untracked / external orders fall back to
 //! [`ExecutionReport`] variants.
 
@@ -26,7 +26,7 @@ mod common;
 use std::sync::Arc;
 
 use common::{
-    account_id, drain_events, empty_f64_map, empty_string_map, make_identity, test_emitter,
+    account_id, drain_events, empty_decimal_map, empty_string_map, make_identity, test_emitter,
 };
 use nautilus_common::messages::ExecutionEvent;
 use nautilus_core::{AtomicMap, UnixNanos};
@@ -48,36 +48,27 @@ use nautilus_model::{
     types::{Currency, Price, Quantity},
 };
 use rstest::rstest;
+use rust_decimal_macros::dec;
 
 const SPOT_SYMBOL: &str = "BTC/USDT";
 const SPOT_INSTRUMENT_ID: &str = "BTC/USDT.KRAKEN";
 
 fn make_spot_pair() -> InstrumentAny {
-    InstrumentAny::CurrencyPair(CurrencyPair::new(
-        InstrumentId::from(SPOT_INSTRUMENT_ID),
-        Symbol::from(SPOT_SYMBOL),
-        Currency::BTC(),
-        Currency::from("USDT"),
-        1,
-        8,
-        Price::from("0.1"),
-        Quantity::from("0.00000001"),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        UnixNanos::default(),
-        UnixNanos::default(),
-    ))
+    InstrumentAny::CurrencyPair(
+        CurrencyPair::builder()
+            .instrument_id(InstrumentId::from(SPOT_INSTRUMENT_ID))
+            .raw_symbol(Symbol::from(SPOT_SYMBOL))
+            .base_currency(Currency::BTC())
+            .quote_currency(Currency::from("USDT"))
+            .price_precision(1)
+            .size_precision(8)
+            .price_increment(Price::from("0.1"))
+            .size_increment(Quantity::from("0.00000001"))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap(),
+    )
 }
 
 fn instruments_with(instrument: InstrumentAny) -> Arc<AtomicMap<InstrumentId, InstrumentAny>> {
@@ -99,8 +90,8 @@ fn make_spot_execution(
         symbol: Some(SPOT_SYMBOL.to_string()),
         side: Some(KrakenOrderSide::Buy),
         order_type: Some(KrakenOrderType::Limit),
-        order_qty: Some(0.0001),
-        limit_price: Some(70_000.0),
+        order_qty: Some(dec!(0.0001)),
+        limit_price: Some(dec!(70000)),
         order_status: match exec_type {
             KrakenExecType::Filled => Some(KrakenWsOrderStatus::Filled),
             KrakenExecType::Canceled => Some(KrakenWsOrderStatus::Canceled),
@@ -116,9 +107,9 @@ fn make_spot_execution(
         reduce_only: Some(false),
         timestamp: "2026-04-11T00:00:00.000Z".parse().unwrap(),
         exec_id: exec_id.map(str::to_string),
-        last_qty: exec_id.map(|_| 0.0001),
-        last_price: exec_id.map(|_| 70_000.0),
-        cost: exec_id.map(|_| 7.0),
+        last_qty: exec_id.map(|_| dec!(0.0001)),
+        last_price: exec_id.map(|_| dec!(70000)),
+        cost: exec_id.map(|_| dec!(7)),
         liquidity_ind: exec_id.map(|_| KrakenLiquidityInd::Maker),
         fees: None,
         fee_usd_equiv: None,
@@ -143,7 +134,7 @@ fn test_spot_execution_new_tracked_emits_order_accepted() {
         &emitter,
         &instruments_with(make_spot_pair()),
         &empty_string_map(),
-        &empty_f64_map(),
+        &empty_decimal_map(),
         account_id(),
         UnixNanos::default(),
     );
@@ -178,7 +169,7 @@ fn test_spot_execution_canceled_tracked_synthesizes_accepted_then_canceled() {
         &emitter,
         &instruments_with(make_spot_pair()),
         &empty_string_map(),
-        &empty_f64_map(),
+        &empty_decimal_map(),
         account_id(),
         UnixNanos::default(),
     );
@@ -218,7 +209,7 @@ fn test_spot_execution_trade_tracked_emits_filled() {
         &emitter,
         &instruments_with(make_spot_pair()),
         &empty_string_map(),
-        &empty_f64_map(),
+        &empty_decimal_map(),
         account_id(),
         UnixNanos::default(),
     );
@@ -250,7 +241,7 @@ fn test_spot_execution_trade_external_emits_fill_report() {
         &emitter,
         &instruments_with(make_spot_pair()),
         &empty_string_map(),
-        &empty_f64_map(),
+        &empty_decimal_map(),
         account_id(),
         UnixNanos::default(),
     );
@@ -278,7 +269,7 @@ fn test_spot_execution_dedup_skips_duplicate_trade_id() {
 
     let instruments = instruments_with(make_spot_pair());
     let truncated = empty_string_map();
-    let qty_cache = empty_f64_map();
+    let qty_cache = empty_decimal_map();
 
     let exec = make_spot_execution(
         KrakenExecType::Trade,
@@ -332,7 +323,7 @@ fn test_spot_execution_new_external_emits_status_report() {
         &emitter,
         &instruments_with(make_spot_pair()),
         &empty_string_map(),
-        &empty_f64_map(),
+        &empty_decimal_map(),
         account_id(),
         UnixNanos::default(),
     );
@@ -366,7 +357,7 @@ fn test_spot_execution_triggered_emits_order_triggered() {
         &emitter,
         &instruments_with(make_spot_pair()),
         &empty_string_map(),
-        &empty_f64_map(),
+        &empty_decimal_map(),
         account_id(),
         UnixNanos::default(),
     );
@@ -407,7 +398,7 @@ fn test_spot_execution_amended_emits_order_updated() {
         &emitter,
         &instruments,
         &empty_string_map(),
-        &empty_f64_map(),
+        &empty_decimal_map(),
         account_id(),
         UnixNanos::default(),
     );
@@ -426,7 +417,7 @@ fn test_spot_execution_amended_emits_order_updated() {
         &emitter,
         &instruments,
         &empty_string_map(),
-        &empty_f64_map(),
+        &empty_decimal_map(),
         account_id(),
         UnixNanos::default(),
     );
@@ -458,7 +449,7 @@ fn test_spot_execution_filled_marker_cleans_up_state() {
         &emitter,
         &instruments,
         &empty_string_map(),
-        &empty_f64_map(),
+        &empty_decimal_map(),
         account_id(),
         UnixNanos::default(),
     );
@@ -479,7 +470,7 @@ fn test_spot_execution_filled_marker_cleans_up_state() {
         &emitter,
         &instruments,
         &empty_string_map(),
-        &empty_f64_map(),
+        &empty_decimal_map(),
         account_id(),
         UnixNanos::default(),
     );
@@ -507,7 +498,7 @@ fn test_spot_execution_stale_after_terminal_is_skipped() {
         &emitter,
         &instruments_with(make_spot_pair()),
         &empty_string_map(),
-        &empty_f64_map(),
+        &empty_decimal_map(),
         account_id(),
         UnixNanos::default(),
     );
@@ -541,7 +532,7 @@ fn test_spot_filled_with_fill_payload_defers_cleanup_until_after_fill() {
         &emitter,
         &instruments_with(make_spot_pair()),
         &empty_string_map(),
-        &empty_f64_map(),
+        &empty_decimal_map(),
         account_id(),
         UnixNanos::default(),
     );
@@ -587,7 +578,7 @@ fn test_spot_restated_emits_order_updated() {
         &emitter,
         &instruments,
         &empty_string_map(),
-        &empty_f64_map(),
+        &empty_decimal_map(),
         account_id(),
         UnixNanos::default(),
     );
@@ -606,7 +597,7 @@ fn test_spot_restated_emits_order_updated() {
         &emitter,
         &instruments,
         &empty_string_map(),
-        &empty_f64_map(),
+        &empty_decimal_map(),
         account_id(),
         UnixNanos::default(),
     );
@@ -622,7 +613,7 @@ fn test_spot_restated_emits_order_updated() {
 /// Builds a delta-style execution frame matching what Kraken sends as a
 /// follow-up to `pending_new` (and for `amended` / `restated` / `status`):
 /// only `order_id`, `exec_type`, `order_status`, and `timestamp` are
-/// populated — every other field, including `symbol`, is `None`.
+/// populated - every other field, including `symbol`, is `None`.
 fn make_spot_execution_delta(
     exec_type: KrakenExecType,
     venue_order_id: &str,
@@ -682,7 +673,7 @@ fn test_spot_pending_new_then_symbolless_delta_resolves_via_cache(
         &emitter,
         &instruments,
         &empty_string_map(),
-        &empty_f64_map(),
+        &empty_decimal_map(),
         account_id(),
         UnixNanos::default(),
     );
@@ -695,7 +686,7 @@ fn test_spot_pending_new_then_symbolless_delta_resolves_via_cache(
         &emitter,
         &instruments,
         &empty_string_map(),
-        &empty_f64_map(),
+        &empty_decimal_map(),
         account_id(),
         UnixNanos::default(),
     );
@@ -728,7 +719,7 @@ fn test_spot_delta_without_cached_symbol_is_dropped() {
         &emitter,
         &instruments,
         &empty_string_map(),
-        &empty_f64_map(),
+        &empty_decimal_map(),
         account_id(),
         UnixNanos::default(),
     );
@@ -765,7 +756,7 @@ fn test_spot_tracked_pending_new_seeds_caches_no_event_yet() {
         &emitter,
         &instruments,
         &empty_string_map(),
-        &empty_f64_map(),
+        &empty_decimal_map(),
         account_id(),
         UnixNanos::default(),
     );
@@ -811,7 +802,7 @@ fn test_spot_tracked_delta_new_without_cl_ord_id_emits_order_accepted() {
         &emitter,
         &instruments,
         &empty_string_map(),
-        &empty_f64_map(),
+        &empty_decimal_map(),
         account_id(),
         UnixNanos::default(),
     );
@@ -828,7 +819,7 @@ fn test_spot_tracked_delta_new_without_cl_ord_id_emits_order_accepted() {
         &emitter,
         &instruments,
         &empty_string_map(),
-        &empty_f64_map(),
+        &empty_decimal_map(),
         account_id(),
         UnixNanos::default(),
     );
@@ -870,7 +861,7 @@ fn test_spot_terminal_eviction_runs_on_missing_instrument_early_return() {
         &emitter,
         &empty_instruments,
         &empty_string_map(),
-        &empty_f64_map(),
+        &empty_decimal_map(),
         account_id(),
         UnixNanos::default(),
     );
@@ -897,7 +888,7 @@ fn test_spot_terminal_exec_type_evicts_symbol_cache() {
         &emitter,
         &instruments,
         &empty_string_map(),
-        &empty_f64_map(),
+        &empty_decimal_map(),
         account_id(),
         UnixNanos::default(),
     );
@@ -915,7 +906,7 @@ fn test_spot_terminal_exec_type_evicts_symbol_cache() {
         &emitter,
         &instruments,
         &empty_string_map(),
-        &empty_f64_map(),
+        &empty_decimal_map(),
         account_id(),
         UnixNanos::default(),
     );

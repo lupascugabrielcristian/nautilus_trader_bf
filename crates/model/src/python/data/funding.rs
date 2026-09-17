@@ -30,6 +30,7 @@ use nautilus_core::{
     },
 };
 use pyo3::{
+    IntoPyObjectExt,
     prelude::*,
     pyclass::CompareOp,
     types::{PyString, PyTuple},
@@ -145,7 +146,7 @@ impl FundingRateUpdate {
     }
 
     #[pyo3(name = "to_dict")]
-    fn py_to_dict(&self, py: Python<'_>) -> Py<PyAny> {
+    fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let mut dict = HashMap::new();
         dict.insert(
             "type".to_string(),
@@ -178,7 +179,7 @@ impl FundingRateUpdate {
             "ts_init".to_string(),
             self.ts_init.as_u64().into_py_any_unwrap(py),
         );
-        dict.into_py_any_unwrap(py)
+        dict.into_py_any(py)
     }
 
     #[staticmethod]
@@ -281,7 +282,7 @@ impl FundingRateUpdate {
         Ok(())
     }
 
-    fn __getstate__(&self, py: Python) -> Py<PyAny> {
+    fn __getstate__(&self, py: Python) -> PyResult<Py<PyAny>> {
         (
             self.instrument_id.to_string(),
             self.rate.to_string(),
@@ -290,13 +291,13 @@ impl FundingRateUpdate {
             self.ts_event.as_u64(),
             self.ts_init.as_u64(),
         )
-            .into_py_any_unwrap(py)
+            .into_py_any(py)
     }
 
     fn __reduce__(&self, py: Python) -> PyResult<Py<PyAny>> {
         let safe_constructor = py.get_type::<Self>().getattr("_safe_constructor")?;
-        let state = self.__getstate__(py);
-        Ok((safe_constructor, PyTuple::empty(py), state).into_py_any_unwrap(py))
+        let state = self.__getstate__(py)?;
+        (safe_constructor, PyTuple::empty(py), state).into_py_any(py)
     }
 
     #[staticmethod]
@@ -325,39 +326,6 @@ impl FundingRateUpdate {
     #[staticmethod]
     fn py_from_msgpack(data: &[u8]) -> PyResult<Self> {
         Self::from_msgpack_bytes(data).map_err(to_pyvalue_err)
-    }
-}
-
-impl FundingRateUpdate {
-    /// Creates a new [`FundingRateUpdate`] from a Python object.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `PyErr` if extracting any attribute or converting types fails.
-    pub fn from_pyobject(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let instrument_id_obj: Bound<'_, PyAny> = obj.getattr("instrument_id")?.extract()?;
-        let instrument_id_str: String = instrument_id_obj.getattr("value")?.extract()?;
-        let instrument_id =
-            InstrumentId::from_str(instrument_id_str.as_str()).map_err(to_pyvalue_err)?;
-
-        let rate: Decimal = obj.getattr("rate")?.extract()?;
-        let ts_event: u64 = obj.getattr("ts_event")?.extract()?;
-        let ts_init: u64 = obj.getattr("ts_init")?.extract()?;
-
-        let interval: Option<u16> = obj.getattr("interval").ok().and_then(|x| x.extract().ok());
-        let next_funding_ns: Option<u64> = obj
-            .getattr("next_funding_ns")
-            .ok()
-            .and_then(|x| x.extract().ok());
-
-        Ok(Self::new(
-            instrument_id,
-            rate,
-            interval,
-            next_funding_ns.map(UnixNanos::from),
-            UnixNanos::from(ts_event),
-            UnixNanos::from(ts_init),
-        ))
     }
 }
 

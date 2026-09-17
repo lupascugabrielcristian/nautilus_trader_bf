@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 
 #[allow(unused_imports)] // Used in template pattern for returns conversion
 use nautilus_core::UnixNanos;
+use nautilus_model::position::Position;
 use pyo3::prelude::*;
 
 use crate::{statistic::PortfolioStatistic, statistics::loser_max::MaxLoser};
@@ -24,6 +25,10 @@ use crate::{statistic::PortfolioStatistic, statistics::loser_max::MaxLoser};
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl MaxLoser {
+    /// Calculates the largest losing trade (most negative PnL) from realized PnLs.
+    ///
+    /// Only negative PnLs count as losers. Returns `NaN` for an empty series or
+    /// when there are no losing trades.
     #[new]
     fn py_new() -> Self {
         Self {}
@@ -52,7 +57,7 @@ impl MaxLoser {
     }
 
     #[pyo3(name = "calculate_from_positions")]
-    fn py_calculate_from_positions(&mut self, _positions: Vec<Py<PyAny>>) -> Option<f64> {
+    fn py_calculate_from_positions(&mut self, _positions: Vec<Position>) -> Option<f64> {
         None
     }
 }

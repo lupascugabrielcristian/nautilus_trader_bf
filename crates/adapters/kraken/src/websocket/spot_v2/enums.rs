@@ -33,19 +33,6 @@ use strum::{AsRefStr, Display, EnumString, FromRepr};
     Serialize,
     Deserialize,
 )]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.kraken",
-        eq,
-        eq_int,
-        from_py_object
-    )
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.kraken")
-)]
 #[serde(rename_all = "lowercase")]
 #[strum(ascii_case_insensitive, serialize_all = "lowercase")]
 pub enum KrakenWsMethod {
@@ -80,19 +67,6 @@ pub enum KrakenWsMethod {
     Hash,
     Serialize,
     Deserialize,
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.kraken",
-        eq,
-        eq_int,
-        from_py_object
-    )
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.kraken")
 )]
 #[serde(rename_all = "lowercase")]
 #[strum(ascii_case_insensitive, serialize_all = "lowercase")]
@@ -135,19 +109,6 @@ pub enum KrakenWsChannel {
     Hash,
     Serialize,
     Deserialize,
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.kraken",
-        eq,
-        eq_int,
-        from_py_object
-    )
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.kraken")
 )]
 #[serde(rename_all = "lowercase")]
 #[strum(ascii_case_insensitive, serialize_all = "lowercase")]

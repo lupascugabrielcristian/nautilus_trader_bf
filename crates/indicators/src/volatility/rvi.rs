@@ -16,7 +16,7 @@
 use std::fmt::{Debug, Display};
 
 use arraydeque::{ArrayDeque, Wrapping};
-use nautilus_model::data::Bar;
+use nautilus_model::data::{Bar, QuoteTick, TradeTick};
 
 use crate::{
     average::{MovingAverageFactory, MovingAverageType},
@@ -28,7 +28,7 @@ use crate::{
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.indicators", unsendable)
+    pyo3::pyclass(module = "nautilus_trader.indicators", unsendable)
 )]
 #[cfg_attr(
     feature = "python",
@@ -74,6 +74,12 @@ impl Indicator for RelativeVolatilityIndex {
     fn initialized(&self) -> bool {
         self.initialized
     }
+
+    fn handle_quote(&mut self, _quote: &QuoteTick) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn handle_trade(&mut self, _trade: &TradeTick) {}
 
     fn handle_bar(&mut self, bar: &Bar) {
         self.update_raw((&bar.close).into());
@@ -131,6 +137,13 @@ impl RelativeVolatilityIndex {
     }
 
     pub fn update_raw(&mut self, close: f64) {
+        // Bound the price window to `period`. The fixed-capacity deque otherwise retains
+        // up to 1024 prices, so the standard deviation below is computed over far
+        // more than `period` observations while using a `period`-window mean.
+        if self.prices.len() == self.period {
+            self.prices.pop_front();
+        }
+
         self.prices.push_back(close);
         self.ma.update_raw(close);
 
@@ -220,6 +233,20 @@ mod tests {
         }
 
         assert!(rvi_10.initialized());
+        assert_eq!(rvi_10.value, 10.0);
+    }
+
+    #[rstest]
+    fn test_prices_window_bounded_to_period(mut rvi_10: RelativeVolatilityIndex) {
+        // Regression: the price window must stay bounded to `period`. Previously the
+        // fixed-capacity deque grew to its 1024 capacity, so the standard deviation was
+        // computed over far more than `period` prices while using a `period`-window mean.
+        for i in 0..50 {
+            rvi_10.update_raw(100.0 + f64::from(i));
+        }
+
+        assert!(rvi_10.initialized());
+        assert_eq!(rvi_10.prices.len(), 10);
         assert_eq!(rvi_10.value, 10.0);
     }
 

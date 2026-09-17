@@ -20,7 +20,7 @@ use std::{
 
 use nautilus_core::{
     from_pydict,
-    python::{IntoPyObjectNautilusExt, serialization::from_dict_pyo3, to_pyvalue_err},
+    python::{IntoPyObjectNautilusExt, to_pyvalue_err},
 };
 use pyo3::{basic::CompareOp, prelude::*, types::PyDict};
 use rust_decimal::Decimal;
@@ -39,7 +39,7 @@ impl FuturesContract {
     /// Represents a generic deliverable futures contract instrument.
     #[expect(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature = (instrument_id, raw_symbol, asset_class, underlying, activation_ns, expiration_ns, currency, price_precision, price_increment, multiplier, lot_size, ts_event, ts_init, max_quantity=None, min_quantity=None, max_price=None, min_price=None, margin_init=None, margin_maint=None, maker_fee=None, taker_fee=None, exchange=None, info=None))]
+    #[pyo3(signature = (instrument_id, raw_symbol, asset_class, underlying, activation_ns, expiration_ns, currency, price_precision, price_increment, multiplier, lot_size, ts_event, ts_init, max_quantity=None, min_quantity=None, max_price=None, min_price=None, margin_init=None, margin_maint=None, maker_fee=None, taker_fee=None, exchange=None, tick_scheme=None, info=None))]
     fn py_new(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
@@ -63,6 +63,7 @@ impl FuturesContract {
         maker_fee: Option<Decimal>,
         taker_fee: Option<Decimal>,
         exchange: Option<String>,
+        tick_scheme: Option<String>,
         info: Option<Py<PyDict>>,
     ) -> PyResult<Self> {
         // Convert Python dict to Params
@@ -72,32 +73,33 @@ impl FuturesContract {
             None
         };
 
-        Self::new_checked(
-            instrument_id,
-            raw_symbol,
-            asset_class,
-            exchange.map(|x| Ustr::from(&x)),
-            underlying.into(),
-            activation_ns.into(),
-            expiration_ns.into(),
-            currency,
-            price_precision,
-            price_increment,
-            multiplier,
-            lot_size,
-            max_quantity,
-            min_quantity,
-            max_price,
-            min_price,
-            margin_init,
-            margin_maint,
-            maker_fee,
-            taker_fee,
-            info_map,
-            ts_event.into(),
-            ts_init.into(),
-        )
-        .map_err(to_pyvalue_err)
+        Self::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(raw_symbol)
+            .asset_class(asset_class)
+            .maybe_exchange(exchange.map(|x| Ustr::from(&x)))
+            .underlying(underlying.into())
+            .activation_ns(activation_ns.into())
+            .expiration_ns(expiration_ns.into())
+            .currency(currency)
+            .price_precision(price_precision)
+            .price_increment(price_increment)
+            .multiplier(multiplier)
+            .lot_size(lot_size)
+            .maybe_max_quantity(max_quantity)
+            .maybe_min_quantity(min_quantity)
+            .maybe_max_price(max_price)
+            .maybe_min_price(min_price)
+            .maybe_margin_init(margin_init)
+            .maybe_margin_maint(margin_maint)
+            .maybe_maker_fee(maker_fee)
+            .maybe_taker_fee(taker_fee)
+            .maybe_tick_scheme(tick_scheme.map(|name| ustr::Ustr::from(name.as_str())))
+            .maybe_info(info_map)
+            .ts_event(ts_event.into())
+            .ts_init(ts_init.into())
+            .build()
+            .map_err(to_pyvalue_err)
     }
 
     fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
@@ -286,7 +288,7 @@ impl FuturesContract {
     #[staticmethod]
     #[pyo3(name = "from_dict")]
     fn py_from_dict(py: Python<'_>, values: Py<PyDict>) -> PyResult<Self> {
-        from_dict_pyo3(py, values)
+        crate::python::instruments::from_dict_instrument_pyo3(py, values)
     }
 
     #[pyo3(name = "to_dict")]
@@ -350,6 +352,10 @@ impl FuturesContract {
             Some(value) => dict.set_item("exchange", value.to_string())?,
             None => dict.set_item("exchange", py.None())?,
         }
+        dict.set_item(
+            "tick_scheme",
+            crate::python::instruments::tick_scheme_to_py(self),
+        )?;
         Ok(dict.into())
     }
 }

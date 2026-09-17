@@ -16,10 +16,12 @@
 use std::str::FromStr;
 
 use nautilus_core::{
-    UUID4,
+    Params, UUID4,
     python::{
         IntoPyObjectNautilusExt,
+        params::params_to_pydict,
         parsing::{get_required, get_required_list, get_required_parsed, get_required_string},
+        to_pyvalue_err,
     },
 };
 use pyo3::{basic::CompareOp, prelude::*, types::PyDict};
@@ -31,13 +33,18 @@ use crate::{
     types::{AccountBalance, Currency, MarginBalance},
 };
 
-#[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
+#[pymethods]
 impl AccountState {
     /// Represents an event which includes information on the state of the account.
+    ///
+    /// The optional `info` bag carries venue-specific account data that does not map
+    /// to the typed `balances` and `margins` fields, such as wallet balance,
+    /// available balance, or an account summary, so consumers can read the venue
+    /// context that accompanied a given snapshot.
     #[expect(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature = (account_id, account_type, balances, margins, is_reported, event_id, ts_event, ts_init, base_currency=None))]
+    #[pyo3(signature = (account_id, account_type, balances, margins, is_reported, event_id, ts_event, ts_init, base_currency=None, info=None))]
     fn py_new(
         account_id: AccountId,
         account_type: AccountType,
@@ -48,8 +55,13 @@ impl AccountState {
         ts_event: u64,
         ts_init: u64,
         base_currency: Option<Currency>,
-    ) -> Self {
-        Self::new(
+        info: Option<pyo3::Py<PyDict>>,
+    ) -> PyResult<Self> {
+        let info_params = info
+            .map(|dict| Python::attach(|py| nautilus_core::from_pydict(py, &dict)))
+            .transpose()?
+            .flatten();
+        Ok(Self::new(
             account_id,
             account_type,
             balances,
@@ -60,6 +72,7 @@ impl AccountState {
             ts_init.into(),
             base_currency,
         )
+        .with_info(info_params))
     }
 
     #[getter]
@@ -87,6 +100,39 @@ impl AccountState {
         self.margins.clone()
     }
 
+    #[getter]
+    #[pyo3(name = "is_reported")]
+    fn py_is_reported(&self) -> bool {
+        self.is_reported
+    }
+
+    #[getter]
+    #[pyo3(name = "event_id")]
+    fn py_event_id(&self) -> UUID4 {
+        self.event_id
+    }
+
+    #[getter]
+    #[pyo3(name = "ts_event")]
+    fn py_ts_event(&self) -> u64 {
+        self.ts_event.as_u64()
+    }
+
+    #[getter]
+    #[pyo3(name = "ts_init")]
+    fn py_ts_init(&self) -> u64 {
+        self.ts_init.as_u64()
+    }
+
+    #[getter]
+    #[pyo3(name = "info")]
+    fn py_info(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        match &self.info {
+            Some(params) => params_to_pydict(py, params),
+            None => Ok(PyDict::new(py).unbind()),
+        }
+    }
+
     fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
         match op {
             CompareOp::Eq => self.eq(other).into_py_any_unwrap(py),
@@ -109,12 +155,19 @@ impl AccountState {
     /// # Errors
     ///
     /// Returns a `PyErr` if any required field is missing or type conversion fails.
-    ///
     #[pyo3(name = "from_dict")]
     pub fn py_from_dict(values: &Bound<'_, PyDict>) -> PyResult<Self> {
         let account_id = get_required_string(values, "account_id")?;
         let _account_type = get_required_string(values, "account_type")?;
-        let _base_currency = get_required_string(values, "base_currency")?;
+        let base_currency_str = get_required_string(values, "base_currency")?;
+        let base_currency = if base_currency_str == "None" {
+            None
+        } else {
+            Some(
+                Currency::from_str(&base_currency_str)
+                    .map_err(|e| to_pyvalue_err(format!("Failed to parse 'base_currency': {e}")))?,
+            )
+        };
         let balances_list = get_required_list(values, "balances")?;
         let balances: Vec<AccountBalance> = balances_list
             .iter()
@@ -135,6 +188,17 @@ impl AccountState {
         let _event_id = get_required_string(values, "event_id")?;
         let ts_event = get_required::<u64>(values, "ts_event")?;
         let ts_init = get_required::<u64>(values, "ts_init")?;
+        let info: Option<Params> = match values.get_item("info")? {
+            Some(item) if !item.is_none() => {
+                let info_dict: Bound<'_, PyDict> = item.extract()?;
+                if info_dict.is_empty() {
+                    None
+                } else {
+                    nautilus_core::from_pydict(info_dict.py(), &info_dict.clone().unbind())?
+                }
+            }
+            _ => None,
+        };
         let account = Self::new(
             AccountId::from(account_id.as_str()),
             get_required_parsed(values, "account_type", |s| {
@@ -146,10 +210,9 @@ impl AccountState {
             get_required_parsed(values, "event_id", |s| UUID4::from_str(&s))?,
             ts_event.into(),
             ts_init.into(),
-            Some(get_required_parsed(values, "base_currency", |s| {
-                Currency::from_str(&s).map_err(|e| e.to_string())
-            })?),
-        );
+            base_currency,
+        )
+        .with_info(info);
         Ok(account)
     }
 
@@ -173,7 +236,10 @@ impl AccountState {
         dict.set_item("margins", margins_dict?)?;
         dict.set_item("reported", self.is_reported)?;
         dict.set_item("event_id", self.event_id.to_string())?;
-        dict.set_item("info", PyDict::new(py))?;
+        match &self.info {
+            Some(params) => dict.set_item("info", params_to_pydict(py, params)?)?,
+            None => dict.set_item("info", PyDict::new(py))?,
+        }
         dict.set_item("ts_event", self.ts_event.as_u64())?;
         dict.set_item("ts_init", self.ts_init.as_u64())?;
 

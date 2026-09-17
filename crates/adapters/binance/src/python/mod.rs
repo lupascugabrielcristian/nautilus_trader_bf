@@ -21,6 +21,9 @@ pub mod enums;
 pub mod factories;
 pub mod types;
 
+mod data;
+mod instruments;
+
 use nautilus_common::factories::{ClientConfig, DataClientFactory, ExecutionClientFactory};
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
 use nautilus_model::data::ensure_rust_extractor_registered;
@@ -31,14 +34,21 @@ use pyo3::prelude::*;
 use crate::{
     common::{
         bar::BinanceBar,
-        consts::{BINANCE, BINANCE_NAUTILUS_FUTURES_BROKER_ID, BINANCE_NAUTILUS_SPOT_BROKER_ID},
+        consts::{
+            BINANCE, BINANCE_CLIENT_ID, BINANCE_NAUTILUS_FUTURES_BROKER_ID,
+            BINANCE_NAUTILUS_SPOT_BROKER_ID, BINANCE_VENUE,
+        },
         encoder::decode_broker_id,
         enums::{BinanceEnvironment, BinanceMarginType, BinancePositionSide, BinanceProductType},
     },
-    config::{BinanceDataClientConfig, BinanceExecClientConfig, BinanceSpotMarketDataMode},
+    config::{
+        BinanceDataClientConfig, BinanceExecutionClientConfig, BinanceInstrumentProviderConfig,
+        BinanceSpotMarketDataMode,
+    },
     data_types::{
-        BinanceFuturesLiquidation, BinanceFuturesOpenInterest, BinanceFuturesOpenInterestHist,
-        BinanceFuturesOpenInterestHistPoint, BinanceFuturesTicker, register_binance_custom_data,
+        BinanceFuturesLiquidation, BinanceFuturesMarkPriceUpdate, BinanceFuturesOpenInterest,
+        BinanceFuturesOpenInterestHist, BinanceFuturesOpenInterestHistPoint, BinanceFuturesTicker,
+        BinanceSpotTicker, register_binance_custom_data,
     },
     factories::{BinanceDataClientFactory, BinanceExecutionClientFactory},
 };
@@ -87,10 +97,10 @@ fn extract_binance_exec_config(
     py: Python<'_>,
     config: Py<PyAny>,
 ) -> PyResult<Box<dyn ClientConfig>> {
-    match config.extract::<BinanceExecClientConfig>(py) {
+    match config.extract::<BinanceExecutionClientConfig>(py) {
         Ok(c) => Ok(Box::new(c)),
         Err(e) => Err(to_pyvalue_err(format!(
-            "Failed to extract BinanceExecClientConfig: {e}"
+            "Failed to extract BinanceExecutionClientConfig: {e}"
         ))),
     }
 }
@@ -103,6 +113,7 @@ fn extract_binance_exec_config(
 ///
 /// Strings without the broker prefix are returned unchanged.
 #[pyfunction]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.adapters.binance")]
 #[pyo3(name = "decode_binance_spot_client_order_id")]
 fn py_decode_binance_spot_client_order_id(encoded: &str) -> String {
     decode_broker_id(encoded, BINANCE_NAUTILUS_SPOT_BROKER_ID)
@@ -116,6 +127,7 @@ fn py_decode_binance_spot_client_order_id(encoded: &str) -> String {
 ///
 /// Strings without the broker prefix are returned unchanged.
 #[pyfunction]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.adapters.binance")]
 #[pyo3(name = "decode_binance_futures_client_order_id")]
 fn py_decode_binance_futures_client_order_id(encoded: &str) -> String {
     decode_broker_id(encoded, BINANCE_NAUTILUS_FUTURES_BROKER_ID)
@@ -123,13 +135,16 @@ fn py_decode_binance_futures_client_order_id(encoded: &str) -> String {
 
 /// Binance adapter Python module.
 ///
-/// Loaded as `nautilus_pyo3.binance`.
+/// Exposed through `nautilus_trader.adapters.binance`.
 ///
 /// # Errors
 ///
 /// Returns an error if module initialization fails.
 #[pymodule]
 pub fn binance(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add(stringify!(BINANCE), BINANCE)?;
+    m.add(stringify!(BINANCE_CLIENT_ID), *BINANCE_CLIENT_ID)?;
+    m.add(stringify!(BINANCE_VENUE), *BINANCE_VENUE)?;
     m.add_class::<BinanceProductType>()?;
     m.add_class::<BinanceEnvironment>()?;
     m.add_class::<BinanceMarginType>()?;
@@ -137,6 +152,8 @@ pub fn binance(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<BinanceBar>()?;
     m.add_class::<BinanceFuturesLiquidation>()?;
     m.add_class::<BinanceFuturesTicker>()?;
+    m.add_class::<BinanceSpotTicker>()?;
+    m.add_class::<BinanceFuturesMarkPriceUpdate>()?;
     m.add_class::<BinanceFuturesOpenInterest>()?;
     m.add_class::<BinanceFuturesOpenInterestHistPoint>()?;
     m.add_class::<BinanceFuturesOpenInterestHist>()?;
@@ -150,13 +167,22 @@ pub fn binance(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_class::<BinanceDataClientConfig>()?;
-    m.add_class::<BinanceExecClientConfig>()?;
-    m.add_class::<BinanceSpotMarketDataMode>()?;
     m.add_class::<BinanceDataClientFactory>()?;
+    m.add_class::<BinanceExecutionClientConfig>()?;
     m.add_class::<BinanceExecutionClientFactory>()?;
+    m.add_class::<BinanceInstrumentProviderConfig>()?;
+    m.add_class::<BinanceSpotMarketDataMode>()?;
     m.add_function(wrap_pyfunction!(py_decode_binance_spot_client_order_id, m)?)?;
     m.add_function(wrap_pyfunction!(
         py_decode_binance_futures_client_order_id,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        instruments::py_load_binance_instruments,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        data::py_load_binance_order_book_deltas,
         m
     )?)?;
 
@@ -166,6 +192,8 @@ pub fn binance(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     register_binance_custom_data();
     let _result = ensure_rust_extractor_registered::<BinanceFuturesLiquidation>();
     let _result = ensure_rust_extractor_registered::<BinanceFuturesTicker>();
+    let _result = ensure_rust_extractor_registered::<BinanceSpotTicker>();
+    let _result = ensure_rust_extractor_registered::<BinanceFuturesMarkPriceUpdate>();
     let _result = ensure_rust_extractor_registered::<BinanceFuturesOpenInterest>();
     let _result = ensure_rust_extractor_registered::<BinanceFuturesOpenInterestHist>();
 
@@ -197,7 +225,7 @@ pub fn binance(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     }
 
     if let Err(e) = registry.register_config_extractor(
-        "BinanceExecClientConfig".to_string(),
+        "BinanceExecutionClientConfig".to_string(),
         extract_binance_exec_config,
     ) {
         return Err(to_pyruntime_err(format!(

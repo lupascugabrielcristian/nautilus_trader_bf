@@ -16,7 +16,7 @@
 use std::fmt::Display;
 
 use arraydeque::{ArrayDeque, Wrapping};
-use nautilus_model::data::Bar;
+use nautilus_model::data::{Bar, QuoteTick, TradeTick};
 
 use crate::indicator::Indicator;
 
@@ -26,7 +26,7 @@ const MAX_PERIOD: usize = 1_024;
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.indicators")
+    pyo3::pyclass(module = "nautilus_trader.indicators")
 )]
 #[cfg_attr(
     feature = "python",
@@ -59,6 +59,12 @@ impl Indicator for RateOfChange {
     fn initialized(&self) -> bool {
         self.initialized
     }
+
+    fn handle_quote(&mut self, _quote: &QuoteTick) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn handle_trade(&mut self, _trade: &TradeTick) {}
 
     fn handle_bar(&mut self, bar: &Bar) {
         self.update_raw((&bar.close).into());
@@ -97,6 +103,9 @@ impl RateOfChange {
     }
 
     pub fn update_raw(&mut self, price: f64) {
+        if self.prices.len() == self.period {
+            let _ = self.prices.pop_front();
+        }
         let _ = self.prices.push_back(price);
 
         if !self.initialized {
@@ -109,7 +118,7 @@ impl RateOfChange {
 
         if let Some(first) = self.prices.front() {
             if self.use_log {
-                self.value = (price / first).log10();
+                self.value = (price / first).ln();
             } else {
                 self.value = (price - first) / first;
             }
@@ -122,7 +131,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::stubs::roc_10;
+    use crate::{stubs::roc_10, testing::assert_approx_equal};
 
     #[rstest]
     fn test_name_returns_expected_string(roc_10: RateOfChange) {
@@ -157,7 +166,7 @@ mod tests {
         }
 
         assert!(roc_10.initialized());
-        assert_eq!(roc_10.value, 1.081_081_881_387_059);
+        assert_approx_equal(roc_10.value, 0.654598510443);
     }
 
     #[rstest]
@@ -171,5 +180,18 @@ mod tests {
         assert!(!roc_10.initialized());
         assert!(!roc_10.has_inputs);
         assert_eq!(roc_10.value, 0.0);
+    }
+
+    #[rstest]
+    fn test_value_respects_period_window() {
+        let mut roc = RateOfChange::new(3, Some(false));
+
+        roc.update_raw(100.0);
+        roc.update_raw(1.0);
+        roc.update_raw(2.0);
+        roc.update_raw(3.0);
+        roc.update_raw(4.0);
+
+        assert_eq!(roc.value, 1.0);
     }
 }

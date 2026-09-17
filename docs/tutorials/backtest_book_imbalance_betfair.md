@@ -1,7 +1,7 @@
 # Book Imbalance Backtest (Betfair)
 
 :::note
-This is a **Rust-only** v2 system tutorial. It drives the Rust `BacktestEngine`
+This is a **Rust-only** system tutorial. It drives the Rust `BacktestEngine`
 directly with raw Betfair streaming data, bypassing the Python and Parquet paths.
 :::
 
@@ -76,7 +76,7 @@ flowchart LR
 Place the file at:
 
 ```
-tests/test_data/local/betfair/1.253378068.gz
+test_data/local/betfair/1.253378068.gz
 ```
 
 This path is gitignored and not shipped with the repository. The bundled
@@ -98,25 +98,25 @@ let items = loader.load(&filepath)?;
 
 The loader returns a `Vec<BetfairDataItem>`:
 
-| Variant             | Description                                     | Maps to `Data` enum?       |
-|:--------------------|:------------------------------------------------|:---------------------------|
-| `Instrument`        | Runner definition from market definition.       | No (added separately)      |
-| `Status`            | Market status transition (PreOpen, Trading...). | No (`Data` has no variant) |
-| `Deltas`            | Order book snapshot or delta update.            | Yes, `Data::Deltas`        |
-| `Trade`             | Incremental trade tick from cumulative volumes. | Yes, `Data::Trade`         |
-| `Ticker`            | Last traded price, volume, BSP near/far.        | -                          |
-| `StartingPrice`     | Betfair Starting Price for a runner.            | -                          |
-| `BspBookDelta`      | BSP-specific book delta.                        | -                          |
+| Variant             | Description                                     | Maps to `Data` enum?         |
+| :------------------ | :---------------------------------------------- | :--------------------------- |
+| `Instrument`        | Runner definition from market definition.       | No (added separately)        |
+| `Status`            | Market status transition (PreOpen, Trading...). | No (`Data` has no variant)   |
+| `Deltas`            | Order book snapshot or delta update.            | Yes, `Data::Deltas`          |
+| `Trade`             | Incremental trade tick from cumulative volumes. | Yes, `Data::Trade`           |
+| `Ticker`            | Last traded price, volume, BSP near/far.        | -                            |
+| `StartingPrice`     | Betfair Starting Price for a runner.            | -                            |
+| `BspBookDelta`      | BSP-specific book delta.                        | -                            |
 | `InstrumentClose`   | Settlement event.                               | Yes, `Data::InstrumentClose` |
-| `SequenceCompleted` | Batch completion marker.                        | -                          |
-| `RaceRunnerData`    | GPS tracking data (horse/greyhound racing).     | -                          |
-| `RaceProgress`      | Race‑level progress data.                       | -                          |
+| `SequenceCompleted` | Batch completion marker.                        | -                            |
+| `RaceRunnerData`    | GPS tracking data (horse/greyhound racing).     | -                            |
+| `RaceProgress`      | Race-level progress data.                       | -                            |
 
 The backtest engine accepts the `Data` enum, so we map the variants we need
 and skip the Betfair-specific types:
 
 ```rust
-use nautilus_model::data::{Data, OrderBookDeltas_API};
+use nautilus_model::data::Data;
 
 let mut instruments = AHashMap::new();
 let mut data: Vec<Data> = Vec::new();
@@ -127,7 +127,7 @@ for item in items {
             instruments.insert(inst.id(), *inst);
         }
         BetfairDataItem::Deltas(d) => {
-            data.push(Data::Deltas(OrderBookDeltas_API::new(d)));
+            data.push(Data::Deltas(Box::new(d)));
         }
         BetfairDataItem::Trade(t) => {
             data.push(Data::Trade(t));
@@ -140,8 +140,7 @@ for item in items {
 }
 ```
 
-`OrderBookDeltas_API` is a thin FFI wrapper around `OrderBookDeltas`
-required by the `Data` enum.
+`Data::Deltas` boxes its `OrderBookDeltas` payload to keep the enum small.
 
 Instruments are re-emitted on every market definition update in the stream,
 so the map deduplicates them by keeping the latest version.
@@ -186,8 +185,9 @@ A `DataActor` in Rust needs three pieces:
 3. The `DataActor` trait implementation with your callbacks.
 
 The framework provides blanket `Actor` and `Component` implementations for
-any type that implements `DataActor + Debug`, so you do not need to
-implement those manually.
+runtime actors. The `nautilus_actor!` macro supplies the native runtime wiring
+when your struct holds a `DataActorCore`, so normal actor code only implements
+the callbacks it needs.
 
 On start the actor subscribes to `OrderBookDeltas` for each instrument. On
 each update it sums per-side volume from the individual deltas and
@@ -217,7 +217,7 @@ engine.add_venue(
         .account_type(AccountType::Cash)
         .book_type(BookType::L2_MBP)
         .starting_balances(vec![Money::from("1_000_000 GBP")])
-        .build(),
+        .build()?,
 )?;
 ```
 
@@ -345,5 +345,5 @@ The complete example is at
 - **Multiple markets**. Load several `.gz` files and run them through the
   same engine to test cross-market signals.
 - **Compare with Python**. Run the same backtest from Python using the
-  `BacktestEngine` Python API. The Rust engine processes the same data
-  pipeline at roughly six times the throughput of the Python/Cython path.
+  `BacktestEngine` Python API. Both surfaces drive the same Rust engine over
+  the same data pipeline, so the results should match.

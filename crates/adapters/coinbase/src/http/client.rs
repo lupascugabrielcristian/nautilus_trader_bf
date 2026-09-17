@@ -27,7 +27,7 @@ use std::{
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
-use chrono::{DateTime, Utc};
+use jiff::{Timestamp, tz::Offset};
 use nautilus_core::{
     AtomicMap, UnixNanos,
     consts::NAUTILUS_USER_AGENT,
@@ -168,14 +168,12 @@ impl CoinbaseRawHttpClient {
         retry_config: Option<RetryConfig>,
     ) -> std::result::Result<Self, HttpClientError> {
         Ok(Self {
-            client: HttpClient::new(
-                Self::default_headers(),
-                vec![],
-                vec![],
-                Some(*COINBASE_REST_QUOTA),
-                Some(timeout_secs),
-                proxy_url,
-            )?,
+            client: HttpClient::builder()
+                .headers(Self::default_headers())
+                .default_quota(*COINBASE_REST_QUOTA)
+                .timeout_secs(timeout_secs)
+                .maybe_proxy_url(proxy_url)
+                .build()?,
             credential: None,
             base_url: ArcSwap::from_pointee(urls::rest_url(environment).to_string()),
             environment,
@@ -197,14 +195,12 @@ impl CoinbaseRawHttpClient {
         retry_config: Option<RetryConfig>,
     ) -> std::result::Result<Self, HttpClientError> {
         Ok(Self {
-            client: HttpClient::new(
-                Self::default_headers(),
-                vec![],
-                vec![],
-                Some(*COINBASE_REST_QUOTA),
-                Some(timeout_secs),
-                proxy_url,
-            )?,
+            client: HttpClient::builder()
+                .headers(Self::default_headers())
+                .default_quota(*COINBASE_REST_QUOTA)
+                .timeout_secs(timeout_secs)
+                .maybe_proxy_url(proxy_url)
+                .build()?,
             credential: Some(credential),
             base_url: ArcSwap::from_pointee(urls::rest_url(environment).to_string()),
             environment,
@@ -374,7 +370,7 @@ impl CoinbaseRawHttpClient {
                 &operation_name,
                 operation,
                 should_retry,
-                Error::transport,
+                |e| Error::transport(e.to_string()),
                 &self.cancellation_token,
             )
             .await
@@ -610,8 +606,12 @@ impl CoinbaseRawHttpClient {
         let mut cursor: Option<String> = None;
 
         loop {
-            let start_str = query.start.map(|s| s.to_rfc3339());
-            let end_str = query.end.map(|e| e.to_rfc3339());
+            let start_str = query
+                .start
+                .map(|s| s.display_with_offset(Offset::UTC).to_string());
+            let end_str = query
+                .end
+                .map(|e| e.display_with_offset(Offset::UTC).to_string());
             let limit_str = query.limit.map(|l| l.to_string());
 
             let mut pairs: Vec<(&str, &str)> = Vec::new();
@@ -678,8 +678,12 @@ impl CoinbaseRawHttpClient {
         let mut cursor: Option<String> = None;
 
         loop {
-            let start_str = query.start.map(|s| s.to_rfc3339());
-            let end_str = query.end.map(|e| e.to_rfc3339());
+            let start_str = query
+                .start
+                .map(|s| s.display_with_offset(Offset::UTC).to_string());
+            let end_str = query
+                .end
+                .map(|e| e.display_with_offset(Offset::UTC).to_string());
             let limit_str = query.limit.map(|l| l.to_string());
 
             let mut pairs: Vec<(&str, &str)> = Vec::new();
@@ -781,11 +785,7 @@ impl CoinbaseRawHttpClient {
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.coinbase", from_py_object)
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.coinbase")
+    pyo3::pyclass(module = "nautilus_trader.adapters.coinbase", from_py_object)
 )]
 pub struct CoinbaseHttpClient {
     pub(crate) inner: Arc<CoinbaseRawHttpClient>,
@@ -1196,8 +1196,8 @@ impl CoinbaseHttpClient {
         account_id: AccountId,
         instrument_id: Option<InstrumentId>,
         open_only: bool,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
         let query = OrderListQuery {
@@ -1248,8 +1248,8 @@ impl CoinbaseHttpClient {
         account_id: AccountId,
         instrument_id: Option<InstrumentId>,
         venue_order_id: Option<VenueOrderId>,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<FillReport>> {
         let query = FillListQuery {
@@ -1376,7 +1376,7 @@ impl CoinbaseHttpClient {
         reduce_only: bool,
         retail_portfolio_id: Option<String>,
     ) -> anyhow::Result<CreateOrderResponse> {
-        let coinbase_side = map_order_side(side)?;
+        let coinbase_side = map_order_side(side);
         let order_config = build_order_configuration(
             order_type,
             side,
@@ -1568,15 +1568,10 @@ impl CoinbaseHttpClient {
 }
 
 /// Maps a Nautilus [`OrderSide`] to Coinbase's wire enum.
-///
-/// # Errors
-///
-/// Returns an error when the side is [`OrderSide::NoOrderSide`].
-pub fn map_order_side(side: OrderSide) -> anyhow::Result<CoinbaseOrderSide> {
+pub fn map_order_side(side: OrderSide) -> CoinbaseOrderSide {
     match side {
-        OrderSide::Buy => Ok(CoinbaseOrderSide::Buy),
-        OrderSide::Sell => Ok(CoinbaseOrderSide::Sell),
-        OrderSide::NoOrderSide => anyhow::bail!("NoOrderSide is not a valid Coinbase side"),
+        OrderSide::Buy => CoinbaseOrderSide::Buy,
+        OrderSide::Sell => CoinbaseOrderSide::Sell,
     }
 }
 
@@ -1694,9 +1689,6 @@ pub fn build_order_configuration(
             let direction = match side {
                 OrderSide::Buy => CoinbaseStopDirection::StopUp,
                 OrderSide::Sell => CoinbaseStopDirection::StopDown,
-                OrderSide::NoOrderSide => {
-                    anyhow::bail!("STOP_LIMIT requires a defined side")
-                }
             };
 
             match time_in_force {
@@ -1851,16 +1843,15 @@ mod tests {
     }
 
     #[rstest]
-    fn test_map_order_side_rejects_no_side() {
+    fn test_map_order_side() {
         assert!(matches!(
-            map_order_side(OrderSide::Buy).unwrap(),
+            map_order_side(OrderSide::Buy),
             CoinbaseOrderSide::Buy
         ));
         assert!(matches!(
-            map_order_side(OrderSide::Sell).unwrap(),
+            map_order_side(OrderSide::Sell),
             CoinbaseOrderSide::Sell
         ));
-        assert!(map_order_side(OrderSide::NoOrderSide).is_err());
     }
 
     #[rstest]

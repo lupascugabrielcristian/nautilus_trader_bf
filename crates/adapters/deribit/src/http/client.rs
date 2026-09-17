@@ -25,7 +25,8 @@ use std::{
 };
 
 use ahash::{AHashMap, AHashSet};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
+use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::{
     AtomicMap, AtomicTime, Params, datetime::nanos_to_millis, nanos::UnixNanos,
     time::get_atomic_clock_realtime,
@@ -42,7 +43,7 @@ use nautilus_model::{
 use nautilus_network::{
     http::{HttpClient, Method},
     ratelimiter::quota::Quota,
-    retry::{RetryConfig, RetryManager},
+    retry::{RetryConfig, RetryError, RetryManager},
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
@@ -53,7 +54,7 @@ use ustr::Ustr;
 use super::{
     error::DeribitHttpError,
     models::{
-        DeribitAccountSummariesResponse, DeribitBookSummary, DeribitCombo, DeribitCurrency,
+        DeribitAccountSummariesResponse, DeribitBookSummaryRaw, DeribitCombo, DeribitCurrency,
         DeribitExpirationsResponse, DeribitInstrument, DeribitJsonRpcRequest,
         DeribitJsonRpcResponse, DeribitPosition, DeribitProductType, DeribitTicker,
         DeribitUserTradesResponse,
@@ -72,7 +73,7 @@ use crate::{
         consts::{
             DERIBIT_ACCOUNT_RATE_KEY, DERIBIT_API_PATH, DERIBIT_GLOBAL_RATE_KEY,
             DERIBIT_HTTP_ACCOUNT_QUOTA, DERIBIT_HTTP_ORDER_QUOTA, DERIBIT_HTTP_REST_QUOTA,
-            DERIBIT_ORDER_RATE_KEY, DERIBIT_VENUE, JSONRPC_VERSION, should_retry_error_code,
+            DERIBIT_ORDER_RATE_KEY, DERIBIT_VENUE, JSONRPC_VERSION,
         },
         credential::{Credential, credential_env_vars},
         enums::DeribitEnvironment,
@@ -218,15 +219,13 @@ impl DeribitRawHttpClient {
 
         Ok(Self {
             base_url,
-            client: HttpClient::new(
-                HashMap::new(),
-                Vec::new(),
-                Self::rate_limiter_quotas(),
-                Some(*DERIBIT_HTTP_REST_QUOTA),
-                Some(timeout_secs),
-                proxy_url,
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {e}"))?,
+            client: HttpClient::builder()
+                .keyed_quotas(Self::rate_limiter_quotas())
+                .default_quota(*DERIBIT_HTTP_REST_QUOTA)
+                .timeout_secs(timeout_secs)
+                .maybe_proxy_url(proxy_url)
+                .build()
+                .map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {e}"))?,
             credential: None,
             retry_manager,
             cancellation_token: CancellationToken::new(),
@@ -354,15 +353,13 @@ impl DeribitRawHttpClient {
 
         Ok(Self {
             base_url,
-            client: HttpClient::new(
-                HashMap::new(),
-                Vec::new(),
-                Self::rate_limiter_quotas(),
-                Some(*DERIBIT_HTTP_REST_QUOTA),
-                Some(timeout_secs),
-                proxy_url,
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {e}"))?,
+            client: HttpClient::builder()
+                .keyed_quotas(Self::rate_limiter_quotas())
+                .default_quota(*DERIBIT_HTTP_REST_QUOTA)
+                .timeout_secs(timeout_secs)
+                .maybe_proxy_url(proxy_url)
+                .build()
+                .map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {e}"))?,
             credential: Some(credential),
             retry_manager,
             cancellation_token: CancellationToken::new(),
@@ -497,7 +494,7 @@ impl DeribitRawHttpClient {
                     Err(_) => {
                         // Not valid JSON - treat as HTTP error
                         let error_body = String::from_utf8_lossy(&resp.body);
-                        log::error!(
+                        log::warn!(
                             "Non-JSON response: method={method}, status={}, body={error_body}",
                             resp.status.as_u16()
                         );
@@ -511,7 +508,7 @@ impl DeribitRawHttpClient {
                 // Try to parse as JSON-RPC response
                 let json_rpc_response: DeribitJsonRpcResponse<T> =
                     serde_json::from_value(json_value.clone()).map_err(|e| {
-                        log::error!(
+                        log::warn!(
                             "Failed to deserialize Deribit JSON-RPC response: method={method}, status={}, error={e}",
                             resp.status.as_u16()
                         );
@@ -546,7 +543,7 @@ impl DeribitRawHttpClient {
                         error.data.as_ref(),
                     ))
                 } else {
-                    log::error!(
+                    log::warn!(
                         "Response contains neither result nor error field: method={method}, status={}, request_id={:?}",
                         resp.status.as_u16(),
                         json_rpc_response.id
@@ -566,28 +563,19 @@ impl DeribitRawHttpClient {
         //
         // Note: Deribit returns many permanent errors which should NOT be retried
         // (e.g., "invalid_credentials", "not_enough_funds", "order_not_found")
-        let should_retry = |error: &DeribitHttpError| -> bool {
+        let should_retry = |error: &DeribitHttpError| -> bool { error.is_retryable() };
+
+        let create_error = |error: RetryError| -> DeribitHttpError {
             match error {
-                DeribitHttpError::NetworkError(_) => true,
-                DeribitHttpError::UnexpectedStatus { status, .. } => {
-                    *status >= 500 || *status == 429
+                RetryError::Canceled => {
+                    DeribitHttpError::Canceled("Adapter disconnecting or shutting down".to_string())
                 }
-                DeribitHttpError::DeribitError { error_code, .. } => {
-                    should_retry_error_code(*error_code)
-                }
-                _ => false,
+                error => DeribitHttpError::NetworkError(error.to_string()),
             }
         };
 
-        let create_error = |msg: String| -> DeribitHttpError {
-            if msg == "canceled" {
-                DeribitHttpError::Canceled("Adapter disconnecting or shutting down".to_string())
-            } else {
-                DeribitHttpError::NetworkError(msg)
-            }
-        };
-
-        self.retry_manager
+        let result = self
+            .retry_manager
             .execute_with_retry_with_cancel(
                 &operation_id,
                 operation,
@@ -595,7 +583,15 @@ impl DeribitRawHttpClient {
                 create_error,
                 &self.cancellation_token,
             )
-            .await
+            .await;
+
+        if let Err(ref e) = result
+            && e.is_retryable()
+        {
+            log::error!("Request exhausted retries: method={method}, error={e}");
+        }
+
+        result
     }
 
     /// Gets available trading instruments.
@@ -849,7 +845,7 @@ impl DeribitRawHttpClient {
     pub async fn get_book_summary_by_currency(
         &self,
         params: GetBookSummaryByCurrencyParams,
-    ) -> Result<DeribitJsonRpcResponse<Vec<DeribitBookSummary>>, DeribitHttpError> {
+    ) -> Result<DeribitJsonRpcResponse<Vec<DeribitBookSummaryRaw>>, DeribitHttpError> {
         self.send_request("public/get_book_summary_by_currency", params, false)
             .await
     }
@@ -890,7 +886,7 @@ impl DeribitRawHttpClient {
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.deribit", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.deribit", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -1069,7 +1065,7 @@ impl DeribitHttpClient {
             }
         }
 
-        log::info!(
+        log::debug!(
             "Parsed {} instruments ({} skipped, {} errors)",
             instruments.len(),
             skipped_count,
@@ -1240,6 +1236,7 @@ impl DeribitHttpClient {
     /// # Errors
     ///
     /// Returns an error if:
+    /// - The instrument is not found in cache
     /// - The request fails
     /// - Trade parsing fails
     ///
@@ -1251,8 +1248,8 @@ impl DeribitHttpClient {
     pub async fn request_trades(
         &self,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<TradeTick>> {
         // Get instrument from cache to determine precisions
@@ -1261,20 +1258,20 @@ impl DeribitHttpClient {
                 (instrument.price_precision(), instrument.size_precision())
             } else {
                 log::warn!("Instrument {instrument_id} not in cache, skipping trades request");
-                anyhow::bail!("Instrument {instrument_id} not in cache");
+                return Err(InstrumentLookupError::not_found(instrument_id).into());
             };
 
         // Convert timestamps to milliseconds
-        let now = Utc::now();
+        let now = Timestamp::now();
         let end_dt = end.unwrap_or(now);
-        let start_dt = start.unwrap_or(end_dt - chrono::Duration::hours(1));
+        let start_dt = start.unwrap_or(end_dt - jiff::SignedDuration::from_hours(1));
 
         if let (Some(s), Some(e)) = (start, end) {
             anyhow::ensure!(s < e, "Invalid time range: start={s:?} end={e:?}");
         }
 
-        let start_ms = start_dt.timestamp_millis();
-        let end_ms = end_dt.timestamp_millis();
+        let start_ms = start_dt.as_millisecond();
+        let end_ms = end_dt.as_millisecond();
         let ts_init = self.generate_ts_init();
         let mut all_trades = Vec::new();
         let mut paginator = TradePaginator::new(start_ms, end_ms);
@@ -1345,7 +1342,7 @@ impl DeribitHttpClient {
             }
         }
 
-        log::info!(
+        log::debug!(
             "Fetched {} historical trades for {} from {} to {}",
             all_trades.len(),
             instrument_id,
@@ -1365,6 +1362,7 @@ impl DeribitHttpClient {
     /// Returns an error if:
     /// - Aggregation source is not EXTERNAL
     /// - Bar aggregation type is not supported by Deribit
+    /// - The instrument is not found in cache
     /// - The request fails or response cannot be parsed
     ///
     /// # Supported Resolutions
@@ -1373,8 +1371,8 @@ impl DeribitHttpClient {
     pub async fn request_bars(
         &self,
         bar_type: BarType,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<Bar>> {
         anyhow::ensure!(
@@ -1382,11 +1380,11 @@ impl DeribitHttpClient {
             "Only EXTERNAL aggregation is supported"
         );
 
-        let now = Utc::now();
+        let now = Timestamp::now();
 
         // Default to last hour if no start/end provided
         let end_dt = end.unwrap_or(now);
-        let start_dt = start.unwrap_or(end_dt - chrono::Duration::hours(1));
+        let start_dt = start.unwrap_or(end_dt - jiff::SignedDuration::from_hours(1));
 
         if let (Some(s), Some(e)) = (start, end) {
             anyhow::ensure!(s < e, "Invalid time range: start={s:?} end={e:?}");
@@ -1413,9 +1411,22 @@ impl DeribitHttpClient {
             );
         }
 
-        let instrument_name = bar_type.instrument_id().symbol.to_string();
-        let start_timestamp = start_dt.timestamp_millis();
-        let end_timestamp = end_dt.timestamp_millis();
+        let instrument_id = bar_type.instrument_id();
+        let (price_precision, size_precision, use_cost_for_volume) =
+            if let Some(instrument) = self.get_instrument(&instrument_id.symbol.inner()) {
+                (
+                    instrument.price_precision(),
+                    instrument.size_precision(),
+                    use_cost_for_bar_volume(&instrument),
+                )
+            } else {
+                log::warn!("Instrument {instrument_id} not in cache, skipping bars request");
+                return Err(InstrumentLookupError::not_found(instrument_id).into());
+            };
+
+        let instrument_name = instrument_id.symbol.to_string();
+        let start_timestamp = start_dt.as_millisecond();
+        let end_timestamp = end_dt.as_millisecond();
 
         let params = GetTradingViewChartDataParams::new(
             instrument_name,
@@ -1434,20 +1445,6 @@ impl DeribitHttpClient {
             return Ok(Vec::new());
         }
 
-        // Get instrument from cache to determine precisions and volume-field selection.
-        let instrument_id = bar_type.instrument_id();
-        let (price_precision, size_precision, use_cost_for_volume) =
-            if let Some(instrument) = self.get_instrument(&instrument_id.symbol.inner()) {
-                (
-                    instrument.price_precision(),
-                    instrument.size_precision(),
-                    use_cost_for_bar_volume(&instrument),
-                )
-            } else {
-                log::warn!("Instrument {instrument_id} not in cache, skipping bars request");
-                anyhow::bail!("Instrument {instrument_id} not in cache");
-            };
-
         let ts_init = self.generate_ts_init();
         let mut bars = parse_bars(
             &chart_data,
@@ -1465,7 +1462,7 @@ impl DeribitHttpClient {
             }
         }
 
-        log::info!("Parsed {} bars for {}", bars.len(), bar_type);
+        log::debug!("Parsed {} bars for {}", bars.len(), bar_type);
 
         Ok(bars)
     }
@@ -1482,6 +1479,7 @@ impl DeribitHttpClient {
     /// # Errors
     ///
     /// Returns an error if:
+    /// - The instrument is not found in cache
     /// - The request fails
     /// - Order book parsing fails
     pub async fn request_book_snapshot(
@@ -1493,7 +1491,7 @@ impl DeribitHttpClient {
             if let Some(instrument) = self.get_instrument(&instrument_id.symbol.inner()) {
                 (instrument.price_precision(), instrument.size_precision())
             } else {
-                anyhow::bail!("Instrument {instrument_id} not in cache");
+                return Err(InstrumentLookupError::not_found(instrument_id).into());
             };
 
         let params = GetOrderBookParams::new(instrument_id.symbol.to_string(), depth);
@@ -1516,7 +1514,7 @@ impl DeribitHttpClient {
             ts_init,
         )?;
 
-        log::info!(
+        log::debug!(
             "Fetched order book for {} with {} bids and {} asks",
             instrument_id,
             order_book_data.bids.len(),
@@ -1613,7 +1611,7 @@ impl DeribitHttpClient {
         let mut seen_order_ids = AHashSet::new();
 
         let mut parse_and_add = |order: &DeribitOrderMsg| {
-            let symbol = Ustr::from(&order.instrument_name);
+            let symbol = order.instrument_name;
             if let Some(instrument) = self.get_instrument(&symbol) {
                 match parse_user_order_msg(order, &instrument, account_id, ts_init) {
                     Ok(report) => {
@@ -1768,7 +1766,7 @@ impl DeribitHttpClient {
         end: Option<UnixNanos>,
     ) -> anyhow::Result<Vec<FillReport>> {
         let ts_init = self.generate_ts_init();
-        let now_ms = Utc::now().timestamp_millis();
+        let now_ms = Timestamp::now().as_millisecond();
 
         // Convert UnixNanos to milliseconds for Deribit API
         let start_ms = start.map_or(0, |ns| nanos_to_millis(ns.as_u64()) as i64);
@@ -1777,7 +1775,7 @@ impl DeribitHttpClient {
 
         // Helper closure to parse trade and add to reports
         let mut parse_and_add = |trade: &DeribitUserTradeMsg| {
-            let symbol = Ustr::from(&trade.instrument_name);
+            let symbol = trade.instrument_name;
             if let Some(instrument) = self.get_instrument(&symbol) {
                 match parse_user_trade_msg(trade, &instrument, account_id, ts_init) {
                     Ok(report) => reports.push(report),
@@ -1897,10 +1895,10 @@ impl DeribitHttpClient {
             .ok_or_else(|| anyhow::anyhow!("No result in ticker response"))
     }
 
-    /// Requests book summaries for options of a given currency.
+    /// Requests book summaries for a currency via `public/get_book_summary_by_currency`.
     ///
-    /// Returns raw `DeribitBookSummary` items which include `underlying_price`
-    /// (the forward price) for each option instrument.
+    /// Defaults to product kind `option`.
+    /// Entries include mark/IV, bid-ask, volumes, and `underlying_price` (forward) when present.
     ///
     /// # Errors
     ///
@@ -1908,8 +1906,27 @@ impl DeribitHttpClient {
     pub async fn request_book_summaries(
         &self,
         currency: &str,
-    ) -> anyhow::Result<Vec<DeribitBookSummary>> {
-        let params = GetBookSummaryByCurrencyParams::options(currency);
+    ) -> anyhow::Result<Vec<DeribitBookSummaryRaw>> {
+        self.request_book_summaries_kind(currency, Some("option"))
+            .await
+    }
+
+    /// Requests book summaries for a currency with an optional product `kind` filter.
+    ///
+    /// When `kind` is `None`, Deribit returns summaries for all product kinds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn request_book_summaries_kind(
+        &self,
+        currency: &str,
+        kind: Option<&str>,
+    ) -> anyhow::Result<Vec<DeribitBookSummaryRaw>> {
+        let params = GetBookSummaryByCurrencyParams {
+            currency: currency.to_string(),
+            kind: kind.map(str::to_string),
+        };
         let full_response = self
             .inner
             .get_book_summary_by_currency(params)

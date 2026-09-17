@@ -20,7 +20,9 @@
 //! clients for different networks (Ethereum, Polygon, Arbitrum, Base, BSC) and common
 //! utilities for handling RPC requests and responses.
 
+use alloy::primitives::Address;
 use enum_dispatch::enum_dispatch;
+use nautilus_live::SocketControl;
 use nautilus_network::websocket::TransportBackend;
 
 use crate::rpc::{
@@ -29,7 +31,7 @@ use crate::rpc::{
         ethereum::EthereumRpcClient, polygon::PolygonRpcClient,
     },
     error::BlockchainRpcClientError,
-    types::BlockchainMessage,
+    types::{BlockchainMessage, RpcEventType},
 };
 
 pub mod chains;
@@ -40,6 +42,9 @@ pub mod http;
 pub mod providers;
 pub mod types;
 pub mod utils;
+
+#[cfg(feature = "hypersync")]
+pub(crate) mod verification;
 
 #[enum_dispatch(BlockchainRpcClient)]
 #[derive(Debug)]
@@ -56,13 +61,14 @@ pub enum BlockchainRpcClientAny {
 pub trait BlockchainRpcClient {
     async fn connect(&mut self) -> anyhow::Result<()>;
     async fn subscribe_blocks(&mut self) -> Result<(), BlockchainRpcClientError>;
-    async fn subscribe_swaps(&mut self) -> Result<(), BlockchainRpcClientError> {
-        todo!("Not implemented")
-    }
+    async fn subscribe_pool_events(
+        &mut self,
+        event_type: RpcEventType,
+        addresses: &[Address],
+        event_signature: String,
+    ) -> Result<(), BlockchainRpcClientError>;
     async fn unsubscribe_blocks(&mut self) -> Result<(), BlockchainRpcClientError>;
-    async fn unsubscribe_swaps(&mut self) -> Result<(), BlockchainRpcClientError> {
-        todo!("Not implemented")
-    }
     async fn next_rpc_message(&mut self) -> Result<BlockchainMessage, BlockchainRpcClientError>;
     fn set_transport_backend(&mut self, backend: TransportBackend);
+    fn set_socket_control(&mut self, control: SocketControl);
 }

@@ -158,7 +158,7 @@ strategy cancels all open orders and places a fresh grid:
 | `num_levels`            | `usize`        | `3`        | Number of buy and sell levels.                                           |
 | `grid_step_bps`         | `u32`          | `10`       | Grid spacing in basis points (10 = 0.1%).                                |
 | `skew_factor`           | `f64`          | `0.0`      | How aggressively to shift the grid based on inventory.                   |
-| `requote_threshold_bps` | `u32`          | `5`        | Minimum mid‑price move in bps before re‑quoting.                         |
+| `requote_threshold_bps` | `u32`          | `5`        | Minimum mid-price move in bps before re-quoting.                         |
 | `expire_time_secs`      | `Option<u64>`  | `None`     | Order expiry in seconds. Uses GTD when set, GTC otherwise.               |
 | `on_cancel_resubmit`    | `bool`         | `false`    | Resubmit grid on next quote after an unexpected cancel.                  |
 
@@ -266,13 +266,11 @@ DYDX_WALLET_ADDRESS=dydx1...
 ### Run the example
 
 ```bash
-# Mainnet (default)
 cargo run --example dydx-grid-mm --package nautilus-dydx --features examples
-
-# Testnet (set DYDX_NETWORK=testnet, requires testnet API trading key)
-DYDX_NETWORK=testnet \
-  cargo run --example dydx-grid-mm --package nautilus-dydx --features examples
 ```
+
+The example targets mainnet. To run against testnet, set the `DYDX_NETWORK` constant near the top
+of the example to `DydxNetwork::Testnet` (this needs a testnet API trading key) and rebuild.
 
 ### Graceful shutdown
 
@@ -289,23 +287,13 @@ The `main` function lives at
 [`crates/adapters/dydx/examples/node_grid_mm.rs`](https://github.com/nautechsystems/nautilus_trader/tree/develop/crates/adapters/dydx/examples/node_grid_mm.rs):
 
 ```rust
+const DYDX_NETWORK: DydxNetwork = DydxNetwork::Mainnet;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
-    let network = match std::env::var("DYDX_NETWORK") {
-        Err(_) => DydxNetwork::Mainnet,
-        Ok(value) => match value.to_ascii_lowercase().as_str() {
-            "testnet" => DydxNetwork::Testnet,
-            "mainnet" | "" => DydxNetwork::Mainnet,
-            other => {
-                return Err(format!(
-                    "DYDX_NETWORK must be 'mainnet' or 'testnet' (case-insensitive), got '{other}'",
-                )
-                .into());
-            }
-        },
-    };
+    let network = DYDX_NETWORK;
 
     let environment = Environment::Live;
     let trader_id = TraderId::from("TESTER-001");
@@ -318,8 +306,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    let exec_config = DydxExecClientConfig {
-        trader_id,
+    let exec_config = DydxExecutionClientConfig {
         account_id,
         network,
         ..Default::default()
@@ -342,13 +329,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_delay_post_stop_secs(5)
         .build()?;
 
-    let config = GridMarketMakerConfig::new(instrument_id, Quantity::from("0.10"))
-        .with_num_levels(3)
-        .with_grid_step_bps(100)
-        .with_skew_factor(0.5)
-        .with_requote_threshold_bps(10)
-        .with_expire_time_secs(8)
-        .with_on_cancel_resubmit(true);
+    let config = GridMarketMakerConfig::builder()
+        .instrument_id(instrument_id)
+        .max_position(Quantity::from("0.10"))
+        .num_levels(3)
+        .grid_step_bps(100)
+        .skew_factor(0.5)
+        .requote_threshold_bps(10)
+        .expire_time_secs(8)
+        .on_cancel_resubmit(true)
+        .build();
     let strategy = GridMarketMaker::new(config);
 
     node.add_strategy(strategy)?;
@@ -437,7 +427,13 @@ fn on_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
         return Ok(()); // Mid hasn't moved enough, keep existing grid
     }
 
-    self.cancel_all_orders(instrument_id, None, None, None)?;
+    self.cancel_all_orders(
+        instrument_id,
+        None,
+        None,
+        true, // Restrict cancellation to this strategy.
+        None,
+    )?;
 
     let (net_position, worst_long, worst_short) = { /* ... */ };
 
@@ -449,7 +445,7 @@ fn on_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
 
     let (tif, expire_time) = match self.config.expire_time_secs {
         Some(secs) => {
-            let now_ns = self.core.clock().timestamp_ns();
+            let now_ns = self.clock().timestamp_ns();
             let expire_ns = now_ns + secs * 1_000_000_000;
             (Some(TimeInForce::Gtd), Some(expire_ns))
         }
@@ -457,7 +453,7 @@ fn on_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
     };
 
     for (side, price) in grid {
-        let order = self.core.order_factory().limit(
+        let order = self.order().limit(
             instrument_id,
             side,
             trade_size,
@@ -576,15 +572,15 @@ DYDX_LOG=/tmp/dydx_main.log \
 
 ## Monitoring and understanding output
 
-### Key log messages
+### Log messages
 
-| Log message                                         | Meaning                                            |
-| --------------------------------------------------- | -------------------------------------------------- |
-| `Requoting grid: mid=X, last_mid=Y`                 | Mid moved beyond threshold, refreshing grid.       |
-| `Submit short‑term order N`                         | Order submitted via short‑term broadcast path.    |
-| `BatchCancel N short-term orders`                   | Batch cancel executed for expired/stale orders.   |
-| `benign cancel error, treating as success`          | Cancel for an already‑filled or expired order (normal). |
-| `Sequence mismatch detected, will resync and retry` | Cosmos SDK sequence error, auto‑recovering.        |
+| Log message                                         | Meaning                                                 |
+| --------------------------------------------------- | ------------------------------------------------------- |
+| `Requoting grid: mid=X, last_mid=Y`                 | Mid moved beyond threshold, refreshing grid.            |
+| `Submit short-term order N`                         | Order submitted via short-term broadcast path.          |
+| `BatchCancel N short-term orders`                   | Batch cancel executed for expired/stale orders.         |
+| `benign cancel error, treating as success`          | Cancel for an already-filled or expired order (normal). |
+| `Sequence mismatch detected, will resync and retry` | Cosmos SDK sequence error, auto-recovering.             |
 
 ### Expected behaviour patterns
 
@@ -604,11 +600,11 @@ DYDX_LOG=/tmp/dydx_main.log \
 
 ### High vs low volatility
 
-| Condition       | Adjustment                                                               |
-| --------------- | ------------------------------------------------------------------------ |
-| High volatility | Wider `grid_step_bps` (100-200), fewer `num_levels`, lower `skew_factor`.|
-| Low volatility  | Tighter `grid_step_bps` (10-30), more `num_levels`, higher `skew_factor`.|
-| Thin liquidity  | Increase `requote_threshold_bps` to reduce cancel frequency.             |
+| Condition       | Adjustment                                                                |
+| --------------- | ------------------------------------------------------------------------- |
+| High volatility | Wider `grid_step_bps` (100-200), fewer `num_levels`, lower `skew_factor`. |
+| Low volatility  | Tighter `grid_step_bps` (10-30), more `num_levels`, higher `skew_factor`. |
+| Thin liquidity  | Increase `requote_threshold_bps` to reduce cancel frequency.              |
 
 ### Multiple instruments
 
@@ -616,21 +612,29 @@ Run separate `GridMarketMaker` instances per instrument. Each instance
 manages its own grid, position, and cancel state independently:
 
 ```rust
-let btc_config = GridMarketMakerConfig::new(
-    InstrumentId::from("BTC-USD-PERP.DYDX"),
-    Quantity::from("0.001"),
-)
-.with_strategy_id(StrategyId::from("GRID_MM-BTC"))
-.with_order_id_tag("BTC".to_string())
-.with_grid_step_bps(50);
+let btc_config = GridMarketMakerConfig::builder()
+    .instrument_id(InstrumentId::from("BTC-USD-PERP.DYDX"))
+    .max_position(Quantity::from("0.001"))
+    .base(
+        StrategyConfig::builder()
+            .strategy_id(StrategyId::from("GRID_MM-BTC"))
+            .order_id_tag("BTC".to_string())
+            .build(),
+    )
+    .grid_step_bps(50)
+    .build();
 
-let eth_config = GridMarketMakerConfig::new(
-    InstrumentId::from("ETH-USD-PERP.DYDX"),
-    Quantity::from("0.10"),
-)
-.with_strategy_id(StrategyId::from("GRID_MM-ETH"))
-.with_order_id_tag("ETH".to_string())
-.with_grid_step_bps(100);
+let eth_config = GridMarketMakerConfig::builder()
+    .instrument_id(InstrumentId::from("ETH-USD-PERP.DYDX"))
+    .max_position(Quantity::from("0.10"))
+    .base(
+        StrategyConfig::builder()
+            .strategy_id(StrategyId::from("GRID_MM-ETH"))
+            .order_id_tag("ETH".to_string())
+            .build(),
+    )
+    .grid_step_bps(100)
+    .build();
 
 node.add_strategy(GridMarketMaker::new(btc_config))?;
 node.add_strategy(GridMarketMaker::new(eth_config))?;
@@ -638,9 +642,9 @@ node.add_strategy(GridMarketMaker::new(eth_config))?;
 
 ### Mainnet vs testnet toggle
 
-The example reads `DYDX_NETWORK` and selects the appropriate endpoint and
-credential set. Set `DYDX_NETWORK=testnet` to run against testnet; leave
-unset for mainnet.
+The example selects the network from the `DYDX_NETWORK` constant near the top of the file
+(`DydxNetwork::Mainnet` by default). Change it to `DydxNetwork::Testnet` and rebuild to run
+against testnet.
 
 ## Further reading
 
@@ -650,6 +654,3 @@ unset for mainnet.
   docs.
 - [Order types](https://docs.dydx.xyz/concepts/trading/orders):
   protocol-level order mechanics.
-- [Grid Market Making with a Deadman's Switch (BitMEX)](./grid_market_maker_bitmex.md):
-  comparison with deadman's switch as an alternative to short-term order
-  expiry.

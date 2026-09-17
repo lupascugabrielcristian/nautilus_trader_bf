@@ -36,9 +36,16 @@ use nautilus_model::{
         MarketStatusAction, OrderSide, PriceType,
     },
     identifiers::{InstrumentId, TradeId},
-    types::{Price, Quantity},
+    types::{Currency, Money, Price, Quantity, fixed::check_fixed_precision},
 };
-use nautilus_serialization::capnp::{FromCapnp, ToCapnp, market_capnp};
+use nautilus_serialization::capnp::{
+    FromCapnp, ToCapnp,
+    conversions::{
+        deserialize_money, deserialize_price, deserialize_quantity, serialize_money,
+        serialize_price, serialize_quantity,
+    },
+    market_capnp,
+};
 use rstest::rstest;
 use rust_decimal_macros::dec;
 use ustr::Ustr;
@@ -80,12 +87,60 @@ fn test_quote_tick_roundtrip() {
 }
 
 #[rstest]
+fn test_quote_tick_invalid_nested_price_precision_returns_error() {
+    let quote = QuoteTick {
+        instrument_id: InstrumentId::from("BTCUSDT.BINANCE"),
+        bid_price: Price::from("100.50"),
+        ask_price: Price::from("100.55"),
+        bid_size: Quantity::from("10.5"),
+        ask_size: Quantity::from("8.3"),
+        ts_event: 1234567890.into(),
+        ts_init: 1234567891.into(),
+    };
+
+    let mut message = capnp::message::Builder::new_default();
+    let mut builder = message.init_root::<market_capnp::quote_tick::Builder>();
+    quote.to_capnp(builder.reborrow());
+    builder
+        .reborrow()
+        .get_bid_price()
+        .unwrap()
+        .set_precision(u8::MAX);
+
+    let reader = message
+        .get_root_as_reader::<market_capnp::quote_tick::Reader>()
+        .unwrap();
+    let error = QuoteTick::from_capnp(reader).unwrap_err();
+    let expected_error = check_fixed_precision(u8::MAX).unwrap_err();
+
+    assert_eq!(error.to_string(), expected_error.to_string());
+}
+
+#[rstest]
+fn test_capnp_resolved_raw_width_roundtrip() {
+    // Values chosen so their fixed-point raw crosses 64 bits only when the model resolves to
+    // high precision, which is what makes this decode against the resolved alias rather than
+    // this crate's own feature.
+    let price = Price::from("50000.00");
+    let quantity = Quantity::from("20000.00");
+    let money = Money::new(20_000.0, Currency::USD());
+
+    let price_bytes = serialize_price(&price).unwrap();
+    let quantity_bytes = serialize_quantity(&quantity).unwrap();
+    let money_bytes = serialize_money(&money).unwrap();
+
+    assert_eq!(deserialize_price(&price_bytes).unwrap(), price);
+    assert_eq!(deserialize_quantity(&quantity_bytes).unwrap(), quantity);
+    assert_eq!(deserialize_money(&money_bytes).unwrap(), money);
+}
+
+#[rstest]
 fn test_trade_tick_roundtrip() {
     let trade = TradeTick {
         instrument_id: InstrumentId::from("ETHUSDT.BINANCE"),
         price: Price::from("2500.75"),
         size: Quantity::from("1.5"),
-        aggressor_side: AggressorSide::Buyer,
+        aggressor_side: AggressorSide::Buy,
         trade_id: TradeId::from("12345"),
         ts_event: 1234567890.into(),
         ts_init: 1234567891.into(),
@@ -117,8 +172,8 @@ fn test_trade_tick_roundtrip() {
 
 #[rstest]
 #[case(AggressorSide::NoAggressor)]
-#[case(AggressorSide::Buyer)]
-#[case(AggressorSide::Seller)]
+#[case(AggressorSide::Buy)]
+#[case(AggressorSide::Sell)]
 fn test_trade_tick_all_aggressor_sides(#[case] aggressor_side: AggressorSide) {
     let trade = TradeTick {
         instrument_id: InstrumentId::from("BTCUSDT.BINANCE"),
@@ -560,6 +615,22 @@ fn test_bar_specification_all_combinations(
     assert_eq!(spec.step, decoded.step);
     assert_eq!(spec.aggregation, decoded.aggregation);
     assert_eq!(spec.price_type, decoded.price_type);
+}
+
+#[rstest]
+fn test_bar_specification_max_step_roundtrip() {
+    let spec = BarSpecification::new(usize::MAX, BarAggregation::Tick, PriceType::Last);
+
+    let mut message = capnp::message::Builder::new_default();
+    let builder = message.init_root::<market_capnp::bar_spec::Builder>();
+    spec.to_capnp(builder);
+
+    let reader = message
+        .get_root_as_reader::<market_capnp::bar_spec::Reader>()
+        .unwrap();
+    let decoded = BarSpecification::from_capnp(reader).unwrap();
+
+    assert_eq!(decoded, spec);
 }
 
 #[rstest]

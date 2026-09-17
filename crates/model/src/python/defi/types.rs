@@ -22,11 +22,14 @@ use std::{
     sync::Arc,
 };
 
-use nautilus_core::python::to_pyvalue_err;
+use nautilus_core::python::{IntoPyObjectNautilusExt, to_pyvalue_err};
 use pyo3::{basic::CompareOp, prelude::*};
 
 use crate::{
-    defi::{AmmType, Blockchain, Chain, Dex, DexType, Pool, Token, chain::chains},
+    defi::{
+        AmmType, Blockchain, Chain, Dex, DexType, Pool, Token, chain::chains,
+        validation::validate_address,
+    },
     identifiers::InstrumentId,
 };
 
@@ -53,11 +56,11 @@ impl Chain {
         hasher.finish()
     }
 
-    fn __richcmp__(&self, other: &Self, op: CompareOp) -> bool {
+    fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
         match op {
-            CompareOp::Eq => self == other,
-            CompareOp::Ne => self != other,
-            _ => panic!("Unsupported comparison for Chain"),
+            CompareOp::Eq => self.eq(other).into_py_any_unwrap(py),
+            CompareOp::Ne => self.ne(other).into_py_any_unwrap(py),
+            _ => py.NotImplemented(),
         }
     }
 
@@ -154,11 +157,11 @@ impl Token {
         hasher.finish()
     }
 
-    fn __richcmp__(&self, other: &Self, op: CompareOp) -> bool {
+    fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
         match op {
-            CompareOp::Eq => self == other,
-            CompareOp::Ne => self != other,
-            _ => panic!("Unsupported comparison for Token"),
+            CompareOp::Eq => self.eq(other).into_py_any_unwrap(py),
+            CompareOp::Ne => self.ne(other).into_py_any_unwrap(py),
+            _ => py.NotImplemented(),
         }
     }
 
@@ -214,6 +217,9 @@ impl Dex {
         let amm_type = AmmType::from_str(&amm_type).map_err(to_pyvalue_err)?;
         let dex_type = DexType::from_dex_name(&name)
             .ok_or_else(|| to_pyvalue_err(format!("Invalid DEX name: {name}")))?;
+
+        validate_address(&factory).map_err(to_pyvalue_err)?;
+
         Ok(Self::new(
             chain,
             dex_type,
@@ -244,11 +250,11 @@ impl Dex {
         hasher.finish()
     }
 
-    fn __richcmp__(&self, other: &Self, op: CompareOp) -> bool {
+    fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
         match op {
-            CompareOp::Eq => self == other,
-            CompareOp::Ne => self != other,
-            _ => panic!("Unsupported comparison for Dex"),
+            CompareOp::Eq => self.eq(other).into_py_any_unwrap(py),
+            CompareOp::Ne => self.ne(other).into_py_any_unwrap(py),
+            _ => py.NotImplemented(),
         }
     }
 
@@ -328,8 +334,8 @@ impl Pool {
     /// ## Instrument ID Format
     ///
     /// The instrument ID encodes with the following components:
-    /// - `symbol` – The pool identifier (address for V2/V3, Pool ID for V4)
-    /// - `venue`  – The chain name plus DEX ID
+    /// - `symbol` - The pool identifier (address for V2/V3, Pool ID for V4)
+    /// - `venue`  - The chain name plus DEX ID
     ///
     /// String representation: `<POOL_IDENTIFIER>.<CHAIN_NAME>:<DEX_ID>`
     ///
@@ -379,11 +385,11 @@ impl Pool {
         hasher.finish()
     }
 
-    fn __richcmp__(&self, other: &Self, op: CompareOp) -> bool {
+    fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
         match op {
-            CompareOp::Eq => self == other,
-            CompareOp::Ne => self != other,
-            _ => panic!("Unsupported comparison for Pool"),
+            CompareOp::Eq => self.eq(other).into_py_any_unwrap(py),
+            CompareOp::Ne => self.ne(other).into_py_any_unwrap(py),
+            _ => py.NotImplemented(),
         }
     }
 

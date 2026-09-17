@@ -27,7 +27,7 @@ use nautilus_common::{
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
     enums::{AccountType, OmsType},
-    identifiers::ClientId,
+    identifiers::{ClientId, TraderId},
 };
 use nautilus_network::retry::RetryConfig;
 
@@ -38,7 +38,7 @@ use crate::{
         instrument_cache::InstrumentCache,
         urls,
     },
-    config::{DydxAdapterConfig, DydxDataClientConfig, DydxExecClientConfig},
+    config::{DydxAdapterConfig, DydxDataClientConfig, DydxExecutionClientConfig},
     data::DydxDataClient,
     execution::DydxExecutionClient,
     http::client::DydxHttpClient,
@@ -51,7 +51,7 @@ impl ClientConfig for DydxDataClientConfig {
     }
 }
 
-impl ClientConfig for DydxExecClientConfig {
+impl ClientConfig for DydxExecutionClientConfig {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -61,7 +61,7 @@ impl ClientConfig for DydxExecClientConfig {
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.dydx", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.dydx", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -127,12 +127,14 @@ impl DataClientFactory for DydxDataClientFactory {
             retry_config,
         )?;
 
-        let ws_client = DydxWebSocketClient::new_public_with_cache(
+        let ws_client = DydxWebSocketClient::new_public_with_cache_and_pool(
             ws_url,
             Arc::new(InstrumentCache::new()),
             Some(20),
             dydx_config.transport_backend,
             dydx_config.proxy_url.clone(),
+            dydx_config.max_ws_connections,
+            dydx_config.per_channel_subscription_limit,
         );
 
         let client = DydxDataClient::new(client_id, dydx_config, http_client, ws_client)?;
@@ -152,7 +154,7 @@ impl DataClientFactory for DydxDataClientFactory {
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.dydx", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.dydx", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -177,16 +179,17 @@ impl Default for DydxExecutionClientFactory {
 impl ExecutionClientFactory for DydxExecutionClientFactory {
     fn create(
         &self,
+        trader_id: TraderId,
         name: &str,
         config: &dyn ClientConfig,
         cache: CacheView,
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
         let dydx_config = config
             .as_any()
-            .downcast_ref::<DydxExecClientConfig>()
+            .downcast_ref::<DydxExecutionClientConfig>()
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Invalid config type for DydxExecutionClientFactory. Expected DydxExecClientConfig, was {config:?}",
+                    "Invalid config type for DydxExecutionClientFactory. Expected DydxExecutionClientConfig, was {config:?}",
                 )
             })?
             .clone();
@@ -198,7 +201,7 @@ impl ExecutionClientFactory for DydxExecutionClientFactory {
         let account_type = AccountType::Margin;
 
         let core = ExecutionClientCore::new(
-            dydx_config.trader_id,
+            trader_id,
             ClientId::from(name),
             *DYDX_VENUE,
             oms_type,
@@ -232,7 +235,7 @@ impl ExecutionClientFactory for DydxExecutionClientFactory {
             transport_backend: dydx_config.transport_backend,
         };
 
-        log::info!(
+        log::debug!(
             "Resolving wallet address: config={:?}, network={}, env_var={}",
             dydx_config.wallet_address,
             dydx_config.network,
@@ -245,14 +248,14 @@ impl ExecutionClientFactory for DydxExecutionClientFactory {
         let wallet_address = if let Some(addr) =
             resolve_wallet_address(dydx_config.wallet_address.clone(), dydx_config.network)
         {
-            log::info!("Using wallet address from config/env: {addr}");
+            log::debug!("Using wallet address from config/env: {addr}");
             addr
         } else if let Some(credential) = DydxCredential::resolve(
             dydx_config.private_key.as_deref(),
             dydx_config.network,
             dydx_config.authenticator_ids.clone(),
         )? {
-            log::info!(
+            log::debug!(
                 "Derived wallet address from private key: {}",
                 credential.address
             );
@@ -278,7 +281,7 @@ impl ExecutionClientFactory for DydxExecutionClientFactory {
     }
 
     fn config_type(&self) -> &'static str {
-        "DydxExecClientConfig"
+        "DydxExecutionClientConfig"
     }
 }
 
@@ -297,7 +300,7 @@ mod tests {
     use super::*;
     use crate::{
         common::enums::DydxNetwork,
-        config::{DydxDataClientConfig, DydxExecClientConfig},
+        config::{DydxDataClientConfig, DydxExecutionClientConfig},
     };
 
     #[rstest]
@@ -317,7 +320,7 @@ mod tests {
     fn test_dydx_execution_client_factory_creation() {
         let factory = DydxExecutionClientFactory::new();
         assert_eq!(factory.name(), DYDX);
-        assert_eq!(factory.config_type(), "DydxExecClientConfig");
+        assert_eq!(factory.config_type(), "DydxExecutionClientConfig");
     }
 
     #[rstest]
@@ -337,8 +340,7 @@ mod tests {
 
     #[rstest]
     fn test_dydx_exec_client_config_implements_client_config() {
-        let config = DydxExecClientConfig {
-            trader_id: TraderId::from("TRADER-001"),
+        let config = DydxExecutionClientConfig {
             account_id: AccountId::from("DYDX-001"),
             network: DydxNetwork::Mainnet,
             grpc_endpoint: None,
@@ -359,7 +361,9 @@ mod tests {
         };
 
         let boxed_config: Box<dyn ClientConfig> = Box::new(config);
-        let downcasted = boxed_config.as_any().downcast_ref::<DydxExecClientConfig>();
+        let downcasted = boxed_config
+            .as_any()
+            .downcast_ref::<DydxExecutionClientConfig>();
 
         assert!(downcasted.is_some());
     }
@@ -367,8 +371,7 @@ mod tests {
     #[rstest]
     fn test_dydx_data_client_factory_rejects_wrong_config_type() {
         let factory = DydxDataClientFactory::new();
-        let wrong_config = DydxExecClientConfig {
-            trader_id: TraderId::from("TRADER-001"),
+        let wrong_config = DydxExecutionClientConfig {
             account_id: AccountId::from("DYDX-001"),
             network: DydxNetwork::Mainnet,
             grpc_endpoint: None,
@@ -409,7 +412,12 @@ mod tests {
 
         let cache = Rc::new(RefCell::new(Cache::default()));
 
-        let result = factory.create("DYDX-TEST", &wrong_config, cache.into());
+        let result = factory.create(
+            TraderId::from("TRADER-001"),
+            "DYDX-TEST",
+            &wrong_config,
+            cache.into(),
+        );
         assert!(result.is_err());
         assert!(
             result

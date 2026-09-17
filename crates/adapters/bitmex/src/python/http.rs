@@ -15,7 +15,7 @@
 
 //! Python bindings for the BitMEX HTTP client.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
 use nautilus_model::{
     data::BarType,
@@ -123,6 +123,12 @@ impl BitmexHttpClient {
     }
 
     /// Update position leverage.
+    ///
+    /// # Errors
+    ///
+    /// - Credentials are missing.
+    /// - The request fails.
+    /// - The API returns an error.
     #[pyo3(name = "update_position_leverage")]
     fn py_update_position_leverage<'py>(
         &self,
@@ -146,6 +152,12 @@ impl BitmexHttpClient {
     }
 
     /// Request a single instrument and parse it into a Nautilus type.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Ok(Some(..))` when the venue returns a definition that parses
+    /// successfully, `Ok(None)` when the instrument is unknown, unsupported, or the payload
+    /// cannot be converted into a Nautilus `Instrument`.
     #[pyo3(name = "request_instrument")]
     fn py_request_instrument<'py>(
         &self,
@@ -168,6 +180,10 @@ impl BitmexHttpClient {
     }
 
     /// Request all available instruments and parse them into Nautilus types.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or parsing fails.
     #[pyo3(name = "request_instruments")]
     fn py_request_instruments<'py>(
         &self,
@@ -187,24 +203,25 @@ impl BitmexHttpClient {
                     .into_iter()
                     .map(|inst| instrument_any_to_pyobject(py, inst))
                     .collect();
-                let pylist = PyList::new(py, py_instruments?)
-                    .unwrap()
-                    .into_any()
-                    .unbind();
+                let pylist = PyList::new(py, py_instruments?)?.into_any().unbind();
                 Ok(pylist)
             })
         })
     }
 
     /// Request trades for the given instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or parsing fails.
     #[pyo3(name = "request_trades")]
     #[pyo3(signature = (instrument_id, start=None, end=None, limit=None))]
     fn py_request_trades<'py>(
         &self,
         py: Python<'py>,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
@@ -220,21 +237,26 @@ impl BitmexHttpClient {
                     .into_iter()
                     .map(|trade| trade.into_py_any(py))
                     .collect();
-                let pylist = PyList::new(py, py_trades?).unwrap().into_any().unbind();
+                let pylist = PyList::new(py, py_trades?)?.into_any().unbind();
                 Ok(pylist)
             })
         })
     }
 
     /// Request bars for the given bar type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails, parsing fails, or the bar specification is
+    /// unsupported by BitMEX.
     #[pyo3(name = "request_bars")]
     #[pyo3(signature = (bar_type, start=None, end=None, limit=None, partial=false))]
     fn py_request_bars<'py>(
         &self,
         py: Python<'py>,
         bar_type: BarType,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<u32>,
         partial: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -249,13 +271,78 @@ impl BitmexHttpClient {
             Python::attach(|py| {
                 let py_bars: PyResult<Vec<_>> =
                     bars.into_iter().map(|bar| bar.into_py_any(py)).collect();
-                let pylist = PyList::new(py, py_bars?).unwrap().into_any().unbind();
+                let pylist = PyList::new(py, py_bars?)?.into_any().unbind();
+                Ok(pylist)
+            })
+        })
+    }
+
+    /// Request a current L2 order book snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails, the instrument is not cached, or the book
+    /// rows cannot be parsed.
+    #[pyo3(name = "request_book_snapshot")]
+    #[pyo3(signature = (instrument_id, depth=None))]
+    fn py_request_book_snapshot<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+        depth: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let book = client
+                .request_book_snapshot(instrument_id, depth)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| book.into_py_any(py))
+        })
+    }
+
+    /// Request historical funding rates for the given instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the time range is invalid.
+    #[pyo3(name = "request_funding_rates")]
+    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None))]
+    fn py_request_funding_rates<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
+        limit: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let rates = client
+                .request_funding_rates(instrument_id, start, end, limit)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let py_rates: PyResult<Vec<_>> =
+                    rates.into_iter().map(|rate| rate.into_py_any(py)).collect();
+                let pylist = PyList::new(py, py_rates?)?.into_any().unbind();
                 Ok(pylist)
             })
         })
     }
 
     /// Query a single order by client order ID or venue order ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Credentials are missing.
+    /// - The request fails.
+    /// - The API returns an error.
     #[pyo3(name = "query_order")]
     #[pyo3(signature = (instrument_id, client_order_id=None, venue_order_id=None))]
     fn py_query_order<'py>(
@@ -280,6 +367,13 @@ impl BitmexHttpClient {
     }
 
     /// Request multiple order status reports.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Credentials are missing.
+    /// - The request fails.
+    /// - The API returns an error.
     #[pyo3(name = "request_order_status_reports")]
     #[pyo3(signature = (instrument_id=None, open_only=false, limit=None))]
     fn py_request_order_status_reports<'py>(
@@ -302,13 +396,17 @@ impl BitmexHttpClient {
                     .into_iter()
                     .map(|report| report.into_py_any(py))
                     .collect();
-                let pylist = PyList::new(py, py_reports?).unwrap().into_any().unbind();
+                let pylist = PyList::new(py, py_reports?)?.into_any().unbind();
                 Ok(pylist)
             })
         })
     }
 
     /// Request fill reports for the given instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or parsing fails.
     #[pyo3(name = "request_fill_reports")]
     #[pyo3(signature = (instrument_id=None, limit=None))]
     fn py_request_fill_reports<'py>(
@@ -330,13 +428,17 @@ impl BitmexHttpClient {
                     .into_iter()
                     .map(|report| report.into_py_any(py))
                     .collect();
-                let pylist = PyList::new(py, py_reports?).unwrap().into_any().unbind();
+                let pylist = PyList::new(py, py_reports?)?.into_any().unbind();
                 Ok(pylist)
             })
         })
     }
 
     /// Request position reports.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or parsing fails.
     #[pyo3(name = "request_position_status_reports")]
     fn py_request_position_status_reports<'py>(
         &self,
@@ -355,13 +457,18 @@ impl BitmexHttpClient {
                     .into_iter()
                     .map(|report| report.into_py_any(py))
                     .collect();
-                let pylist = PyList::new(py, py_reports?).unwrap().into_any().unbind();
+                let pylist = PyList::new(py, py_reports?)?.into_any().unbind();
                 Ok(pylist)
             })
         })
     }
 
     /// Submit a new order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing, the request fails, order validation fails,
+    /// the order is rejected, or the API returns an error.
     #[pyo3(name = "submit_order")]
     #[pyo3(signature = (
         instrument_id,
@@ -445,6 +552,14 @@ impl BitmexHttpClient {
     }
 
     /// Cancel an order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Credentials are missing.
+    /// - The request fails.
+    /// - The order doesn't exist.
+    /// - The API returns an error.
     #[pyo3(name = "cancel_order")]
     #[pyo3(signature = (instrument_id, client_order_id=None, venue_order_id=None))]
     fn py_cancel_order<'py>(
@@ -467,6 +582,14 @@ impl BitmexHttpClient {
     }
 
     /// Cancel multiple orders.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Credentials are missing.
+    /// - The request fails.
+    /// - The order doesn't exist.
+    /// - The API returns an error.
     #[pyo3(name = "cancel_orders")]
     #[pyo3(signature = (instrument_id, client_order_ids=None, venue_order_ids=None))]
     fn py_cancel_orders<'py>(
@@ -489,13 +612,21 @@ impl BitmexHttpClient {
                     .into_iter()
                     .map(|report| report.into_py_any(py))
                     .collect();
-                let pylist = PyList::new(py, py_reports?).unwrap().into_any().unbind();
+                let pylist = PyList::new(py, py_reports?)?.into_any().unbind();
                 Ok(pylist)
             })
         })
     }
 
     /// Cancel all orders for an instrument and optionally an order side.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Credentials are missing.
+    /// - The request fails.
+    /// - The order doesn't exist.
+    /// - The API returns an error.
     #[pyo3(name = "cancel_all_orders")]
     #[pyo3(signature = (instrument_id, order_side))]
     fn py_cancel_all_orders<'py>(
@@ -517,13 +648,22 @@ impl BitmexHttpClient {
                     .into_iter()
                     .map(|report| report.into_py_any(py))
                     .collect();
-                let pylist = PyList::new(py, py_reports?).unwrap().into_any().unbind();
+                let pylist = PyList::new(py, py_reports?)?.into_any().unbind();
                 Ok(pylist)
             })
         })
     }
 
     /// Modify an existing order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Credentials are missing.
+    /// - The request fails.
+    /// - The order doesn't exist.
+    /// - The order is already closed.
+    /// - The API returns an error.
     #[pyo3(name = "modify_order")]
     #[pyo3(signature = (
         instrument_id,
@@ -616,6 +756,10 @@ impl BitmexHttpClient {
     }
 
     /// Request account state for the authenticated BitMEX account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or no account state is returned.
     #[pyo3(name = "request_account_state")]
     fn py_request_account_state<'py>(
         &self,
@@ -705,6 +849,10 @@ impl BitmexHttpClient {
     /// Sets the dead man's switch (cancel all orders after timeout).
     ///
     /// Calling with `timeout_ms=0` disarms the switch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails.
     #[pyo3(name = "cancel_all_after")]
     fn py_cancel_all_after<'py>(
         &self,

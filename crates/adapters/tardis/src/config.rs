@@ -98,7 +98,7 @@ pub struct TardisReplayConfig {
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.tardis", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.tardis", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -133,6 +133,15 @@ pub struct TardisDataClientConfig {
     #[builder(default)]
     pub stream_options: Vec<StreamNormalizedRequestOptions>,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(TardisDataClientConfig {
+    tardis_ws_url: Option<String>,
+    normalize_symbols: bool,
+    extract_bbo_as_quotes: bool,
+    options: Vec<ReplayNormalizedRequestOptions>,
+    stream_options: Vec<StreamNormalizedRequestOptions>,
+});
 
 impl Default for TardisDataClientConfig {
     fn default() -> Self {

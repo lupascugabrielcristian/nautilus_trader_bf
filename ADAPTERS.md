@@ -78,19 +78,22 @@ third-party adapter, please file a minimal reproducible example against the
 The following adapters are maintained in the core repository:
 
 | Adapter             | Type           |
-|---------------------|----------------|
+| ------------------- | -------------- |
 | Architect (AX)      | Data/Execution |
 | Betfair             | Data/Execution |
 | Binance             | Data/Execution |
+| Blockchain          | Data           |
 | BitMEX              | Data/Execution |
 | Bybit               | Data/Execution |
 | Coinbase            | Data/Execution |
 | Databento           | Data           |
 | Deribit             | Data/Execution |
+| Derive              | Data/Execution |
 | dYdX                | Data/Execution |
 | Hyperliquid         | Data/Execution |
 | Interactive Brokers | Data/Execution |
 | Kraken              | Data/Execution |
+| Lighter             | Data/Execution |
 | OKX                 | Data/Execution |
 | Polymarket          | Data/Execution |
 | Tardis              | Data           |
@@ -120,13 +123,19 @@ listing criteria or misrepresents its relationship to NautilusTrader.
 
 Community adapters are externally maintained and are not supported by NautilusTrader maintainers.
 
-| Project                                                 | Description                                | Maintainer |
-|---------------------------------------------------------|--------------------------------------------|------------|
-| [mt5-connect](https://github.com/aulekator/mt5-connect) | Unofficial community MetaTrader 5 adapter. | aulekator  |
+| Project                                          | Description                                | Maintainer    |
+| ------------------------------------------------ | ------------------------------------------ | ------------- |
+| [mt5-connector][mt5-connector]                   | MetaTrader 5 adapter.                      | aulekator     |
+| [sinopac-nt-community][sinopac-nt-community]     | SinoPac Securities Taiwan markets adapter. | Martingale42  |
+| [tickerall-nt-community][tickerall-nt-community] | MetaTrader 5 market data adapter.          | Miguel Santos |
+
+[mt5-connector]: https://github.com/aulekator/mt5-connector
+[sinopac-nt-community]: https://github.com/Martingale42/sinopac-nt-community
+[tickerall-nt-community]: https://github.com/miguelangelo78/tickerall-nt-community
 
 ## Updates
 
 This document may be updated from time to time. Changes are tracked through the
 repository's version control history.
 
-Last updated: 2026-04-25
+Last updated: 2026-08-24

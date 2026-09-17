@@ -15,6 +15,10 @@
 
 use ahash::AHashMap;
 use derive_builder::Builder;
+use nautilus_core::serialization::{
+    deserialize_decimal, deserialize_decimal_from_str, deserialize_optional_decimal_from_str,
+    serialize_decimal_as_str,
+};
 use nautilus_model::{
     data::{
         Bar, Data, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate, OrderBookDeltas,
@@ -22,6 +26,7 @@ use nautilus_model::{
     },
     reports::{FillReport, OrderStatusReport},
 };
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
@@ -31,7 +36,7 @@ use crate::{
         HyperliquidOrderStatus as HyperliquidOrderStatusEnum, HyperliquidSide,
         HyperliquidTimeInForce, HyperliquidTpSl, HyperliquidTwapStatus,
     },
-    http::models::{HyperliquidExchangeRequest, HyperliquidExecAction},
+    http::models::{HyperliquidExchangeAction, HyperliquidExchangeRequest},
 };
 
 /// Represents an outbound WebSocket message from client to Hyperliquid.
@@ -130,7 +135,7 @@ pub enum PostRequest {
     Info { payload: serde_json::Value },
     /// Action request (requires signature).
     Action {
-        payload: HyperliquidExchangeRequest<HyperliquidExecAction>,
+        payload: HyperliquidExchangeRequest<HyperliquidExchangeAction>,
     },
 }
 
@@ -164,9 +169,17 @@ pub enum ActionRequest {
         grouping: String,
     },
     /// Cancel orders.
-    Cancel { cancels: Vec<CancelRequest> },
+    Cancel {
+        cancels: Vec<CancelRequest>,
+        #[serde(rename = "f", skip_serializing_if = "Option::is_none")]
+        fast: Option<bool>,
+    },
     /// Cancel orders by client order ID.
-    CancelByCloid { cancels: Vec<CancelByCloidRequest> },
+    CancelByCloid {
+        cancels: Vec<CancelByCloidRequest>,
+        #[serde(rename = "f", skip_serializing_if = "Option::is_none")]
+        fast: Option<bool>,
+    },
     /// Modify orders.
     Modify { modifies: Vec<ModifyRequest> },
 }
@@ -195,7 +208,10 @@ impl ActionRequest {
     /// ]);
     /// ```
     pub fn cancel(cancels: Vec<CancelRequest>) -> Self {
-        Self::Cancel { cancels }
+        Self::Cancel {
+            cancels,
+            fast: None,
+        }
     }
 
     /// Create a cancel-by-cloid action
@@ -207,7 +223,10 @@ impl ActionRequest {
     /// ]);
     /// ```
     pub fn cancel_by_cloid(cancels: Vec<CancelByCloidRequest>) -> Self {
-        Self::CancelByCloid { cancels }
+        Self::CancelByCloid {
+            cancels,
+            fast: None,
+        }
     }
 
     /// Create a modify action for multiple orders
@@ -413,15 +432,20 @@ pub struct CandleData {
     /// Interval.
     pub i: Ustr,
     /// Open price.
-    pub o: String,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub o: Decimal,
     /// Close price.
-    pub c: String,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub c: Decimal,
     /// High price.
-    pub h: String,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub h: Decimal,
     /// Low price.
-    pub l: String,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub l: Decimal,
     /// Volume.
-    pub v: String,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub v: Decimal,
     /// Number of trades.
     pub n: u32,
 }
@@ -438,9 +462,17 @@ pub struct WsBookData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WsLevelData {
     /// Price.
-    pub px: String,
+    #[serde(
+        deserialize_with = "deserialize_decimal_from_str",
+        serialize_with = "serialize_decimal_as_str"
+    )]
+    pub px: Decimal,
     /// Size.
-    pub sz: String,
+    #[serde(
+        deserialize_with = "deserialize_decimal_from_str",
+        serialize_with = "serialize_decimal_as_str"
+    )]
+    pub sz: Decimal,
     /// Number of orders.
     pub n: u32,
 }
@@ -450,8 +482,16 @@ pub struct WsLevelData {
 pub struct WsTradeData {
     pub coin: Ustr,
     pub side: HyperliquidSide,
-    pub px: String,
-    pub sz: String,
+    #[serde(
+        deserialize_with = "deserialize_decimal_from_str",
+        serialize_with = "serialize_decimal_as_str"
+    )]
+    pub px: Decimal,
+    #[serde(
+        deserialize_with = "deserialize_decimal_from_str",
+        serialize_with = "serialize_decimal_as_str"
+    )]
+    pub sz: Decimal,
     pub hash: String,
     pub time: u64,
     pub tid: u64,
@@ -472,20 +512,25 @@ pub struct WsOrderData {
 pub struct WsBasicOrderData {
     pub coin: Ustr,
     pub side: HyperliquidSide,
-    #[serde(rename = "limitPx")]
-    pub limit_px: String,
-    pub sz: String,
+    #[serde(rename = "limitPx", deserialize_with = "deserialize_decimal_from_str")]
+    pub limit_px: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub sz: Decimal,
     pub oid: u64,
     pub timestamp: u64,
-    #[serde(rename = "origSz")]
-    pub orig_sz: String,
+    #[serde(rename = "origSz", deserialize_with = "deserialize_decimal_from_str")]
+    pub orig_sz: Decimal,
     pub cloid: Option<String>,
     pub tif: Option<HyperliquidTimeInForce>,
     #[serde(rename = "reduceOnly")]
     pub reduce_only: Option<bool>,
     /// Trigger price for conditional orders (stop/take-profit).
-    #[serde(rename = "triggerPx")]
-    pub trigger_px: Option<String>,
+    #[serde(
+        rename = "triggerPx",
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str"
+    )]
+    pub trigger_px: Option<Decimal>,
     /// Whether this is a market or limit trigger order.
     #[serde(rename = "isMarket")]
     pub is_market: Option<bool>,
@@ -526,13 +571,18 @@ impl TrailingOffsetType {
 #[derive(Debug, Clone, Deserialize)]
 pub struct WsTrailingStopData {
     /// Trailing offset value.
-    pub offset: String,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub offset: Decimal,
     /// Offset type.
     #[serde(rename = "offsetType")]
     pub offset_type: TrailingOffsetType,
     /// Current callback price (highest/lowest price reached).
-    #[serde(rename = "callbackPrice")]
-    pub callback_price: Option<String>,
+    #[serde(
+        rename = "callbackPrice",
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str"
+    )]
+    pub callback_price: Option<Decimal>,
 }
 
 /// WebSocket user event data.
@@ -568,26 +618,39 @@ pub enum WsUserEventData {
 #[derive(Debug, Clone, Deserialize)]
 pub struct WsFillData {
     pub coin: Ustr,
-    pub px: String,
-    pub sz: String,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub px: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub sz: Decimal,
     pub side: HyperliquidSide,
     pub time: u64,
-    #[serde(rename = "startPosition")]
-    pub start_position: String,
+    #[serde(
+        rename = "startPosition",
+        deserialize_with = "deserialize_decimal_from_str"
+    )]
+    pub start_position: Decimal,
     pub dir: HyperliquidFillDirection,
-    #[serde(rename = "closedPnl")]
-    pub closed_pnl: String,
+    #[serde(
+        rename = "closedPnl",
+        deserialize_with = "deserialize_decimal_from_str"
+    )]
+    pub closed_pnl: Decimal,
     pub hash: String,
     pub oid: u64,
     pub crossed: bool,
-    pub fee: String,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub fee: Decimal,
     pub tid: u64,
     #[serde(default)]
     pub liquidation: Option<FillLiquidationData>,
     #[serde(rename = "feeToken")]
     pub fee_token: Ustr,
-    #[serde(rename = "builderFee")]
-    pub builder_fee: Option<String>,
+    #[serde(
+        rename = "builderFee",
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str"
+    )]
+    pub builder_fee: Option<Decimal>,
     /// Client order ID (hex string with 0x prefix).
     pub cloid: Option<String>,
     /// TWAP order ID if this fill is part of a TWAP order.
@@ -600,8 +663,8 @@ pub struct WsFillData {
 pub struct FillLiquidationData {
     #[serde(rename = "liquidatedUser")]
     pub liquidated_user: Option<String>,
-    #[serde(rename = "markPx")]
-    pub mark_px: f64,
+    #[serde(rename = "markPx", deserialize_with = "deserialize_decimal_from_str")]
+    pub mark_px: Decimal,
     pub method: HyperliquidLiquidationMethod,
 }
 
@@ -610,10 +673,15 @@ pub struct FillLiquidationData {
 pub struct WsUserFundingData {
     pub time: u64,
     pub coin: Ustr,
-    pub usdc: String,
-    pub szi: String,
-    #[serde(rename = "fundingRate")]
-    pub funding_rate: String,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub usdc: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub szi: Decimal,
+    #[serde(
+        rename = "fundingRate",
+        deserialize_with = "deserialize_decimal_from_str"
+    )]
+    pub funding_rate: Decimal,
 }
 
 /// WebSocket liquidation data.
@@ -622,8 +690,10 @@ pub struct WsLiquidationData {
     pub lid: u64,
     pub liquidator: String,
     pub liquidated_user: String,
-    pub liquidated_ntl_pos: String,
-    pub liquidated_account_value: String,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub liquidated_ntl_pos: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub liquidated_account_value: Decimal,
 }
 
 /// WebSocket non-user cancel data.
@@ -639,8 +709,11 @@ pub struct WsTriggerActivatedData {
     pub coin: Ustr,
     pub oid: u64,
     pub time: u64,
-    #[serde(rename = "triggerPx")]
-    pub trigger_px: String,
+    #[serde(
+        rename = "triggerPx",
+        deserialize_with = "deserialize_decimal_from_str"
+    )]
+    pub trigger_px: Decimal,
     pub tpsl: HyperliquidTpSl,
 }
 
@@ -650,10 +723,13 @@ pub struct WsTriggerTriggeredData {
     pub coin: Ustr,
     pub oid: u64,
     pub time: u64,
-    #[serde(rename = "triggerPx")]
-    pub trigger_px: String,
-    #[serde(rename = "marketPx")]
-    pub market_px: String,
+    #[serde(
+        rename = "triggerPx",
+        deserialize_with = "deserialize_decimal_from_str"
+    )]
+    pub trigger_px: Decimal,
+    #[serde(rename = "marketPx", deserialize_with = "deserialize_decimal_from_str")]
+    pub market_px: Decimal,
     pub tpsl: HyperliquidTpSl,
     /// Order ID of the resulting market/limit order after trigger.
     #[serde(rename = "resultingOid")]
@@ -689,18 +765,32 @@ pub enum WsActiveAssetCtxData {
 /// Shared asset context fields.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SharedAssetCtx {
-    #[serde(rename = "dayNtlVlm")]
-    pub day_ntl_vlm: String,
-    #[serde(rename = "prevDayPx")]
-    pub prev_day_px: String,
-    #[serde(rename = "markPx")]
-    pub mark_px: String,
-    #[serde(rename = "midPx")]
-    pub mid_px: Option<String>,
+    #[serde(
+        rename = "dayNtlVlm",
+        deserialize_with = "deserialize_decimal_from_str"
+    )]
+    pub day_ntl_vlm: Decimal,
+    #[serde(
+        rename = "prevDayPx",
+        deserialize_with = "deserialize_decimal_from_str"
+    )]
+    pub prev_day_px: Decimal,
+    #[serde(rename = "markPx", deserialize_with = "deserialize_decimal_from_str")]
+    pub mark_px: Decimal,
+    #[serde(
+        rename = "midPx",
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str"
+    )]
+    pub mid_px: Option<Decimal>,
     #[serde(rename = "impactPxs")]
     pub impact_pxs: Option<Vec<String>>,
-    #[serde(rename = "dayBaseVlm")]
-    pub day_base_vlm: Option<String>,
+    #[serde(
+        rename = "dayBaseVlm",
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str"
+    )]
+    pub day_base_vlm: Option<Decimal>,
 }
 
 /// Perps asset context.
@@ -708,12 +798,17 @@ pub struct SharedAssetCtx {
 pub struct PerpsAssetCtx {
     #[serde(flatten)]
     pub shared: SharedAssetCtx,
-    pub funding: String,
-    #[serde(rename = "openInterest")]
-    pub open_interest: String,
-    #[serde(rename = "oraclePx")]
-    pub oracle_px: String,
-    pub premium: Option<String>,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub funding: Decimal,
+    #[serde(
+        rename = "openInterest",
+        deserialize_with = "deserialize_decimal_from_str"
+    )]
+    pub open_interest: Decimal,
+    #[serde(rename = "oraclePx", deserialize_with = "deserialize_decimal_from_str")]
+    pub oracle_px: Decimal,
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_from_str")]
+    pub premium: Option<Decimal>,
 }
 
 /// Spot asset context.
@@ -721,8 +816,11 @@ pub struct PerpsAssetCtx {
 pub struct SpotAssetCtx {
     #[serde(flatten)]
     pub shared: SharedAssetCtx,
-    #[serde(rename = "circulatingSupply")]
-    pub circulating_supply: String,
+    #[serde(
+        rename = "circulatingSupply",
+        deserialize_with = "deserialize_decimal_from_str"
+    )]
+    pub circulating_supply: Decimal,
 }
 
 /// WebSocket active asset data.
@@ -777,6 +875,8 @@ pub struct WsTwapHistoryData {
     pub state: TwapStateData,
     pub status: TwapStatusData,
     pub time: u64,
+    #[serde(default, rename = "twapId")]
+    pub twap_id: Option<u64>,
 }
 
 /// TWAP state data.
@@ -785,11 +885,13 @@ pub struct TwapStateData {
     pub coin: Ustr,
     pub user: String,
     pub side: HyperliquidSide,
-    pub sz: f64,
-    #[serde(rename = "executedSz")]
-    pub executed_sz: f64,
-    #[serde(rename = "executedNtl")]
-    pub executed_ntl: f64,
+    /// Venue may send a JSON string or number.
+    #[serde(deserialize_with = "deserialize_decimal")]
+    pub sz: Decimal,
+    #[serde(rename = "executedSz", deserialize_with = "deserialize_decimal")]
+    pub executed_sz: Decimal,
+    #[serde(rename = "executedNtl", deserialize_with = "deserialize_decimal")]
+    pub executed_ntl: Decimal,
     pub minutes: u32,
     #[serde(rename = "reduceOnly")]
     pub reduce_only: bool,
@@ -801,6 +903,8 @@ pub struct TwapStateData {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TwapStatusData {
     pub status: HyperliquidTwapStatus,
+    /// Present when `status` is `error`; otherwise often omitted.
+    #[serde(default)]
     pub description: String,
 }
 
@@ -815,6 +919,7 @@ pub struct WsBboData {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use rust_decimal_macros::dec;
     use serde_json;
 
     use super::*;
@@ -881,7 +986,7 @@ mod tests {
         let trade: WsTradeData = serde_json::from_str(json).unwrap();
         assert_eq!(trade.coin, "BTC");
         assert_eq!(trade.side, HyperliquidSide::Buy);
-        assert_eq!(trade.px, "50000.0");
+        assert_eq!(trade.px, dec!(50000.0));
     }
 
     #[rstest]
@@ -910,9 +1015,9 @@ mod tests {
         }"#;
 
         let data: WsTrailingStopData = serde_json::from_str(json).unwrap();
-        assert_eq!(data.offset, "100.0");
+        assert_eq!(data.offset, dec!(100.0));
         assert_eq!(data.offset_type, TrailingOffsetType::Price);
-        assert_eq!(data.callback_price.unwrap(), "50000.0");
+        assert_eq!(data.callback_price.unwrap(), dec!(50000.0));
     }
 
     #[rstest]
@@ -928,7 +1033,7 @@ mod tests {
         let data: WsTriggerActivatedData = serde_json::from_str(json).unwrap();
         assert_eq!(data.coin, Ustr::from("BTC"));
         assert_eq!(data.oid, 12345);
-        assert_eq!(data.trigger_px, "50000.0");
+        assert_eq!(data.trigger_px, dec!(50000.0));
         assert_eq!(data.tpsl, HyperliquidTpSl::Sl);
         assert_eq!(data.time, 1704470400000);
     }
@@ -948,8 +1053,8 @@ mod tests {
         let data: WsTriggerTriggeredData = serde_json::from_str(json).unwrap();
         assert_eq!(data.coin, Ustr::from("ETH"));
         assert_eq!(data.oid, 67890);
-        assert_eq!(data.trigger_px, "3000.0");
-        assert_eq!(data.market_px, "3001.0");
+        assert_eq!(data.trigger_px, dec!(3000.0));
+        assert_eq!(data.market_px, dec!(3001.0));
         assert_eq!(data.tpsl, HyperliquidTpSl::Tp);
         assert_eq!(data.resulting_oid, Some(99999));
     }
@@ -977,12 +1082,12 @@ mod tests {
 
         let fill: WsFillData = serde_json::from_str(json).unwrap();
         assert_eq!(fill.coin, "@107");
-        assert_eq!(fill.px, "31.737");
-        assert_eq!(fill.sz, "0.31");
+        assert_eq!(fill.px, dec!(31.737));
+        assert_eq!(fill.sz, dec!(0.31));
         assert_eq!(fill.side, HyperliquidSide::Buy);
         assert_eq!(fill.oid, 308086083674);
         assert!(fill.crossed);
-        assert_eq!(fill.fee, "0.00021699");
+        assert_eq!(fill.fee, dec!(0.00021699));
         assert_eq!(fill.fee_token, "HYPE");
         assert_eq!(
             fill.cloid,
@@ -1003,7 +1108,7 @@ mod tests {
                     assert_eq!(fills.len(), 1);
                     let fill = &fills[0];
                     assert_eq!(fill.coin, "@107");
-                    assert_eq!(fill.px, "31.737");
+                    assert_eq!(fill.px, dec!(31.737));
                     assert_eq!(
                         fill.cloid,
                         Some("0xd211f1c27288259290850338d22132a0".to_string())
@@ -1028,15 +1133,59 @@ mod tests {
                     assert_eq!(fills.len(), 1);
                     let fill = &fills[0];
                     assert_eq!(fill.coin, "BTC");
-                    assert_eq!(fill.px, "79146.0");
+                    assert_eq!(fill.px, dec!(79146.0));
                     assert_eq!(fill.side, HyperliquidSide::Sell);
-                    assert_eq!(fill.builder_fee, Some("0.007914".to_string()));
+                    assert_eq!(fill.builder_fee, Some(dec!(0.007914)));
                     assert_eq!(fill.fee_token, "USDC");
                 }
                 _ => panic!("Expected Fills variant"),
             },
             _ => panic!("Expected User channel message"),
         }
+    }
+
+    #[rstest]
+    fn test_ws_user_fills_message_with_liquidation() {
+        // Real message from production that failed to parse: the liquidation
+        // block carries `markPx` as a quoted string like every other decimal.
+        let json = include_str!("../../test_data/ws_user_fill_liquidation.json");
+
+        let msg: HyperliquidWsMessage = serde_json::from_str(json).unwrap();
+
+        match msg {
+            HyperliquidWsMessage::User { data } => match data {
+                WsUserEventData::Fills { fills } => {
+                    assert_eq!(fills.len(), 1);
+                    let fill = &fills[0];
+                    let liquidation = fill.liquidation.as_ref().expect("expected liquidation");
+                    assert_eq!(fill.coin, "BTC");
+                    assert_eq!(fill.side, HyperliquidSide::Sell);
+                    assert_eq!(liquidation.mark_px, dec!(66607.0));
+                    assert_eq!(liquidation.method, HyperliquidLiquidationMethod::Market);
+                    assert_eq!(
+                        liquidation.liquidated_user.as_deref(),
+                        Some("0x360878d351f05975e25f1807a27895e1e5e004fb"),
+                    );
+                }
+                _ => panic!("Expected Fills variant"),
+            },
+            _ => panic!("Expected User channel message"),
+        }
+    }
+
+    #[rstest]
+    fn test_ws_trade_data_round_trips_decimals_as_strings() {
+        // Deserializing into Decimal then serializing must reproduce the
+        // string wire form (with scale preserved), not emit a JSON number.
+        let json = r#"{"coin":"BTC","side":"B","px":"66653.0","sz":"0.001","hash":"0xabc","time":1,"tid":2,"users":["0xa","0xb"]}"#;
+
+        let trade: WsTradeData = serde_json::from_str(json).unwrap();
+        assert_eq!(trade.px, dec!(66653.0));
+        assert_eq!(trade.sz, dec!(0.001));
+
+        let value = serde_json::to_value(&trade).unwrap();
+        assert_eq!(value["px"], serde_json::Value::from("66653.0"));
+        assert_eq!(value["sz"], serde_json::Value::from("0.001"));
     }
 }
 
@@ -1079,7 +1228,10 @@ pub enum NautilusWsMessage {
 /// This enum allows both order status updates and fill reports.
 /// to be sent through the execution engine.
 #[derive(Debug, Clone)]
-#[expect(clippy::large_enum_variant)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the variant size gap only crosses the threshold when high-precision widens the raw types"
+)]
 pub enum ExecutionReport {
     /// Order status report.
     Order(OrderStatusReport),

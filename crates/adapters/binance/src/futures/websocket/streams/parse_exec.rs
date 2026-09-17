@@ -22,7 +22,7 @@ use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     enums::{
         AccountType, LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce,
-        TrailingOffsetType,
+        TrailingOffsetType, TriggerType,
     },
     events::AccountState,
     identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId, TradeId, VenueOrderId},
@@ -35,17 +35,20 @@ use super::messages::{
     AlgoOrderUpdateData, BinanceFuturesAccountUpdateMsg, BinanceFuturesOrderUpdateMsg,
     OrderUpdateData,
 };
-use crate::common::{
-    consts::BINANCE_NAUTILUS_FUTURES_BROKER_ID,
-    encoder::decode_broker_id,
-    enums::{
-        BinanceAlgoStatus, BinanceFuturesOrderType, BinanceOrderStatus, BinanceSide,
-        BinanceTimeInForce,
+use crate::{
+    common::{
+        consts::BINANCE_NAUTILUS_FUTURES_BROKER_ID,
+        encoder::decode_client_order_id,
+        enums::{
+            BinanceAlgoStatus, BinanceFuturesOrderType, BinanceOrderStatus, BinanceSide,
+            BinanceTimeInForce, BinanceWorkingType,
+        },
+        parse::{
+            parse_millis_or_init, parse_required_decimal, parse_required_price_at_precision,
+            parse_required_quantity_at_precision,
+        },
     },
-    parse::{
-        parse_required_decimal, parse_required_price_at_precision,
-        parse_required_quantity_at_precision,
-    },
+    futures::conversions::{normalize_futures_asset, parse_good_till_date},
 };
 
 /// Converts a Binance Futures order update to a Nautilus order status report.
@@ -63,12 +66,9 @@ pub fn parse_futures_order_update_to_order_status(
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderStatusReport> {
     let order = &msg.order;
-    let ts_event = UnixNanos::from_millis(msg.event_time as u64);
+    let ts_event = parse_millis_or_init(msg.event_time, "Futures order update event time", ts_init);
 
-    let client_order_id = ClientOrderId::new(decode_broker_id(
-        &order.client_order_id,
-        BINANCE_NAUTILUS_FUTURES_BROKER_ID,
-    ));
+    let client_order_id = decode_order_client_id(order)?;
     let venue_order_id = VenueOrderId::new(order.order_id.to_string());
 
     let order_side = parse_side(order.side);
@@ -100,7 +100,7 @@ pub fn parse_futures_order_update_to_order_status(
         instrument_id,
         Some(client_order_id),
         venue_order_id,
-        order_side,
+        order_side.into(),
         order_type,
         time_in_force,
         order_status,
@@ -116,6 +116,11 @@ pub fn parse_futures_order_update_to_order_status(
     report.post_only = order.order_type == BinanceFuturesOrderType::Limit
         && order.time_in_force == BinanceTimeInForce::Gtx;
 
+    match parse_good_till_date(order.good_till_date) {
+        Ok(expire_time) => report.expire_time = expire_time,
+        Err(e) => log::warn!("{e}; omitting Futures order expiry"),
+    }
+
     if let Some(stop_price) =
         parse_optional_positive_price_at_precision(&order.stop_price, price_precision)
     {
@@ -128,7 +133,15 @@ pub fn parse_futures_order_update_to_order_status(
         .and_then(parse_trailing_offset_basis_points)
     {
         report.trailing_offset = Some(offset);
-        report.trailing_offset_type = TrailingOffsetType::BasisPoints;
+        report.trailing_offset_type = Some(TrailingOffsetType::BasisPoints);
+    }
+
+    if let Some(activation_price) = order
+        .activation_price
+        .as_deref()
+        .and_then(|raw| parse_optional_positive_price_at_precision(raw, price_precision))
+    {
+        report.activation_price = Some(activation_price);
     }
 
     if let Some(avg) = avg_px {
@@ -155,14 +168,14 @@ pub fn resolve_commission(
     last_px: Price,
     taker_fee: Option<Decimal>,
     quote_currency: Option<Currency>,
+    bnfcr_currency: Currency,
 ) -> anyhow::Result<Money> {
     if order.commission.is_some() || order.commission_asset.is_some() {
         let raw_commission = order.commission.as_deref().unwrap_or("0");
         let amount = parse_required_decimal(raw_commission, "commission")?;
-        let currency = order
-            .commission_asset
-            .as_ref()
-            .map_or_else(Currency::USDT, |a| Currency::from(a.as_str()));
+        let currency = order.commission_asset.as_ref().map_or(bnfcr_currency, |a| {
+            normalize_futures_asset(a.as_str(), bnfcr_currency)
+        });
         Money::from_decimal(amount, currency)
             .map_err(|e| anyhow::anyhow!("invalid commission='{raw_commission}': {e}"))
     } else if let Some(fee) = taker_fee {
@@ -201,16 +214,14 @@ pub fn parse_futures_order_update_to_fill(
     size_precision: u8,
     taker_fee: Option<Decimal>,
     quote_currency: Option<Currency>,
+    bnfcr_currency: Currency,
     venue_position_id: Option<PositionId>,
     ts_init: UnixNanos,
 ) -> anyhow::Result<FillReport> {
     let order = &msg.order;
-    let ts_event = UnixNanos::from_millis(msg.event_time as u64);
+    let ts_event = parse_millis_or_init(msg.event_time, "Futures fill event time", ts_init);
 
-    let client_order_id = ClientOrderId::new(decode_broker_id(
-        &order.client_order_id,
-        BINANCE_NAUTILUS_FUTURES_BROKER_ID,
-    ));
+    let client_order_id = decode_order_client_id(order)?;
     let venue_order_id = VenueOrderId::new(order.order_id.to_string());
     let trade_id = TradeId::new(order.trade_id.to_string());
 
@@ -232,7 +243,14 @@ pub fn parse_futures_order_update_to_fill(
         price_precision,
         "last_filled_price",
     )?;
-    let commission = resolve_commission(order, last_qty, last_px, taker_fee, quote_currency)?;
+    let commission = resolve_commission(
+        order,
+        last_qty,
+        last_px,
+        taker_fee,
+        quote_currency,
+        bnfcr_currency,
+    )?;
 
     Ok(FillReport::new(
         account_id,
@@ -259,22 +277,21 @@ pub fn parse_futures_order_update_to_fill(
 ///
 /// # Errors
 ///
-/// Returns an error if report quantity parsing fails.
+/// Returns an error if client order ID, report quantity, limit price, or trigger price parsing
+/// fails.
 pub fn parse_futures_algo_update_to_order_status(
     algo_data: &AlgoOrderUpdateData,
     event_time: i64,
     instrument_id: InstrumentId,
-    _price_precision: u8,
+    price_precision: u8,
     size_precision: u8,
     account_id: AccountId,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Option<OrderStatusReport>> {
-    let ts_event = UnixNanos::from_millis(event_time as u64);
+    let ts_event =
+        parse_millis_or_init(event_time, "Futures algo order update event time", ts_init);
 
-    let client_order_id = ClientOrderId::new(decode_broker_id(
-        &algo_data.client_algo_id,
-        BINANCE_NAUTILUS_FUTURES_BROKER_ID,
-    ));
+    let client_order_id = decode_algo_client_id(algo_data)?;
 
     let venue_order_id = algo_data
         .actual_order_id
@@ -297,13 +314,15 @@ pub fn parse_futures_algo_update_to_order_status(
 
     let quantity =
         parse_required_quantity_at_precision(&algo_data.quantity, size_precision, "quantity")?;
+    let trigger_price = parse_algo_trigger_price(algo_data, price_precision)?;
+    let price = parse_algo_limit_price(algo_data, price_precision)?;
 
-    let report = OrderStatusReport::new(
+    let mut report = OrderStatusReport::new(
         account_id,
         instrument_id,
         Some(client_order_id),
         venue_order_id,
-        order_side,
+        order_side.into(),
         order_type,
         time_in_force,
         order_status,
@@ -315,6 +334,20 @@ pub fn parse_futures_algo_update_to_order_status(
         None, // report_id
     );
 
+    if let Some(price) = price {
+        report.price = Some(price);
+    }
+
+    if let Some(trigger_price) = trigger_price {
+        report.trigger_price = Some(trigger_price);
+        report.trigger_type = Some(parse_working_type(algo_data.working_type));
+    }
+
+    match parse_good_till_date(algo_data.good_till_date) {
+        Ok(expire_time) => report.expire_time = expire_time,
+        Err(e) => log::warn!("{e}; omitting Futures algo order expiry"),
+    }
+
     Ok(Some(report))
 }
 
@@ -322,9 +355,11 @@ pub fn parse_futures_algo_update_to_order_status(
 pub fn parse_futures_account_update(
     msg: &BinanceFuturesAccountUpdateMsg,
     account_id: AccountId,
+    bnfcr_currency: Currency,
     ts_init: UnixNanos,
 ) -> Option<AccountState> {
-    let ts_event = UnixNanos::from_millis(msg.event_time as u64);
+    let ts_event =
+        parse_millis_or_init(msg.event_time, "Futures account update event time", ts_init);
 
     let balances: Vec<AccountBalance> = msg
         .account
@@ -335,7 +370,7 @@ pub fn parse_futures_account_update(
                 return None;
             }
 
-            let currency = Currency::from(&b.asset);
+            let currency = normalize_futures_asset(b.asset, bnfcr_currency);
             AccountBalance::from_total_and_free(b.wallet_balance, b.cross_wallet_balance, currency)
                 .ok()
         })
@@ -359,19 +394,21 @@ pub fn parse_futures_account_update(
 }
 
 /// Returns the decoded client order ID from an [`OrderUpdateData`].
-pub fn decode_order_client_id(order: &OrderUpdateData) -> ClientOrderId {
-    ClientOrderId::new(decode_broker_id(
-        &order.client_order_id,
-        BINANCE_NAUTILUS_FUTURES_BROKER_ID,
-    ))
+///
+/// # Errors
+///
+/// Returns an error if the encoded client order ID is malformed or invalid.
+pub fn decode_order_client_id(order: &OrderUpdateData) -> anyhow::Result<ClientOrderId> {
+    decode_client_order_id(&order.client_order_id, BINANCE_NAUTILUS_FUTURES_BROKER_ID)
 }
 
 /// Returns the decoded client order ID from an [`AlgoOrderUpdateData`].
-pub fn decode_algo_client_id(algo: &AlgoOrderUpdateData) -> ClientOrderId {
-    ClientOrderId::new(decode_broker_id(
-        &algo.client_algo_id,
-        BINANCE_NAUTILUS_FUTURES_BROKER_ID,
-    ))
+///
+/// # Errors
+///
+/// Returns an error if the encoded client order ID is malformed or invalid.
+pub fn decode_algo_client_id(algo: &AlgoOrderUpdateData) -> anyhow::Result<ClientOrderId> {
+    decode_client_order_id(&algo.client_algo_id, BINANCE_NAUTILUS_FUTURES_BROKER_ID)
 }
 
 fn parse_optional_positive_price_at_precision(raw: &str, precision: u8) -> Option<Price> {
@@ -383,6 +420,57 @@ fn parse_optional_positive_price_at_precision(raw: &str, precision: u8) -> Optio
     Price::from_decimal_dp(decimal, precision).ok()
 }
 
+fn parse_positive_price_at_precision(
+    raw: &str,
+    precision: u8,
+    field: &str,
+) -> anyhow::Result<Option<Price>> {
+    let decimal = parse_required_decimal(raw, field)?;
+    if decimal <= Decimal::ZERO {
+        return Ok(None);
+    }
+
+    Price::from_decimal_dp(decimal, precision)
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("invalid {field} precision: {e}"))
+}
+
+fn parse_algo_trigger_price(
+    algo_data: &AlgoOrderUpdateData,
+    price_precision: u8,
+) -> anyhow::Result<Option<Price>> {
+    let trigger_price = parse_positive_price_at_precision(
+        &algo_data.trigger_price,
+        price_precision,
+        "trigger_price",
+    )?;
+
+    if trigger_price.is_none() && requires_algo_trigger_price(algo_data.order_type) {
+        anyhow::bail!(
+            "missing positive trigger_price for Binance algo order type {:?}",
+            algo_data.order_type
+        );
+    }
+
+    Ok(trigger_price)
+}
+
+fn parse_algo_limit_price(
+    algo_data: &AlgoOrderUpdateData,
+    price_precision: u8,
+) -> anyhow::Result<Option<Price>> {
+    let price = parse_positive_price_at_precision(&algo_data.price, price_precision, "price")?;
+
+    if price.is_none() && requires_algo_limit_price(algo_data.order_type) {
+        anyhow::bail!(
+            "missing positive price for Binance algo order type {:?}",
+            algo_data.order_type
+        );
+    }
+
+    Ok(price)
+}
+
 fn parse_trailing_offset_basis_points(raw: &str) -> Option<Decimal> {
     let rate = parse_required_decimal(raw, "callback_rate").ok()?;
     if rate <= Decimal::ZERO {
@@ -390,6 +478,31 @@ fn parse_trailing_offset_basis_points(raw: &str) -> Option<Decimal> {
     }
 
     rate.checked_mul(Decimal::from(100))
+}
+
+fn parse_working_type(working_type: BinanceWorkingType) -> TriggerType {
+    match working_type {
+        BinanceWorkingType::ContractPrice => TriggerType::LastPrice,
+        BinanceWorkingType::MarkPrice => TriggerType::MarkPrice,
+        BinanceWorkingType::Unknown => TriggerType::Default,
+    }
+}
+
+fn requires_algo_trigger_price(order_type: BinanceFuturesOrderType) -> bool {
+    matches!(
+        order_type,
+        BinanceFuturesOrderType::Stop
+            | BinanceFuturesOrderType::StopMarket
+            | BinanceFuturesOrderType::TakeProfit
+            | BinanceFuturesOrderType::TakeProfitMarket
+    )
+}
+
+fn requires_algo_limit_price(order_type: BinanceFuturesOrderType) -> bool {
+    matches!(
+        order_type,
+        BinanceFuturesOrderType::Stop | BinanceFuturesOrderType::TakeProfit
+    )
 }
 
 fn parse_side(side: BinanceSide) -> OrderSide {
@@ -446,6 +559,7 @@ fn parse_time_in_force(tif: BinanceTimeInForce) -> TimeInForce {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_model::enums::OrderSide;
     use rstest::rstest;
     use serde::de::DeserializeOwned;
 
@@ -498,11 +612,82 @@ mod tests {
 
         assert_eq!(report.account_id, account_id());
         assert_eq!(report.instrument_id, instrument_id());
-        assert_eq!(report.order_side, OrderSide::Buy);
+        assert_eq!(report.order_side, OrderSide::Buy.into());
         assert_eq!(report.order_status, OrderStatus::Accepted);
         assert_eq!(report.order_type, OrderType::TrailingStopMarket);
         assert_eq!(report.venue_order_id, VenueOrderId::new("8886774"));
         assert_eq!(report.client_order_id, Some(ClientOrderId::from("TEST")));
+    }
+
+    #[rstest]
+    #[case::negative(-1)]
+    #[case::overflow(i64::MAX)]
+    fn test_parse_order_update_to_order_status_falls_back_for_invalid_timestamp(
+        #[case] event_time: i64,
+    ) {
+        let mut msg: BinanceFuturesOrderUpdateMsg = load_user_data_fixture("order_update_new.json");
+        msg.event_time = event_time;
+
+        let ts_init = UnixNanos::from(1);
+        let report = parse_futures_order_update_to_order_status(
+            &msg,
+            instrument_id(),
+            PRICE_PRECISION,
+            SIZE_PRECISION,
+            account_id(),
+            false,
+            ts_init,
+        )
+        .unwrap();
+
+        assert_eq!(report.ts_accepted, ts_init);
+        assert_eq!(report.ts_last, ts_init);
+        assert_eq!(report.ts_init, ts_init);
+    }
+
+    #[rstest]
+    fn test_parse_order_update_to_order_status_captures_activation_price() {
+        let mut msg: BinanceFuturesOrderUpdateMsg = load_user_data_fixture("order_update_new.json");
+        msg.order.activation_price = Some("1650.50".to_string());
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = parse_futures_order_update_to_order_status(
+            &msg,
+            instrument_id(),
+            PRICE_PRECISION,
+            SIZE_PRECISION,
+            account_id(),
+            false,
+            ts_init,
+        )
+        .unwrap();
+
+        assert_eq!(report.activation_price, Some(Price::from("1650.50")));
+    }
+
+    #[rstest]
+    fn test_parse_order_update_to_order_status_preserves_good_till_date() {
+        let mut msg: BinanceFuturesOrderUpdateMsg = load_user_data_fixture("order_update_new.json");
+        msg.order.time_in_force = BinanceTimeInForce::Gtd;
+        msg.order.good_till_date = Some(1_700_000_601_000);
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = parse_futures_order_update_to_order_status(
+            &msg,
+            instrument_id(),
+            PRICE_PRECISION,
+            SIZE_PRECISION,
+            account_id(),
+            false,
+            ts_init,
+        )
+        .unwrap();
+
+        assert_eq!(report.time_in_force, TimeInForce::Gtd);
+        assert_eq!(
+            report.expire_time,
+            Some(UnixNanos::from_millis(1_700_000_601_000)),
+        );
     }
 
     #[rstest]
@@ -608,6 +793,7 @@ mod tests {
             SIZE_PRECISION,
             None,
             None,
+            Currency::USDT(),
             None,
             ts_init,
         )
@@ -638,6 +824,7 @@ mod tests {
             SIZE_PRECISION,
             None,
             None,
+            Currency::USDT(),
             None,
             ts_init,
         );
@@ -661,6 +848,7 @@ mod tests {
             SIZE_PRECISION,
             None,
             None,
+            Currency::USDT(),
             None,
             ts_init,
         );
@@ -684,6 +872,7 @@ mod tests {
             SIZE_PRECISION,
             None,
             None,
+            Currency::USDT(),
             None,
             ts_init,
         );
@@ -697,12 +886,37 @@ mod tests {
         let msg: BinanceFuturesAccountUpdateMsg = load_user_data_fixture("account_update.json");
         let ts_init = UnixNanos::from(1_000_000_000u64);
 
-        let state = parse_futures_account_update(&msg, account_id(), ts_init).unwrap();
+        let state =
+            parse_futures_account_update(&msg, account_id(), Currency::USDT(), ts_init).unwrap();
 
         assert_eq!(state.account_id, account_id());
         assert_eq!(state.account_type, AccountType::Margin);
         assert!(state.is_reported);
         assert_eq!(state.balances.len(), 1);
+    }
+
+    // Credits Trading Mode (EU) reports the wallet in BNFCR, which is absent from the
+    // currency table; resolving it to the configured `bnfcr_currency` keeps the balance
+    // denominated in the stablecoin the contracts settle in instead of panicking.
+    #[rstest]
+    #[case(Currency::USDT())]
+    #[case(Currency::USDC())]
+    fn test_parse_account_update_maps_bnfcr_to_configured_currency(
+        #[case] bnfcr_currency: Currency,
+    ) {
+        let msg: BinanceFuturesAccountUpdateMsg =
+            load_user_data_fixture("account_update_bnfcr.json");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let state =
+            parse_futures_account_update(&msg, account_id(), bnfcr_currency, ts_init).unwrap();
+
+        assert_eq!(state.balances.len(), 1);
+        assert_eq!(state.balances[0].total.currency, bnfcr_currency);
+        assert_eq!(
+            state.balances[0].total.as_decimal(),
+            Decimal::from_str_exact("5001.28983031").unwrap()
+        );
     }
 
     // Regression for the #3867 bug class: WS balances whose `wb` and `cw` have more decimal
@@ -727,7 +941,8 @@ mod tests {
         let msg: BinanceFuturesAccountUpdateMsg = serde_json::from_str(json).unwrap();
         let ts_init = UnixNanos::from(1_000_000_000u64);
 
-        let state = parse_futures_account_update(&msg, account_id(), ts_init).unwrap();
+        let state =
+            parse_futures_account_update(&msg, account_id(), Currency::USDT(), ts_init).unwrap();
 
         assert_eq!(state.balances.len(), 1);
         let balance = &state.balances[0];
@@ -764,12 +979,15 @@ mod tests {
             Some(ClientOrderId::new("Q5xaq5EGKgXXa0fD7fs0Ip")),
         );
         assert_eq!(report.venue_order_id, VenueOrderId::new("2148719"));
-        assert_eq!(report.order_side, OrderSide::Sell);
+        assert_eq!(report.order_side, OrderSide::Sell.into());
         assert_eq!(report.order_type, OrderType::LimitIfTouched);
         assert_eq!(report.time_in_force, TimeInForce::Gtc);
         assert_eq!(report.order_status, OrderStatus::Canceled);
         assert_eq!(report.quantity, Quantity::new(0.01, SIZE_PRECISION));
         assert_eq!(report.filled_qty, Quantity::new(0.0, SIZE_PRECISION));
+        assert_eq!(report.price, Some(Price::from("750.00")));
+        assert_eq!(report.trigger_price, Some(Price::from("750.00")));
+        assert_eq!(report.trigger_type, Some(TriggerType::LastPrice));
         assert_eq!(
             report.ts_accepted,
             UnixNanos::from(1_750_515_742_303_000_000u64)
@@ -779,6 +997,33 @@ mod tests {
             UnixNanos::from(1_750_515_742_303_000_000u64)
         );
         assert_eq!(report.ts_init, ts_init);
+    }
+
+    #[rstest]
+    fn test_parse_algo_update_to_order_status_preserves_good_till_date() {
+        let mut msg: BinanceFuturesAlgoUpdateMsg =
+            load_user_data_fixture("algo_update_canceled.json");
+        msg.algo_order.time_in_force = BinanceTimeInForce::Gtd;
+        msg.algo_order.good_till_date = Some(1_700_000_601_000);
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = parse_futures_algo_update_to_order_status(
+            &msg.algo_order,
+            msg.event_time,
+            instrument_id(),
+            PRICE_PRECISION,
+            SIZE_PRECISION,
+            account_id(),
+            ts_init,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(report.time_in_force, TimeInForce::Gtd);
+        assert_eq!(
+            report.expire_time,
+            Some(UnixNanos::from_millis(1_700_000_601_000)),
+        );
     }
 
     #[rstest]
@@ -795,6 +1040,66 @@ mod tests {
         );
 
         assert!(report.unwrap().is_none());
+    }
+
+    #[rstest]
+    fn test_parse_algo_update_to_order_status_rejects_invalid_trigger_price() {
+        let mut msg: BinanceFuturesAlgoUpdateMsg =
+            load_user_data_fixture("algo_update_canceled.json");
+        msg.algo_order.trigger_price = "not-a-number".to_string();
+
+        let result = parse_futures_algo_update_to_order_status(
+            &msg.algo_order,
+            msg.event_time,
+            instrument_id(),
+            PRICE_PRECISION,
+            SIZE_PRECISION,
+            account_id(),
+            UnixNanos::default(),
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("trigger_price"));
+    }
+
+    #[rstest]
+    fn test_parse_algo_update_to_order_status_rejects_missing_trigger_price() {
+        let mut msg: BinanceFuturesAlgoUpdateMsg =
+            load_user_data_fixture("algo_update_canceled.json");
+        msg.algo_order.trigger_price = "0".to_string();
+
+        let result = parse_futures_algo_update_to_order_status(
+            &msg.algo_order,
+            msg.event_time,
+            instrument_id(),
+            PRICE_PRECISION,
+            SIZE_PRECISION,
+            account_id(),
+            UnixNanos::default(),
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("missing positive trigger_price"));
+    }
+
+    #[rstest]
+    fn test_parse_algo_update_to_order_status_rejects_missing_limit_price() {
+        let mut msg: BinanceFuturesAlgoUpdateMsg =
+            load_user_data_fixture("algo_update_canceled.json");
+        msg.algo_order.price = "0".to_string();
+
+        let result = parse_futures_algo_update_to_order_status(
+            &msg.algo_order,
+            msg.event_time,
+            instrument_id(),
+            PRICE_PRECISION,
+            SIZE_PRECISION,
+            account_id(),
+            UnixNanos::default(),
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("missing positive price"));
     }
 
     #[rstest]
@@ -823,9 +1128,26 @@ mod tests {
         let original = ClientOrderId::from("O-20200101-000000-000-000-1");
         msg.order.client_order_id = encode_broker_id(&original, BINANCE_NAUTILUS_FUTURES_BROKER_ID);
 
-        let decoded = decode_order_client_id(&msg.order);
+        let decoded = decode_order_client_id(&msg.order).unwrap();
 
         assert_eq!(decoded, original);
+    }
+
+    #[rstest]
+    #[case::empty("", "invalid Binance client order ID ''")]
+    #[case::whitespace("   ", "invalid Binance client order ID '   '")]
+    #[case::non_ascii("client-é", "invalid Binance client order ID 'client-é'")]
+    #[case::malformed_prefixed("x-aHRE4BCj-R", "missing raw broker client order ID payload")]
+    fn test_decode_order_client_id_rejects_invalid_input(
+        #[case] client_order_id: &str,
+        #[case] expected: &str,
+    ) {
+        let mut msg: BinanceFuturesOrderUpdateMsg = load_user_data_fixture("order_update_new.json");
+        msg.order.client_order_id = client_order_id.to_string();
+
+        let result = decode_order_client_id(&msg.order);
+
+        assert_eq!(result.unwrap_err().to_string(), expected);
     }
 
     #[rstest]
@@ -836,9 +1158,23 @@ mod tests {
         msg.algo_order.client_algo_id =
             encode_broker_id(&original, BINANCE_NAUTILUS_FUTURES_BROKER_ID);
 
-        let decoded = decode_algo_client_id(&msg.algo_order);
+        let decoded = decode_algo_client_id(&msg.algo_order).unwrap();
 
         assert_eq!(decoded, original);
+    }
+
+    #[rstest]
+    fn test_decode_algo_client_id_rejects_malformed_prefixed_input() {
+        let mut msg: BinanceFuturesAlgoUpdateMsg =
+            load_user_data_fixture("algo_update_canceled.json");
+        msg.algo_order.client_algo_id = "x-aHRE4BCj-Tinvalid".to_string();
+
+        let result = decode_algo_client_id(&msg.algo_order);
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "invalid O-format broker client order ID payload length"
+        );
     }
 
     #[rstest]
@@ -858,6 +1194,7 @@ mod tests {
             SIZE_PRECISION,
             None,
             None,
+            Currency::USDT(),
             None,
             ts_init,
         )
@@ -905,7 +1242,7 @@ mod tests {
             Some(ClientOrderId::new("autoclose-1234567890"))
         );
         assert_eq!(status.venue_order_id, VenueOrderId::new("8886999"));
-        assert_eq!(status.order_side, OrderSide::Sell);
+        assert_eq!(status.order_side, OrderSide::Sell.into());
         assert_eq!(status.order_status, OrderStatus::Filled);
         assert_eq!(status.quantity, Quantity::new(0.014, SIZE_PRECISION));
         assert_eq!(status.filled_qty, Quantity::new(0.014, SIZE_PRECISION));
@@ -928,6 +1265,7 @@ mod tests {
             SIZE_PRECISION,
             None,
             None,
+            Currency::USDT(),
             None,
             ts_init,
         )
@@ -983,6 +1321,7 @@ mod tests {
             SIZE_PRECISION,
             None,
             None,
+            Currency::USDT(),
             None,
             ts_init,
         )
@@ -1083,6 +1422,7 @@ mod tests {
             SIZE_PRECISION,
             None,
             None,
+            Currency::USDT(),
             None,
             UnixNanos::from(1_000_000_000u64),
         )
@@ -1133,7 +1473,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(status.order_status, OrderStatus::Filled);
-        assert_eq!(status.order_side, OrderSide::Sell);
+        assert_eq!(status.order_side, OrderSide::Sell.into());
         assert_eq!(status.quantity, Quantity::new(0.010, SIZE_PRECISION));
         assert_eq!(status.filled_qty, Quantity::new(0.010, SIZE_PRECISION));
     }
@@ -1185,8 +1525,15 @@ mod tests {
         let taker_fee = taker_fee_str.map(|s| Decimal::from_str_exact(s).unwrap());
         let quote_currency = quote_currency_str.map(Currency::from);
 
-        let commission =
-            resolve_commission(&msg.order, last_qty, last_px, taker_fee, quote_currency).unwrap();
+        let commission = resolve_commission(
+            &msg.order,
+            last_qty,
+            last_px,
+            taker_fee,
+            quote_currency,
+            Currency::USDT(),
+        )
+        .unwrap();
 
         assert_eq!(commission.currency, Currency::from(expected_currency));
         let diff = (commission.as_f64() - expected_amount).abs();
@@ -1221,6 +1568,7 @@ mod tests {
             SIZE_PRECISION,
             taker_fee,
             quote_currency,
+            Currency::USDT(),
             venue_position_id,
             ts_init,
         )

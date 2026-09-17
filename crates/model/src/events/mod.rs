@@ -29,14 +29,30 @@ pub use crate::events::{
     account::state::AccountState,
     funding::settlement::FundingSettlement,
     order::{
-        OrderEvent, OrderEventType, accepted::OrderAccepted, accepted_batch::OrderAcceptedBatch,
-        any::OrderEventAny, cancel_rejected::OrderCancelRejected, canceled::OrderCanceled,
-        canceled_batch::OrderCanceledBatch, denied::OrderDenied, emulated::OrderEmulated,
-        expired::OrderExpired, filled::OrderFilled, initialized::OrderInitialized,
-        modify_rejected::OrderModifyRejected, pending_cancel::OrderPendingCancel,
-        pending_update::OrderPendingUpdate, rejected::OrderRejected, released::OrderReleased,
-        snapshot::OrderSnapshot, submitted::OrderSubmitted, submitted_batch::OrderSubmittedBatch,
-        triggered::OrderTriggered, updated::OrderUpdated,
+        OrderEvent, OrderEventType,
+        accepted::OrderAccepted,
+        accepted_batch::OrderAcceptedBatch,
+        any::OrderEventAny,
+        cancel_rejected::OrderCancelRejected,
+        canceled::OrderCanceled,
+        canceled_batch::OrderCanceledBatch,
+        denied::OrderDenied,
+        denied_reason::{OrderDeniedCode, OrderDeniedReason, OrderPriceField},
+        emulated::OrderEmulated,
+        expired::OrderExpired,
+        fill_voided::OrderFillVoided,
+        filled::OrderFilled,
+        initialized::OrderInitialized,
+        modify_rejected::OrderModifyRejected,
+        pending_cancel::OrderPendingCancel,
+        pending_update::OrderPendingUpdate,
+        rejected::OrderRejected,
+        released::OrderReleased,
+        snapshot::OrderSnapshot,
+        submitted::OrderSubmitted,
+        submitted_batch::OrderSubmittedBatch,
+        triggered::OrderTriggered,
+        updated::OrderUpdated,
     },
     portfolio::snapshot::PortfolioSnapshot,
     position::{
@@ -153,6 +169,12 @@ impl HasTsInit for OrderFilled {
     }
 }
 
+impl HasTsInit for OrderFillVoided {
+    fn ts_init(&self) -> UnixNanos {
+        self.ts_init
+    }
+}
+
 impl HasTsInit for OrderSnapshot {
     fn ts_init(&self) -> UnixNanos {
         self.ts_init
@@ -212,6 +234,7 @@ crate::impl_catalog_path_prefix!(OrderReleased, "order_released");
 crate::impl_catalog_path_prefix!(OrderModifyRejected, "order_modify_rejected");
 crate::impl_catalog_path_prefix!(OrderUpdated, "order_updated");
 crate::impl_catalog_path_prefix!(OrderFilled, "order_filled");
+crate::impl_catalog_path_prefix!(OrderFillVoided, "order_fill_voided");
 crate::impl_catalog_path_prefix!(PositionOpened, "position_opened");
 crate::impl_catalog_path_prefix!(PositionChanged, "position_changed");
 crate::impl_catalog_path_prefix!(PositionClosed, "position_closed");

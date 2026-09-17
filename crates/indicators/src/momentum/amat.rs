@@ -16,7 +16,7 @@
 use std::fmt::{Debug, Display};
 
 use arraydeque::{ArrayDeque, Wrapping};
-use nautilus_model::data::Bar;
+use nautilus_model::data::{Bar, QuoteTick, TradeTick};
 
 use crate::{
     average::{MovingAverageFactory, MovingAverageType},
@@ -32,7 +32,7 @@ type SignalBuf = ArrayDeque<f64, { MAX_SIGNAL + 1 }, Wrapping>;
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.indicators", unsendable)
+    pyo3::pyclass(module = "nautilus_trader.indicators", unsendable)
 )]
 #[cfg_attr(
     feature = "python",
@@ -79,6 +79,12 @@ impl Indicator for ArcherMovingAveragesTrends {
     fn initialized(&self) -> bool {
         self.initialized
     }
+
+    fn handle_quote(&mut self, _quote: &QuoteTick) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn handle_trade(&mut self, _trade: &TradeTick) {}
 
     fn handle_bar(&mut self, bar: &Bar) {
         self.update_raw(bar.close.into());

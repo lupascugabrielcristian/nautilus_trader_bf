@@ -13,8 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::num::NonZeroUsize;
-
+use nautilus_common::config::{ConfigError, ConfigErrorCollector, ConfigResult};
 use nautilus_core::Params;
 use nautilus_model::{
     enums::{BookType, OrderType, TimeInForce, TrailingOffsetType, TriggerType},
@@ -27,10 +26,11 @@ use serde::{Deserialize, Serialize};
 
 /// Configuration for the execution tester strategy.
 #[derive(Debug, Clone, Deserialize, Serialize, bon::Builder)]
+#[builder(finish_fn(name = build_inner, vis = ""))]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.testkit", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.testkit", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -75,10 +75,10 @@ pub struct ExecTesterConfig {
     #[builder(default = BookType::L2_MBP)]
     pub book_type: BookType,
     /// Order book depth for subscriptions.
-    pub book_depth: Option<NonZeroUsize>,
+    pub book_depth: Option<usize>,
     /// Order book interval in milliseconds.
-    #[builder(default = NonZeroUsize::new(1000).unwrap())]
-    pub book_interval_ms: NonZeroUsize,
+    #[builder(default = 1000)]
+    pub book_interval_ms: usize,
     /// Number of order book levels to print when logging.
     #[builder(default = 10)]
     pub book_levels_to_print: usize,
@@ -149,6 +149,10 @@ pub struct ExecTesterConfig {
     /// Cancel and replace stop orders to maintain offset.
     #[builder(default = false)]
     pub cancel_replace_stop_orders_to_maintain_offset: bool,
+    /// Trigger one modify or cancel-replace when each enabled limit side is first accepted.
+    /// Combine with exactly one limit-order maintenance mode (TC-E30 to TC-E33).
+    #[builder(default = false)]
+    pub trigger_limit_order_maintenance_once: bool,
     /// Use post-only for limit orders.
     #[builder(default = false)]
     pub use_post_only: bool,
@@ -169,6 +173,8 @@ pub struct ExecTesterConfig {
     /// Close all positions on stop.
     #[builder(default = true)]
     pub close_positions_on_stop: bool,
+    /// Truncate close-on-stop quantities to this decimal precision.
+    pub close_positions_qty_precision: Option<u8>,
     /// Time in force for closing positions (None defaults to GTC).
     pub close_positions_time_in_force: Option<TimeInForce>,
     /// Use `reduce_only` when closing positions.
@@ -208,12 +214,97 @@ pub struct ExecTesterConfig {
     pub clamp_to_instrument_price_range: bool,
 }
 
+impl<S: exec_tester_config_builder::IsComplete> ExecTesterConfigBuilder<S> {
+    /// Validates and builds the [`ExecTesterConfig`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConfigError`] if any field fails validation
+    /// (see [`ExecTesterConfig::validate`]).
+    pub fn build(self) -> ConfigResult<ExecTesterConfig> {
+        let config = self.build_inner();
+        config.validate()?;
+        Ok(config)
+    }
+}
+
 impl ExecTesterConfig {
+    /// Validates the execution tester configuration, collecting every field violation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConfigError`] (a [`ConfigError::Multiple`] when more than one field is
+    /// invalid) if any field fails validation.
+    pub fn validate(&self) -> ConfigResult<()> {
+        let mut errors = ConfigErrorCollector::new();
+
+        errors.check(
+            self.book_interval_ms > 0,
+            ConfigError::range("book_interval_ms", "must be positive, was 0"),
+        );
+
+        if let Some(book_depth) = self.book_depth {
+            errors.check(
+                book_depth > 0,
+                ConfigError::range("book_depth", "must be positive, was 0"),
+            );
+        }
+
+        if self.trigger_limit_order_maintenance_once {
+            let modify = self.modify_orders_to_maintain_tob_offset;
+            let cancel_replace = self.cancel_replace_orders_to_maintain_tob_offset;
+
+            errors.check(
+                modify || cancel_replace,
+                ConfigError::required_one_of([
+                    "modify_orders_to_maintain_tob_offset",
+                    "cancel_replace_orders_to_maintain_tob_offset",
+                ]),
+            );
+            errors.check(
+                !(modify && cancel_replace),
+                ConfigError::mutually_exclusive_fields([
+                    "modify_orders_to_maintain_tob_offset",
+                    "cancel_replace_orders_to_maintain_tob_offset",
+                ]),
+            );
+            errors.check(
+                self.enable_limit_buys || self.enable_limit_sells,
+                ConfigError::dependency(
+                    "trigger_limit_order_maintenance_once",
+                    "enable_limit_buys or enable_limit_sells",
+                    "at least one limit side must be enabled",
+                ),
+            );
+            errors.check(
+                !(self.batch_submit_limit_pair
+                    && self.enable_limit_buys
+                    && self.enable_limit_sells),
+                ConfigError::mutually_exclusive_fields([
+                    "trigger_limit_order_maintenance_once",
+                    "batch_submit_limit_pair",
+                ]),
+            );
+            errors.check(
+                !self.enable_brackets,
+                ConfigError::mutually_exclusive_fields([
+                    "trigger_limit_order_maintenance_once",
+                    "enable_brackets",
+                ]),
+            );
+            errors.check(
+                !self.test_modify_rejected,
+                ConfigError::mutually_exclusive_fields([
+                    "trigger_limit_order_maintenance_once",
+                    "test_modify_rejected",
+                ]),
+            );
+        }
+
+        errors.into_result()
+    }
+
     /// Creates a new [`ExecTesterConfig`] with minimal settings.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `NonZeroUsize::new(1000)` fails (which should never happen).
     #[must_use]
     pub fn new(
         strategy_id: StrategyId,
@@ -238,7 +329,7 @@ impl ExecTesterConfig {
             subscribe_book: false,
             book_type: BookType::L2_MBP,
             book_depth: None,
-            book_interval_ms: NonZeroUsize::new(1000).unwrap(),
+            book_interval_ms: 1000,
             book_levels_to_print: 10,
             open_position_on_start_qty: None,
             open_position_on_first_quote: false,
@@ -264,12 +355,14 @@ impl ExecTesterConfig {
             modify_stop_orders_to_maintain_offset: false,
             cancel_replace_orders_to_maintain_tob_offset: false,
             cancel_replace_stop_orders_to_maintain_offset: false,
+            trigger_limit_order_maintenance_once: false,
             use_post_only: false,
             limit_aggressive: false,
             use_quote_quantity: false,
             emulation_trigger: None,
             cancel_orders_on_stop: true,
             close_positions_on_stop: true,
+            close_positions_qty_precision: None,
             close_positions_time_in_force: None,
             reduce_only_on_stop: true,
             use_individual_cancels_on_stop: false,
@@ -287,6 +380,34 @@ impl ExecTesterConfig {
 
 impl Default for ExecTesterConfig {
     fn default() -> Self {
-        Self::builder().build()
+        Self::builder()
+            .build()
+            .expect("default ExecTesterConfig should be valid")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_default_config_is_valid() {
+        assert!(ExecTesterConfig::builder().build().is_ok());
+    }
+
+    #[rstest]
+    fn test_zero_book_interval_ms_rejected() {
+        let result = ExecTesterConfig::builder().book_interval_ms(0).build();
+        assert!(
+            matches!(result, Err(ConfigError::Range { field, .. }) if field == "book_interval_ms")
+        );
+    }
+
+    #[rstest]
+    fn test_zero_book_depth_rejected() {
+        let result = ExecTesterConfig::builder().book_depth(0).build();
+        assert!(matches!(result, Err(ConfigError::Range { field, .. }) if field == "book_depth"));
     }
 }

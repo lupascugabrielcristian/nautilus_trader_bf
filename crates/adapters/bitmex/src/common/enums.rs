@@ -18,8 +18,8 @@
 use std::borrow::Cow;
 
 use nautilus_model::enums::{
-    ContingencyType, LiquiditySide, MarketStatusAction, OrderSide, OrderSideSpecified, OrderStatus,
-    OrderType, PositionSide, TimeInForce,
+    ContingencyType, LiquiditySide, MarketStatusAction, OrderSide, OrderStatus, OrderType,
+    PositionSide, TimeInForce,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use strum::{AsRefStr, Display, EnumIter, EnumString};
@@ -42,16 +42,12 @@ use strum::{AsRefStr, Display, EnumIter, EnumString};
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.bitmex",
+        module = "nautilus_trader.adapters.bitmex",
         eq,
         eq_int,
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.bitmex")
 )]
 pub enum BitmexSymbolStatus {
     /// Symbol is open for trading.
@@ -85,11 +81,11 @@ pub enum BitmexSide {
     Sell,
 }
 
-impl From<OrderSideSpecified> for BitmexSide {
-    fn from(value: OrderSideSpecified) -> Self {
+impl From<OrderSide> for BitmexSide {
+    fn from(value: OrderSide) -> Self {
         match value {
-            OrderSideSpecified::Buy => Self::Buy,
-            OrderSideSpecified::Sell => Self::Sell,
+            OrderSide::Buy => Self::Buy,
+            OrderSide::Sell => Self::Sell,
         }
     }
 }
@@ -119,16 +115,7 @@ impl From<BitmexSide> for OrderSide {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.bitmex",
-        eq,
-        eq_int,
-        from_py_object
-    )
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.bitmex")
+    pyo3::pyclass(module = "nautilus_trader.adapters.bitmex", eq, eq_int, from_py_object)
 )]
 pub enum BitmexPositionSide {
     /// Long position.
@@ -157,7 +144,7 @@ impl From<PositionSide> for BitmexPositionSide {
         match side {
             PositionSide::Long => Self::Long,
             PositionSide::Short => Self::Short,
-            PositionSide::Flat | PositionSide::NoPositionSide => Self::Flat,
+            PositionSide::Flat => Self::Flat,
         }
     }
 }
@@ -399,14 +386,14 @@ pub enum BitmexContingencyType {
     Unknown, // Can be empty
 }
 
-impl From<BitmexContingencyType> for ContingencyType {
+impl From<BitmexContingencyType> for Option<ContingencyType> {
     fn from(value: BitmexContingencyType) -> Self {
         match value {
-            BitmexContingencyType::OneCancelsTheOther => Self::Oco,
-            BitmexContingencyType::OneTriggersTheOther => Self::Oto,
-            BitmexContingencyType::OneUpdatesTheOtherProportional => Self::Ouo,
-            BitmexContingencyType::OneUpdatesTheOtherAbsolute => Self::Ouo,
-            BitmexContingencyType::Unknown => Self::NoContingency,
+            BitmexContingencyType::OneCancelsTheOther => Some(ContingencyType::Oco),
+            BitmexContingencyType::OneTriggersTheOther => Some(ContingencyType::Oto),
+            BitmexContingencyType::OneUpdatesTheOtherProportional
+            | BitmexContingencyType::OneUpdatesTheOtherAbsolute => Some(ContingencyType::Ouo),
+            BitmexContingencyType::Unknown => None,
         }
     }
 }
@@ -416,7 +403,6 @@ impl TryFrom<ContingencyType> for BitmexContingencyType {
 
     fn try_from(value: ContingencyType) -> Result<Self, Self::Error> {
         match value {
-            ContingencyType::NoContingency => Ok(Self::Unknown),
             ContingencyType::Oco => Ok(Self::OneCancelsTheOther),
             ContingencyType::Oto => Ok(Self::OneTriggersTheOther),
             ContingencyType::Ouo => anyhow::bail!("OUO contingency type not supported by BitMEX"),
@@ -640,10 +626,10 @@ pub enum BitmexInstrumentType {
     #[serde(rename = "FFICSX")]
     PredictionMarket,
 
-    /// Stock-based Perpetual Contracts (e.g., SPY, equity derivatives).
-    /// CFI code FFSCSX - financial future on stocks, cash settled.
+    /// TradFi Perpetual Contracts (equities, FX, and commodities).
+    /// CFI code FFSCSX - financial future on non-crypto underlyings, cash settled.
     #[serde(rename = "FFSCSX")]
-    StockPerpetual,
+    TradFiPerpetual,
 
     /// Perpetual Contracts (crypto).
     #[serde(rename = "FFWCSX")]
@@ -828,6 +814,9 @@ pub enum BitmexInstrumentState {
     Settled,
     /// Instrument is delisted.
     Delisted,
+    /// Unrecognized instrument state received from the venue.
+    #[serde(other)]
+    Unknown,
 }
 
 impl From<&BitmexInstrumentState> for MarketStatusAction {
@@ -838,6 +827,7 @@ impl From<&BitmexInstrumentState> for MarketStatusAction {
             BitmexInstrumentState::Settled => Self::Close,
             BitmexInstrumentState::Unlisted => Self::NotAvailableForTrading,
             BitmexInstrumentState::Delisted => Self::NotAvailableForTrading,
+            BitmexInstrumentState::Unknown => Self::NotAvailableForTrading,
         }
     }
 }
@@ -895,7 +885,7 @@ pub enum BitmexMarkMethod {
     pyo3::pyclass(
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.bitmex",
+        module = "nautilus_trader.adapters.bitmex",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -991,7 +981,7 @@ mod tests {
             r#""FFWCSF""#
         );
         assert_eq!(
-            serde_json::to_string(&BitmexInstrumentType::StockPerpetual).unwrap(),
+            serde_json::to_string(&BitmexInstrumentType::TradFiPerpetual).unwrap(),
             r#""FFSCSX""#
         );
         assert_eq!(
@@ -1085,7 +1075,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_str::<BitmexInstrumentType>(r#""FFSCSX""#).unwrap(),
-            BitmexInstrumentType::StockPerpetual
+            BitmexInstrumentType::TradFiPerpetual
         );
         assert_eq!(
             serde_json::from_str::<BitmexInstrumentType>(r#""IFXXXP""#).unwrap(),
@@ -1228,8 +1218,8 @@ mod tests {
 
     #[rstest]
     fn test_order_side_from_specified() {
-        assert_eq!(BitmexSide::from(OrderSideSpecified::Buy), BitmexSide::Buy);
-        assert_eq!(BitmexSide::from(OrderSideSpecified::Sell), BitmexSide::Sell);
+        assert_eq!(BitmexSide::from(OrderSide::Buy), BitmexSide::Buy);
+        assert_eq!(BitmexSide::from(OrderSide::Sell), BitmexSide::Sell);
     }
 
     #[rstest]
@@ -1323,10 +1313,20 @@ mod tests {
         BitmexInstrumentState::Delisted,
         MarketStatusAction::NotAvailableForTrading
     )]
+    #[case(
+        BitmexInstrumentState::Unknown,
+        MarketStatusAction::NotAvailableForTrading
+    )]
     fn test_bitmex_instrument_state_to_market_status_action(
         #[case] state: BitmexInstrumentState,
         #[case] expected: MarketStatusAction,
     ) {
         assert_eq!(MarketStatusAction::from(&state), expected);
+    }
+
+    #[rstest]
+    fn test_bitmex_instrument_state_unknown_deserializes_from_unrecognized_string() {
+        let state: BitmexInstrumentState = serde_json::from_str(r#""SomeFutureState""#).unwrap();
+        assert_eq!(state, BitmexInstrumentState::Unknown);
     }
 }

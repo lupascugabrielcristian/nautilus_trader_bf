@@ -15,7 +15,8 @@
 
 use std::{collections::HashMap, fs, io::Write, str::FromStr, sync::Arc};
 
-use nautilus_core::{Params, UnixNanos};
+use nautilus_common::live::get_runtime;
+use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::{
     data::{
         Bar, BarSpecification, BarType, BookOrder, CustomData, Data, DataType, FundingRateUpdate,
@@ -24,15 +25,16 @@ use nautilus_model::{
         is_monotonically_increasing_by_init, to_variant,
     },
     enums::{
-        AggregationSource, AggressorSide, BarAggregation, BookAction, CurrencyType,
+        AccountType, AggregationSource, AggressorSide, BarAggregation, BookAction, CurrencyType,
         GreeksConvention, OrderSide, PriceType,
     },
-    identifiers::{InstrumentId, Symbol, TradeId},
+    events::AccountState,
+    identifiers::{AccountId, InstrumentId, Symbol, TradeId},
     instruments::{
         CryptoPerpetual, CurrencyPair, Instrument, InstrumentAny,
         stubs::{audusd_sim, equity_aapl},
     },
-    types::{Currency, Price, Quantity},
+    types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
 use nautilus_persistence::{
     backend::{
@@ -40,8 +42,8 @@ use nautilus_persistence::{
         session::{DataBackendSession, QueryResult},
     },
     test_data::{
-        MacroYieldCurveData, RustTestCustomData, RustTestHashMapCustomData,
-        RustTestParamsCustomData, RustTestPriceMapCustomData,
+        MacroYieldCurveData, RustTestBytesCustomData, RustTestCustomData,
+        RustTestHashMapCustomData, RustTestParamsCustomData, RustTestPriceMapCustomData,
     },
 };
 use nautilus_serialization::{arrow::ArrowSchemaProvider, ensure_custom_data_registered};
@@ -63,6 +65,7 @@ fn ensure_test_custom_data_registered() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         ensure_custom_data_registered::<MacroYieldCurveData>();
+        ensure_custom_data_registered::<RustTestBytesCustomData>();
         ensure_custom_data_registered::<RustTestCustomData>();
         ensure_custom_data_registered::<RustTestHashMapCustomData>();
         ensure_custom_data_registered::<RustTestParamsCustomData>();
@@ -85,17 +88,17 @@ fn ethusdt_binance_id() -> InstrumentId {
 fn create_order_book_delta(ts_init: u64) -> OrderBookDelta {
     OrderBookDelta::new(
         ethusdt_binance_id(),
-        BookAction::Add,
+        BookAction::Update,
         BookOrder::new(
-            OrderSide::Buy,
-            Price::new(10000.0, 1),
-            Quantity::new(0.1, 1),
-            0,
+            OrderSide::Sell,
+            Price::new(10_000.12, 2),
+            Quantity::new(0.123, 3),
+            42,
         ),
-        0,
-        0,
+        7,
+        ts_init + 100,
+        UnixNanos::from(ts_init - 1),
         UnixNanos::from(ts_init),
-        UnixNanos::from(0),
     )
 }
 
@@ -154,9 +157,9 @@ fn create_order_book_depth10(ts_init: u64) -> OrderBookDepth10 {
         asks,
         bid_counts,
         ask_counts,
-        0,
-        0,
-        UnixNanos::from(0),
+        6,
+        ts_init + 200,
+        UnixNanos::from(ts_init - 1),
         UnixNanos::from(ts_init),
     )
 }
@@ -199,7 +202,7 @@ fn create_trade_tick(ts_init: u64) -> TradeTick {
         ethusdt_binance_id(),
         Price::new(1987.0, 1),
         Quantity::new(0.1, 1),
-        AggressorSide::Buyer,
+        AggressorSide::Buy,
         TradeId::from("123456"),
         UnixNanos::from(0),
         UnixNanos::from(ts_init),
@@ -266,7 +269,7 @@ fn create_bar(ts_init: u64) -> Bar {
     Bar::new(
         bar_type,
         Price::new(1.00001, 5),
-        Price::new(1.1, 1),
+        Price::new(1.10000, 5),
         Price::new(1.00000, 5),
         Price::new(1.00000, 5),
         Quantity::new(100_000.0, 0),
@@ -285,7 +288,7 @@ fn create_index_bar(ts_init: u64) -> Bar {
     Bar::new(
         bar_type,
         Price::new(1.00001, 5),
-        Price::new(1.1, 1),
+        Price::new(1.10000, 5),
         Price::new(1.00000, 5),
         Price::new(1.00000, 5),
         Quantity::new(0.0, 0),
@@ -304,7 +307,7 @@ fn test_quote_tick_query() {
         .add_file::<QuoteTick>("quote_005", file_path.as_str(), None, None)
         .unwrap();
     let query_result: QueryResult = catalog.get_query_result();
-    let ticks: Vec<Data> = query_result.collect();
+    let ticks: Vec<Data> = query_result.collect::<Result<_, _>>().unwrap();
 
     if let Data::Quote(q) = ticks[0] {
         assert_eq!("EUR/USD.SIM", q.instrument_id.to_string());
@@ -330,7 +333,7 @@ fn test_quote_tick_query_with_filter() {
         )
         .unwrap();
     let query_result: QueryResult = catalog.get_query_result();
-    let ticks: Vec<Data> = query_result.collect();
+    let ticks: Vec<Data> = query_result.collect::<Result<_, _>>().unwrap();
     assert!(is_monotonically_increasing_by_init(&ticks));
 }
 
@@ -348,7 +351,7 @@ fn test_quote_tick_multiple_query() {
         .add_file::<TradeTick>("quote_tick_2", file_path_trades.as_str(), None, None)
         .unwrap();
     let query_result: QueryResult = catalog.get_query_result();
-    let ticks: Vec<Data> = query_result.collect();
+    let ticks: Vec<Data> = query_result.collect::<Result<_, _>>().unwrap();
 
     assert_eq!(ticks.len(), expected_length);
     assert!(is_monotonically_increasing_by_init(&ticks));
@@ -364,7 +367,7 @@ fn test_trade_tick_query() {
         .add_file::<TradeTick>("trade_001", file_path.as_str(), None, None)
         .unwrap();
     let query_result: QueryResult = catalog.get_query_result();
-    let ticks: Vec<Data> = query_result.collect();
+    let ticks: Vec<Data> = query_result.collect::<Result<_, _>>().unwrap();
 
     if let Data::Trade(t) = ticks[0] {
         assert_eq!("EUR/USD.SIM", t.instrument_id.to_string());
@@ -386,7 +389,7 @@ fn test_bar_query() {
         .add_file::<Bar>("bar_001", file_path.as_str(), None, None)
         .unwrap();
     let query_result: QueryResult = catalog.get_query_result();
-    let ticks: Vec<Data> = query_result.collect();
+    let ticks: Vec<Data> = query_result.collect::<Result<_, _>>().unwrap();
 
     if let Data::Bar(b) = &ticks[0] {
         assert_eq!("ADABTC.BINANCE", b.bar_type.instrument_id().to_string());
@@ -414,7 +417,7 @@ fn test_datafusion_parquet_round_trip() {
         .add_file::<QuoteTick>("test_data", file_path.as_str(), None, None)
         .unwrap();
     let query_result: QueryResult = session.get_query_result();
-    let quote_ticks: Vec<Data> = query_result.collect();
+    let quote_ticks: Vec<Data> = query_result.collect::<Result<_, _>>().unwrap();
     let quote_ticks: Vec<QuoteTick> = to_variant(quote_ticks);
 
     let metadata = HashMap::from([
@@ -449,7 +452,7 @@ fn test_datafusion_parquet_round_trip() {
         .add_file::<QuoteTick>("test_data", temp_file_path.to_str().unwrap(), None, None)
         .unwrap();
     let query_result: QueryResult = session.get_query_result();
-    let ticks: Vec<Data> = query_result.collect();
+    let ticks: Vec<Data> = query_result.collect::<Result<_, _>>().unwrap();
     let ticks_variants: Vec<QuoteTick> = to_variant(ticks);
 
     assert_eq!(quote_ticks.len(), ticks_variants.len());
@@ -460,16 +463,36 @@ fn test_datafusion_parquet_round_trip() {
 
 #[rstest]
 fn test_rust_write_2_bars_to_catalog() {
-    let (_temp_dir, catalog) = create_temp_catalog();
+    let (_temp_dir, mut catalog) = create_temp_catalog();
 
     let bars = vec![create_bar(1), create_bar(2)];
-    catalog
-        .write_to_parquet(bars.clone(), None, None, None)
-        .unwrap();
+    catalog.write_to_parquet(&bars, None, None, None).unwrap();
 
     let bar_type = bars[0].bar_type.to_string();
     let intervals = catalog.get_intervals("bars", Some(&bar_type)).unwrap();
+    let loaded = catalog
+        .bars(Some(vec!["AUD/USD.SIM".to_string()]), None, None)
+        .unwrap();
+
     assert_eq!(intervals, vec![(1, 2)]);
+    assert_eq!(loaded, bars);
+}
+
+#[rstest]
+fn test_rust_query_bars_inside_nautilus_runtime() {
+    let (_temp_dir, mut catalog) = create_temp_catalog();
+
+    let bars = vec![create_bar(1), create_bar(2)];
+    catalog.write_to_parquet(&bars, None, None, None).unwrap();
+
+    let loaded = get_runtime().block_on(async {
+        tokio::task::yield_now().await;
+        catalog
+            .bars(Some(vec!["AUD/USD.SIM".to_string()]), None, None)
+            .unwrap()
+    });
+
+    assert_eq!(loaded, bars);
 }
 
 #[rstest]
@@ -477,12 +500,10 @@ fn test_rust_append_data_to_catalog() {
     let (_temp_dir, catalog) = create_temp_catalog();
 
     let bars1 = vec![create_bar(1), create_bar(2)];
-    catalog
-        .write_to_parquet(bars1.clone(), None, None, None)
-        .unwrap();
+    catalog.write_to_parquet(&bars1, None, None, None).unwrap();
 
     let bars2 = vec![create_bar(3)];
-    catalog.write_to_parquet(bars2, None, None, None).unwrap();
+    catalog.write_to_parquet(&bars2, None, None, None).unwrap();
 
     let bar_type = bars1[0].bar_type.to_string();
     let intervals = catalog.get_intervals("bars", Some(&bar_type)).unwrap();
@@ -498,8 +519,10 @@ fn test_rust_get_intervals_without_identifier_aggregates_across_partitions() {
     let audusd = create_quote_ticks_for_instrument("AUD/USD.SIM", 1_000, 2);
     let ethusdt = create_quote_ticks_for_instrument("ETH/USDT.BINANCE", 5_000, 2);
 
-    catalog.write_to_parquet(audusd, None, None, None).unwrap();
-    catalog.write_to_parquet(ethusdt, None, None, None).unwrap();
+    catalog.write_to_parquet(&audusd, None, None, None).unwrap();
+    catalog
+        .write_to_parquet(&ethusdt, None, None, None)
+        .unwrap();
 
     let aud_intervals = catalog
         .get_intervals("quotes", Some("AUD/USD.SIM"))
@@ -524,8 +547,10 @@ fn test_rust_get_intervals_without_identifier_merges_overlapping_partitions() {
     let audusd = create_quote_ticks_for_instrument("AUD/USD.SIM", 1_000, 10);
     let ethusdt = create_quote_ticks_for_instrument("ETH/USDT.BINANCE", 5_000, 2);
 
-    catalog.write_to_parquet(audusd, None, None, None).unwrap();
-    catalog.write_to_parquet(ethusdt, None, None, None).unwrap();
+    catalog.write_to_parquet(&audusd, None, None, None).unwrap();
+    catalog
+        .write_to_parquet(&ethusdt, None, None, None)
+        .unwrap();
 
     let all_intervals = catalog.get_intervals("quotes", None).unwrap();
     assert_eq!(all_intervals, vec![(1_000, 10_000)]);
@@ -548,12 +573,10 @@ fn test_rust_consolidate_catalog() {
     let (_temp_dir, catalog) = create_temp_catalog();
 
     let bars1 = vec![create_bar(1), create_bar(2)];
-    catalog
-        .write_to_parquet(bars1.clone(), None, None, None)
-        .unwrap();
+    catalog.write_to_parquet(&bars1, None, None, None).unwrap();
 
     let bars2 = vec![create_bar(3)];
-    catalog.write_to_parquet(bars2, None, None, None).unwrap();
+    catalog.write_to_parquet(&bars2, None, None, None).unwrap();
 
     let bar_type = bars1[0].bar_type.to_string();
     catalog
@@ -569,15 +592,13 @@ fn test_rust_consolidate_catalog_with_time_range() {
     let (_temp_dir, catalog) = create_temp_catalog();
 
     let bars1 = vec![create_bar(1)];
-    catalog
-        .write_to_parquet(bars1.clone(), None, None, None)
-        .unwrap();
+    catalog.write_to_parquet(&bars1, None, None, None).unwrap();
 
     let bars2 = vec![create_bar(2)];
-    catalog.write_to_parquet(bars2, None, None, None).unwrap();
+    catalog.write_to_parquet(&bars2, None, None, None).unwrap();
 
     let bars3 = vec![create_bar(3)];
-    catalog.write_to_parquet(bars3, None, None, None).unwrap();
+    catalog.write_to_parquet(&bars3, None, None, None).unwrap();
 
     let bar_type = bars1[0].bar_type.to_string();
     catalog
@@ -601,13 +622,11 @@ fn test_rust_consolidate_with_deduplication() {
 
     // Write bars [1, 2] and [2, 3] as separate files so ts=2 is duplicated
     let bars_a = vec![create_bar(1), create_bar(2)];
-    catalog
-        .write_to_parquet(bars_a.clone(), None, None, None)
-        .unwrap();
+    catalog.write_to_parquet(&bars_a, None, None, None).unwrap();
 
     let bars_b = vec![create_bar(2), create_bar(3)];
     catalog
-        .write_to_parquet(bars_b, None, None, Some(true))
+        .write_to_parquet(&bars_b, None, None, Some(true))
         .unwrap();
 
     let bar_type = bars_a[0].bar_type.to_string();
@@ -664,13 +683,11 @@ fn test_rust_consolidate_index_with_deduplication() {
 
     // Write bars [1, 2] and [2, 3] as separate files so ts=2 is duplicated
     let bars_a = vec![create_index_bar(1), create_index_bar(2)];
-    catalog
-        .write_to_parquet(bars_a.clone(), None, None, None)
-        .unwrap();
+    catalog.write_to_parquet(&bars_a, None, None, None).unwrap();
 
     let bars_b = vec![create_index_bar(2), create_index_bar(3)];
     catalog
-        .write_to_parquet(bars_b, None, None, Some(true))
+        .write_to_parquet(&bars_b, None, None, Some(true))
         .unwrap();
 
     let bar_type = bars_a[0].bar_type.to_string();
@@ -740,7 +757,7 @@ fn test_register_object_store_from_uri_local_file() {
         .add_file::<TradeTick>("trade_ticks", &file_path, None, None)
         .unwrap();
     let query_result: QueryResult = session.get_query_result();
-    let ticks: Vec<Data> = query_result.collect();
+    let ticks: Vec<Data> = query_result.collect::<Result<_, _>>().unwrap();
 
     assert_eq!(ticks.len(), 100);
     assert!(is_monotonically_increasing_by_init(&ticks));
@@ -771,12 +788,10 @@ fn test_rust_get_missing_intervals() {
     let (_temp_dir, catalog) = create_temp_catalog();
 
     let bars1 = vec![create_bar(1), create_bar(2)];
-    catalog
-        .write_to_parquet(bars1.clone(), None, None, None)
-        .unwrap();
+    catalog.write_to_parquet(&bars1, None, None, None).unwrap();
 
     let bars2 = vec![create_bar(5), create_bar(6)];
-    catalog.write_to_parquet(bars2, None, None, None).unwrap();
+    catalog.write_to_parquet(&bars2, None, None, None).unwrap();
 
     let bar_type = bars1[0].bar_type.to_string();
     let missing = catalog
@@ -790,9 +805,7 @@ fn test_rust_get_missing_intervals() {
 fn test_rust_reset_data_file_names() {
     let (_temp_dir, catalog) = create_temp_catalog();
     let bars = vec![create_bar(1), create_bar(2), create_bar(3)];
-    catalog
-        .write_to_parquet(bars.clone(), None, None, None)
-        .unwrap();
+    catalog.write_to_parquet(&bars, None, None, None).unwrap();
 
     let bar_type = bars[0].bar_type.to_string();
     // Get intervals before reset
@@ -817,12 +830,10 @@ fn test_rust_extend_file_name() {
 
     // Write data with a gap
     let bars1 = vec![create_bar(1)];
-    catalog
-        .write_to_parquet(bars1.clone(), None, None, None)
-        .unwrap();
+    catalog.write_to_parquet(&bars1, None, None, None).unwrap();
 
     let bars2 = vec![create_bar(4)];
-    catalog.write_to_parquet(bars2, None, None, None).unwrap();
+    catalog.write_to_parquet(&bars2, None, None, None).unwrap();
 
     let bar_type = bars1[0].bar_type.to_string();
     // Extend the first file to include the missing timestamp range
@@ -843,42 +854,34 @@ fn test_rust_extend_file_name() {
 
 #[rstest]
 fn test_rust_write_quote_ticks() {
-    let (_temp_dir, catalog) = create_temp_catalog();
+    let (_temp_dir, mut catalog) = create_temp_catalog();
 
     let quote_ticks = vec![create_quote_tick(1), create_quote_tick(2)];
     catalog
-        .write_to_parquet(quote_ticks, None, None, None)
+        .write_to_parquet(&quote_ticks, None, None, None)
         .unwrap();
 
-    let files = catalog
-        .query_files(
-            "quotes",
-            Some(vec!["ETH/USDT.BINANCE".to_string()]),
-            None,
-            None,
-        )
+    let loaded = catalog
+        .quote_ticks(Some(vec!["ETH/USDT.BINANCE".to_string()]), None, None)
         .unwrap();
-    assert!(!files.is_empty());
+
+    assert_eq!(loaded, quote_ticks);
 }
 
 #[rstest]
 fn test_rust_write_trade_ticks() {
-    let (_temp_dir, catalog) = create_temp_catalog();
+    let (_temp_dir, mut catalog) = create_temp_catalog();
 
     let trade_ticks = vec![create_trade_tick(1), create_trade_tick(2)];
     catalog
-        .write_to_parquet(trade_ticks, None, None, None)
+        .write_to_parquet(&trade_ticks, None, None, None)
         .unwrap();
 
-    let files = catalog
-        .query_files(
-            "trades",
-            Some(vec!["ETH/USDT.BINANCE".to_string()]),
-            None,
-            None,
-        )
+    let loaded = catalog
+        .trade_ticks(Some(vec!["ETH/USDT.BINANCE".to_string()]), None, None)
         .unwrap();
-    assert!(!files.is_empty());
+
+    assert_eq!(loaded, trade_ticks);
 }
 
 // Non-ASCII ids are stored percent-encoded on disk; queries must resolve the on-disk name.
@@ -891,13 +894,13 @@ fn test_query_round_trip_non_ascii_instrument_id() {
         id,
         Price::new(1987.0, 1),
         Quantity::new(0.1, 1),
-        AggressorSide::Buyer,
+        AggressorSide::Buy,
         TradeId::from("123456"),
         UnixNanos::from(0),
         UnixNanos::from(1),
     );
     catalog
-        .write_to_parquet(vec![trade], None, None, None)
+        .write_to_parquet(&[trade], None, None, None)
         .unwrap();
 
     let files = catalog.query_files("trades", None, None, None).unwrap();
@@ -928,13 +931,13 @@ fn test_filter_files_non_ascii_instrument_id() {
         id,
         Price::new(1987.0, 1),
         Quantity::new(0.1, 1),
-        AggressorSide::Buyer,
+        AggressorSide::Buy,
         TradeId::from("123456"),
         UnixNanos::from(0),
         UnixNanos::from(1),
     );
     catalog
-        .write_to_parquet(vec![trade], None, None, None)
+        .write_to_parquet(&[trade], None, None, None)
         .unwrap();
 
     let all_files = catalog.query_files("trades", None, None, None).unwrap();
@@ -951,31 +954,19 @@ fn test_query_instruments_filtered_non_ascii_instrument_id() {
     let (_temp_dir, catalog) = create_temp_catalog();
 
     let instrument_id = InstrumentId::from("CAFÉ.SIM");
-    let currency_pair = CurrencyPair::new(
-        instrument_id,
-        Symbol::from("CAFÉ"),
-        Currency::from("AUD"),
-        Currency::from("USD"),
-        5,
-        0,
-        Price::new(0.00001, 5),
-        Quantity::new(1.0, 0),
-        None, // multiplier
-        None, // lot_size
-        None, // max_quantity
-        None, // min_quantity
-        None, // max_notional
-        None, // min_notional
-        None, // max_price
-        None, // min_price
-        None, // margin_init
-        None, // margin_maint
-        None, // maker_fee
-        None, // taker_fee
-        None, // info
-        UnixNanos::default(),
-        UnixNanos::default(),
-    );
+    let currency_pair = CurrencyPair::builder()
+        .instrument_id(instrument_id)
+        .raw_symbol(Symbol::from("CAFÉ"))
+        .base_currency(Currency::from("AUD"))
+        .quote_currency(Currency::from("USD"))
+        .price_precision(5)
+        .size_precision(0)
+        .price_increment(Price::new(0.00001, 5))
+        .size_increment(Quantity::new(1.0, 0))
+        .ts_event(UnixNanos::default())
+        .ts_init(UnixNanos::default())
+        .build()
+        .unwrap();
     catalog
         .write_instruments(vec![InstrumentAny::CurrencyPair(currency_pair)])
         .unwrap();
@@ -1002,16 +993,14 @@ fn test_query_bars_non_ascii_instrument_id_partial_match() {
     let bar = Bar::new(
         bar_type,
         Price::new(1.00001, 5),
-        Price::new(1.1, 1),
+        Price::new(1.10000, 5),
         Price::new(1.00000, 5),
         Price::new(1.00000, 5),
         Quantity::new(100_000.0, 0),
         UnixNanos::from(0),
         UnixNanos::from(1),
     );
-    catalog
-        .write_to_parquet(vec![bar], None, None, None)
-        .unwrap();
+    catalog.write_to_parquet(&[bar], None, None, None).unwrap();
 
     // Querying by the bare instrument id only matches via the bars partial-match
     // branch, since the directory name is the full bar-type string.
@@ -1034,38 +1023,122 @@ fn test_query_bars_non_ascii_instrument_id_partial_match() {
 
 #[rstest]
 fn test_rust_write_order_book_deltas() {
-    let (_temp_dir, catalog) = create_temp_catalog();
+    let (_temp_dir, mut catalog) = create_temp_catalog();
 
     let deltas = vec![create_order_book_delta(1), create_order_book_delta(2)];
-    catalog.write_to_parquet(deltas, None, None, None).unwrap();
+    catalog.write_to_parquet(&deltas, None, None, None).unwrap();
 
-    let files = catalog
-        .query_files(
-            "order_book_deltas",
+    let loaded = catalog
+        .query_typed_data::<OrderBookDelta>(
             Some(vec!["ETH/USDT.BINANCE".to_string()]),
             None,
             None,
+            None,
+            None,
+            true,
         )
         .unwrap();
-    assert!(!files.is_empty());
+
+    assert_eq!(loaded.len(), deltas.len());
+
+    for (expected, actual) in deltas.iter().zip(&loaded) {
+        assert_eq!(actual.instrument_id, expected.instrument_id);
+        assert_eq!(actual.action, expected.action);
+        assert_eq!(actual.flags, expected.flags);
+        assert_eq!(actual.sequence, expected.sequence);
+        assert_eq!(actual.ts_event, expected.ts_event);
+        assert_eq!(actual.ts_init, expected.ts_init);
+        assert_eq!(actual.order.side, expected.order.side);
+        assert_eq!(actual.order.price, expected.order.price);
+        assert_eq!(actual.order.size, expected.order.size);
+        assert_eq!(actual.order.order_id, expected.order.order_id);
+    }
 }
 
 #[rstest]
 fn test_rust_write_order_book_depths() {
-    let (_temp_dir, catalog) = create_temp_catalog();
+    let (_temp_dir, mut catalog) = create_temp_catalog();
 
     let depths = vec![create_order_book_depth10(1), create_order_book_depth10(2)];
-    catalog.write_to_parquet(depths, None, None, None).unwrap();
+    catalog.write_to_parquet(&depths, None, None, None).unwrap();
 
-    let files = catalog
-        .query_files(
-            "order_book_depths",
+    let loaded = catalog
+        .query_typed_data::<OrderBookDepth10>(
             Some(vec!["ETH/USDT.BINANCE".to_string()]),
             None,
             None,
+            None,
+            None,
+            true,
         )
         .unwrap();
-    assert!(!files.is_empty());
+
+    assert_eq!(loaded.len(), depths.len());
+
+    for (expected, actual) in depths.iter().zip(&loaded) {
+        assert_eq!(actual.instrument_id, expected.instrument_id);
+        assert_eq!(actual.bid_counts, expected.bid_counts);
+        assert_eq!(actual.ask_counts, expected.ask_counts);
+        assert_eq!(actual.flags, expected.flags);
+        assert_eq!(actual.sequence, expected.sequence);
+        assert_eq!(actual.ts_event, expected.ts_event);
+        assert_eq!(actual.ts_init, expected.ts_init);
+
+        for (expected_order, actual_order) in expected
+            .bids
+            .iter()
+            .zip(&actual.bids)
+            .chain(expected.asks.iter().zip(&actual.asks))
+        {
+            assert_eq!(actual_order.side, expected_order.side);
+            assert_eq!(actual_order.price, expected_order.price);
+            assert_eq!(actual_order.size, expected_order.size);
+            assert_ne!(expected_order.order_id, 0);
+            assert_eq!(actual_order.order_id, 0);
+        }
+    }
+}
+
+#[rstest]
+fn test_rust_write_and_read_account_state() {
+    let (_temp_dir, mut catalog) = create_temp_catalog();
+    let mut info = Params::new();
+    info.insert("total_wallet_balance".to_string(), json!("1000.00000001"));
+    info.insert("can_trade".to_string(), json!(true));
+    let account_states = vec![
+        AccountState::new(
+            AccountId::from("SIM-001"),
+            AccountType::Margin,
+            vec![AccountBalance::new(
+                Money::from("1000.00 USD"),
+                Money::from("200.00 USD"),
+                Money::from("800.00 USD"),
+            )],
+            vec![MarginBalance::new(
+                Money::from("150.00 USD"),
+                Money::from("75.00 USD"),
+                Some(ethusdt_binance_id()),
+            )],
+            true,
+            UUID4::new(),
+            UnixNanos::from(1),
+            UnixNanos::from(2),
+            Some(Currency::USD()),
+        )
+        .with_info(Some(info)),
+    ];
+    catalog
+        .write_to_parquet(&account_states, None, None, None)
+        .unwrap();
+
+    let loaded = catalog
+        .query_typed::<AccountState>(None, None, None, None, None, true)
+        .unwrap();
+
+    assert_eq!(
+        serde_json::to_value(loaded).unwrap(),
+        serde_json::to_value(account_states).unwrap(),
+    );
 }
 
 #[rstest]
@@ -1074,7 +1147,7 @@ fn test_rust_write_mark_price_updates() {
 
     let mark_prices = vec![create_mark_price_update(1), create_mark_price_update(2)];
     catalog
-        .write_to_parquet(mark_prices, None, None, None)
+        .write_to_parquet(&mark_prices, None, None, None)
         .unwrap();
 
     let files = catalog
@@ -1094,7 +1167,7 @@ fn test_rust_write_index_price_updates() {
 
     let index_prices = vec![create_index_price_update(1), create_index_price_update(2)];
     catalog
-        .write_to_parquet(index_prices, None, None, None)
+        .write_to_parquet(&index_prices, None, None, None)
         .unwrap();
 
     let files = catalog
@@ -1113,10 +1186,10 @@ fn test_rust_query_files() {
     let (_temp_dir, catalog) = create_temp_catalog();
 
     let bars1 = vec![create_bar(1), create_bar(2)];
-    catalog.write_to_parquet(bars1, None, None, None).unwrap();
+    catalog.write_to_parquet(&bars1, None, None, None).unwrap();
 
     let bars2 = vec![create_bar(3), create_bar(4)];
-    catalog.write_to_parquet(bars2, None, None, None).unwrap();
+    catalog.write_to_parquet(&bars2, None, None, None).unwrap();
 
     let files = catalog
         .query_files("bars", Some(vec!["AUD/USD.SIM".to_string()]), None, None)
@@ -1130,13 +1203,13 @@ fn test_rust_query_files_with_multiple_files() {
     let (_temp_dir, catalog) = create_temp_catalog();
 
     let bars1 = vec![create_bar(1), create_bar(2)];
-    catalog.write_to_parquet(bars1, None, None, None).unwrap();
+    catalog.write_to_parquet(&bars1, None, None, None).unwrap();
 
     let bars2 = vec![create_bar(3), create_bar(4)];
-    catalog.write_to_parquet(bars2, None, None, None).unwrap();
+    catalog.write_to_parquet(&bars2, None, None, None).unwrap();
 
     let bars3 = vec![create_bar(5), create_bar(6)];
-    catalog.write_to_parquet(bars3, None, None, None).unwrap();
+    catalog.write_to_parquet(&bars3, None, None, None).unwrap();
 
     let files = catalog
         .query_files("bars", Some(vec!["AUD/USD.SIM".to_string()]), None, None)
@@ -1170,7 +1243,7 @@ fn test_consolidate_data_by_period_basic() {
         create_bar(7_200_000_000_000), // 2 hours
         create_bar(7_201_000_000_000), // 2 hours + 1 second
     ];
-    catalog.write_to_parquet(bars, None, None, None).unwrap();
+    catalog.write_to_parquet(&bars, None, None, None).unwrap();
 
     // Consolidate by 1-hour periods
     catalog
@@ -1190,9 +1263,7 @@ fn test_consolidate_data_by_period_basic() {
         create_bar(7_200_000_000_000), // 2 hours
         create_bar(7_201_000_000_000), // 2 hours + 1 second
     ];
-    catalog
-        .write_to_parquet(bars.clone(), None, None, None)
-        .unwrap();
+    catalog.write_to_parquet(&bars, None, None, None).unwrap();
 
     let bar_type = bars[0].bar_type.to_string();
     // Consolidate by 1-hour periods
@@ -1226,9 +1297,7 @@ fn test_consolidate_data_by_period_with_time_range() {
         create_bar(4000),
         create_bar(5000),
     ];
-    catalog
-        .write_to_parquet(bars.clone(), None, None, None)
-        .unwrap();
+    catalog.write_to_parquet(&bars, None, None, None).unwrap();
 
     let bar_type = bars[0].bar_type.to_string();
     // Consolidate only middle range
@@ -1278,9 +1347,7 @@ fn test_consolidate_data_by_period_different_periods() {
         create_bar(180_000_000_000), // 3 minutes
         create_bar(240_000_000_000), // 4 minutes
     ];
-    catalog
-        .write_to_parquet(bars.clone(), None, None, None)
-        .unwrap();
+    catalog.write_to_parquet(&bars, None, None, None).unwrap();
 
     let bar_type = bars[0].bar_type.to_string();
     // Test different period sizes
@@ -1310,9 +1377,7 @@ fn test_consolidate_data_by_period_ensure_contiguous_files_false() {
 
     // Create some test data
     let bars = vec![create_bar(1000), create_bar(2000), create_bar(3000)];
-    catalog
-        .write_to_parquet(bars.clone(), None, None, None)
-        .unwrap();
+    catalog.write_to_parquet(&bars, None, None, None).unwrap();
 
     let bar_type = bars[0].bar_type.to_string();
     // Consolidate with ensure_contiguous_files=false
@@ -1347,7 +1412,7 @@ fn test_consolidate_data_by_period_fragment_per_flush() {
         let bar = create_bar(i * hour_ns + 1);
         last_bar_type = Some(bar.bar_type.to_string());
         catalog
-            .write_to_parquet(vec![bar], None, None, Some(true))
+            .write_to_parquet(&[bar], None, None, Some(true))
             .unwrap();
     }
 
@@ -1381,12 +1446,10 @@ fn test_consolidate_catalog_by_period_basic() {
 
     // Create data for multiple data types
     let bars = vec![create_bar(1000), create_bar(2000)];
-    catalog
-        .write_to_parquet(bars.clone(), None, None, None)
-        .unwrap();
+    catalog.write_to_parquet(&bars, None, None, None).unwrap();
 
     let quotes = vec![create_quote_tick(1000), create_quote_tick(2000)];
-    catalog.write_to_parquet(quotes, None, None, None).unwrap();
+    catalog.write_to_parquet(&quotes, None, None, None).unwrap();
 
     // Consolidate entire catalog
     catalog
@@ -1415,9 +1478,7 @@ fn test_consolidate_catalog_by_period_with_time_range() {
 
     // Create data spanning multiple periods
     let bars = vec![create_bar(1000), create_bar(5000), create_bar(10000)];
-    catalog
-        .write_to_parquet(bars.clone(), None, None, None)
-        .unwrap();
+    catalog.write_to_parquet(&bars, None, None, None).unwrap();
 
     // Consolidate catalog with time range
     catalog
@@ -1457,7 +1518,7 @@ fn test_consolidate_catalog_by_period_default_parameters() {
 
     // Create some test data
     let bars = vec![create_bar(1000), create_bar(2000)];
-    catalog.write_to_parquet(bars, None, None, None).unwrap();
+    catalog.write_to_parquet(&bars, None, None, None).unwrap();
 
     // Consolidate with default parameters
     let result = catalog.consolidate_catalog_by_period(None, None, None, None);
@@ -1473,13 +1534,13 @@ fn test_consolidate_data_by_period_multiple_instruments() {
     // Create bars for AUD/USD
     let aud_bars = vec![create_bar(1000), create_bar(2000)];
     catalog
-        .write_to_parquet(aud_bars.clone(), None, None, None)
+        .write_to_parquet(&aud_bars, None, None, None)
         .unwrap();
 
     // Create quotes for ETH/USDT
     let eth_quotes = vec![create_quote_tick(1000), create_quote_tick(2000)];
     catalog
-        .write_to_parquet(eth_quotes, None, None, None)
+        .write_to_parquet(&eth_quotes, None, None, None)
         .unwrap();
 
     let bar_type = aud_bars[0].bar_type.to_string();
@@ -1562,7 +1623,7 @@ fn test_generic_query_typed_data_quotes() {
     let (_temp_dir, mut catalog) = create_temp_catalog();
     // Create test data
     let quotes = vec![create_quote_tick(1000), create_quote_tick(2000)];
-    catalog.write_to_parquet(quotes, None, None, None).unwrap();
+    catalog.write_to_parquet(&quotes, None, None, None).unwrap();
 
     // query using generic typed data function
     let result = catalog
@@ -1589,7 +1650,7 @@ fn test_generic_query_typed_data_bars() {
 
     // Create test data
     let bars = vec![create_bar(1000), create_bar(2000)];
-    catalog.write_to_parquet(bars, None, None, None).unwrap();
+    catalog.write_to_parquet(&bars, None, None, None).unwrap();
 
     // query using generic typed data function
     let result = catalog
@@ -1644,7 +1705,7 @@ fn test_write_data_enum_funding_rates_round_trip() {
     let data: Vec<Data> = funding_rates
         .iter()
         .copied()
-        .map(Data::FundingRateUpdate)
+        .map(Data::FundingRate)
         .collect();
 
     catalog
@@ -1660,6 +1721,44 @@ fn test_write_data_enum_funding_rates_round_trip() {
         .unwrap();
 
     assert_eq!(result, funding_rates);
+}
+
+#[rstest]
+fn test_write_data_enum_groups_mixed_bar_types() {
+    let (_temp_dir, mut catalog) = create_temp_catalog();
+    let audusd_bars = vec![create_bar(1_000), create_bar(2_000)];
+    let index_bars = vec![create_index_bar(1_500)];
+    let mut data: Vec<Data> = audusd_bars.iter().copied().map(Data::Bar).collect();
+    data.extend(index_bars.iter().copied().map(Data::Bar));
+
+    // Interleaved bar types in one write must be grouped, not written under the
+    // first element's bar type
+    catalog
+        .write_data_enum(&data, None, None, Some(false))
+        .unwrap();
+
+    let audusd_result = catalog
+        .bars(Some(vec![audusd_bars[0].bar_type.to_string()]), None, None)
+        .unwrap();
+    let index_result = catalog
+        .bars(Some(vec![index_bars[0].bar_type.to_string()]), None, None)
+        .unwrap();
+
+    assert_eq!(audusd_result, audusd_bars);
+    assert_eq!(index_result, index_bars);
+}
+
+#[rstest]
+fn test_write_to_parquet_rejects_mixed_bar_types() {
+    let (_temp_dir, catalog) = create_temp_catalog();
+    let mixed = vec![create_bar(1_000), create_index_bar(2_000)];
+
+    let result = catalog.write_to_parquet(&mixed, None, None, Some(false));
+
+    assert!(
+        result.is_err(),
+        "mixed bar types in a single write must error, was {result:?}"
+    );
 }
 
 #[rstest]
@@ -1686,7 +1785,7 @@ fn test_generic_query_typed_data_with_where_clause() {
 
     // Create test data
     let quotes = vec![create_quote_tick(1000), create_quote_tick(2000)];
-    catalog.write_to_parquet(quotes, None, None, None).unwrap();
+    catalog.write_to_parquet(&quotes, None, None, None).unwrap();
 
     // query with WHERE clause
     let result = catalog
@@ -1711,7 +1810,7 @@ fn test_generic_consolidate_data_by_period_quotes() {
     // Create multiple small files with contiguous timestamps
     for i in 0..3 {
         let quotes = vec![create_quote_tick(1000 + i)];
-        catalog.write_to_parquet(quotes, None, None, None).unwrap();
+        catalog.write_to_parquet(&quotes, None, None, None).unwrap();
     }
 
     // Verify we have multiple files initially
@@ -1748,7 +1847,7 @@ fn test_generic_consolidate_data_by_period_bars() {
     for i in 0..3 {
         let bars = vec![create_bar(1000 + i)];
         bars_list.push(bars[0]);
-        catalog.write_to_parquet(bars, None, None, None).unwrap();
+        catalog.write_to_parquet(&bars, None, None, None).unwrap();
     }
 
     let bar_type = bars_list[0].bar_type.to_string();
@@ -1786,7 +1885,7 @@ fn test_generic_consolidate_data_by_period_keeps_skipped_target() {
     for timestamps in [&file1_ts[..], &file2_ts[..], &file3_ts[..]] {
         let bars: Vec<Bar> = timestamps.iter().copied().map(create_bar).collect();
         catalog
-            .write_to_parquet(bars, None, None, Some(true))
+            .write_to_parquet(&bars, None, None, Some(true))
             .unwrap();
     }
 
@@ -1851,7 +1950,7 @@ fn test_generic_consolidate_data_by_period_with_time_range() {
 
     for quote in quotes {
         catalog
-            .write_to_parquet(vec![quote], None, None, None)
+            .write_to_parquet(&[quote], None, None, None)
             .unwrap();
     }
 
@@ -1883,7 +1982,7 @@ fn test_consolidation_workflow_end_to_end() {
     for i in 0..5 {
         let bars = vec![create_bar(1000 + i * 1000)];
         bars_list.push(bars[0]);
-        catalog.write_to_parquet(bars, None, None, None).unwrap();
+        catalog.write_to_parquet(&bars, None, None, None).unwrap();
     }
 
     let bar_type = bars_list[0].bar_type.to_string();
@@ -1912,9 +2011,7 @@ fn test_consolidation_preserves_data_integrity() {
 
     // Write each bar separately to create multiple files
     for bar in &original_bars {
-        catalog
-            .write_to_parquet(vec![*bar], None, None, None)
-            .unwrap();
+        catalog.write_to_parquet(&[*bar], None, None, None).unwrap();
     }
 
     let bar_type = original_bars[0].bar_type.to_string();
@@ -2463,7 +2560,7 @@ fn test_delete_data_range_complete_file_deletion() {
     ];
 
     // Write data
-    catalog.write_to_parquet(quotes, None, None, None).unwrap();
+    catalog.write_to_parquet(&quotes, None, None, None).unwrap();
 
     // Verify initial state
     let initial_data = catalog
@@ -2500,7 +2597,7 @@ fn test_delete_data_range_partial_file_overlap_start() {
     ];
 
     // Write data
-    catalog.write_to_parquet(quotes, None, None, None).unwrap();
+    catalog.write_to_parquet(&quotes, None, None, None).unwrap();
 
     // delete first part of the data
     catalog
@@ -2533,7 +2630,7 @@ fn test_delete_data_range_partial_file_overlap_end() {
     ];
 
     // Write data
-    catalog.write_to_parquet(quotes, None, None, None).unwrap();
+    catalog.write_to_parquet(&quotes, None, None, None).unwrap();
 
     // delete last part of the data
     catalog
@@ -2567,7 +2664,7 @@ fn test_delete_data_range_partial_file_overlap_middle() {
     ];
 
     // Write data
-    catalog.write_to_parquet(quotes, None, None, None).unwrap();
+    catalog.write_to_parquet(&quotes, None, None, None).unwrap();
 
     // delete middle part of the data
     catalog
@@ -2618,7 +2715,7 @@ fn test_delete_data_range_no_intersection() {
     let quotes = vec![create_quote_tick(2_000_000_000)];
 
     // Write data
-    catalog.write_to_parquet(quotes, None, None, None).unwrap();
+    catalog.write_to_parquet(&quotes, None, None, None).unwrap();
 
     // delete data outside existing range
     catalog
@@ -2649,8 +2746,8 @@ fn test_delete_catalog_range_multiple_data_types() {
     ];
     let bars = vec![create_bar(1_500_000_000), create_bar(2_500_000_000)];
 
-    catalog.write_to_parquet(quotes, None, None, None).unwrap();
-    catalog.write_to_parquet(bars, None, None, None).unwrap();
+    catalog.write_to_parquet(&quotes, None, None, None).unwrap();
+    catalog.write_to_parquet(&bars, None, None, None).unwrap();
 
     // Verify initial state
     let initial_quotes = catalog
@@ -2695,8 +2792,8 @@ fn test_delete_catalog_range_complete_deletion() {
     let quotes = vec![create_quote_tick(1_000_000_000)];
     let bars = vec![create_bar(2_000_000_000)];
 
-    catalog.write_to_parquet(quotes, None, None, None).unwrap();
-    catalog.write_to_parquet(bars, None, None, None).unwrap();
+    catalog.write_to_parquet(&quotes, None, None, None).unwrap();
+    catalog.write_to_parquet(&bars, None, None, None).unwrap();
 
     // Verify initial state
     assert_eq!(
@@ -2783,8 +2880,8 @@ fn test_delete_catalog_range_open_boundaries() {
         create_bar(3_500_000_000),
     ];
 
-    catalog.write_to_parquet(quotes, None, None, None).unwrap();
-    catalog.write_to_parquet(bars, None, None, None).unwrap();
+    catalog.write_to_parquet(&quotes, None, None, None).unwrap();
+    catalog.write_to_parquet(&bars, None, None, None).unwrap();
 
     // delete from beginning to middle (open start)
     catalog
@@ -2876,7 +2973,7 @@ fn test_delete_data_range_nanosecond_precision_boundaries() {
         create_quote_tick(1_000_000_003), // +3 nanoseconds
     ];
 
-    catalog.write_to_parquet(quotes, None, None, None).unwrap();
+    catalog.write_to_parquet(&quotes, None, None, None).unwrap();
 
     // delete exactly the middle two timestamps [1_000_000_001, 1_000_000_002]
     catalog
@@ -2910,7 +3007,7 @@ fn test_delete_data_range_single_file_double_split() {
         create_quote_tick(5_000_000_000),
     ];
 
-    catalog.write_to_parquet(quotes, None, None, None).unwrap();
+    catalog.write_to_parquet(&quotes, None, None, None).unwrap();
 
     // delete middle range [2_500_000_000, 3_500_000_000]
     // This should create both split_before and split_after operations
@@ -2947,7 +3044,7 @@ fn test_delete_data_range_saturating_arithmetic_edge_cases() {
         create_quote_tick(2),
     ];
 
-    catalog.write_to_parquet(quotes, None, None, None).unwrap();
+    catalog.write_to_parquet(&quotes, None, None, None).unwrap();
 
     // delete range [0, 1] which tests saturating_sub(1) on timestamp 0
     catalog
@@ -3101,7 +3198,7 @@ fn test_extract_identifier_from_path() {
 
     // Test bar file path
     let identifier =
-        extract_identifier_from_path("data/bar/BTCUSD-1-MINUTE-LAST-EXTERNAL/file.parquet");
+        extract_identifier_from_path("data/bars/BTCUSD-1-MINUTE-LAST-EXTERNAL/file.parquet");
     assert_eq!(identifier, "BTCUSD-1-MINUTE-LAST-EXTERNAL");
 
     // Test path with fewer components
@@ -3165,7 +3262,7 @@ fn test_extract_sql_safe_filename() {
 
     // Test bar filename with timestamp range
     let filename = extract_sql_safe_filename(
-        "data/bar/BTCUSD/2021-01-01T00-00-00-000000000Z_2021-01-01T23-59-59-999999999Z.parquet",
+        "data/bars/BTCUSD/2021-01-01T00-00-00-000000000Z_2021-01-01T23-59-59-999999999Z.parquet",
     );
     assert_eq!(
         filename,
@@ -3204,13 +3301,13 @@ fn test_catalog_query_multiple_instruments_table_naming() {
 
     // Write data for all instruments
     catalog
-        .write_to_parquet(eurusd_quotes, None, None, None)
+        .write_to_parquet(&eurusd_quotes, None, None, None)
         .unwrap();
     catalog
-        .write_to_parquet(btcusd_quotes, None, None, None)
+        .write_to_parquet(&btcusd_quotes, None, None, None)
         .unwrap();
     catalog
-        .write_to_parquet(ethusdt_quotes, None, None, None)
+        .write_to_parquet(&ethusdt_quotes, None, None, None)
         .unwrap();
 
     // Query all instruments simultaneously
@@ -3227,7 +3324,7 @@ fn test_catalog_query_multiple_instruments_table_naming() {
     );
 
     let query_result = result.unwrap();
-    let data: Vec<Data> = query_result.collect();
+    let data: Vec<Data> = query_result.collect::<Result<_, _>>().unwrap();
 
     // Should get all 9 quotes (3 from each instrument)
     assert_eq!(data.len(), 9);
@@ -3266,9 +3363,9 @@ fn test_query_directory_based_registration() {
     let batch3 = create_quote_ticks_for_instrument(instrument_id, 20000, 3); // Large gap to ensure disjoint
 
     // Write each batch separately to create multiple files
-    catalog.write_to_parquet(batch1, None, None, None).unwrap();
-    catalog.write_to_parquet(batch2, None, None, None).unwrap();
-    catalog.write_to_parquet(batch3, None, None, None).unwrap();
+    catalog.write_to_parquet(&batch1, None, None, None).unwrap();
+    catalog.write_to_parquet(&batch2, None, None, None).unwrap();
+    catalog.write_to_parquet(&batch3, None, None, None).unwrap();
 
     // Query with directory-based registration (default)
     let result = catalog.query::<QuoteTick>(
@@ -3286,7 +3383,7 @@ fn test_query_directory_based_registration() {
     );
 
     let query_result = result.unwrap();
-    let data: Vec<Data> = query_result.collect();
+    let data: Vec<Data> = query_result.collect::<Result<_, _>>().unwrap();
 
     // Should get all 9 quotes from all 3 files in the directory
     assert_eq!(data.len(), 9, "Should read all files in directory");
@@ -3302,7 +3399,7 @@ fn test_query_directory_based_registration_preserves_equal_timestamp_order() {
 
     catalog
         .write_to_parquet(
-            create_quote_ticks_for_instrument("ETH/USDT.BINANCE", 1000, 1),
+            &create_quote_ticks_for_instrument("ETH/USDT.BINANCE", 1000, 1),
             None,
             None,
             None,
@@ -3310,7 +3407,7 @@ fn test_query_directory_based_registration_preserves_equal_timestamp_order() {
         .unwrap();
     catalog
         .write_to_parquet(
-            create_quote_ticks_for_instrument("AUD/USD.SIM", 1000, 1),
+            &create_quote_ticks_for_instrument("AUD/USD.SIM", 1000, 1),
             None,
             None,
             None,
@@ -3321,7 +3418,7 @@ fn test_query_directory_based_registration_preserves_equal_timestamp_order() {
         .query::<QuoteTick>(None, None, None, None, None, true)
         .unwrap();
     let instrument_ids: Vec<String> = result
-        .map(|data| match data {
+        .map(|data| match data.unwrap() {
             Data::Quote(quote) => quote.instrument_id.to_string(),
             _ => panic!("Invalid test"),
         })
@@ -3343,9 +3440,9 @@ fn test_query_file_based_registration() {
     let batch3 = create_quote_ticks_for_instrument(instrument_id, 20000, 3); // Large gap to ensure disjoint
 
     // Write each batch separately to create multiple files
-    catalog.write_to_parquet(batch1, None, None, None).unwrap();
-    catalog.write_to_parquet(batch2, None, None, None).unwrap();
-    catalog.write_to_parquet(batch3, None, None, None).unwrap();
+    catalog.write_to_parquet(&batch1, None, None, None).unwrap();
+    catalog.write_to_parquet(&batch2, None, None, None).unwrap();
+    catalog.write_to_parquet(&batch3, None, None, None).unwrap();
 
     // Get all files for this instrument
     let all_files = catalog
@@ -3370,7 +3467,7 @@ fn test_query_file_based_registration() {
     );
 
     let query_result = result.unwrap();
-    let data: Vec<Data> = query_result.collect();
+    let data: Vec<Data> = query_result.collect::<Result<_, _>>().unwrap();
 
     // Should only get 3 quotes from the first file
     assert_eq!(data.len(), 3, "Should only read the specified file");
@@ -3388,8 +3485,8 @@ fn test_query_directory_based_vs_file_based() {
     let batch1 = create_quote_ticks_for_instrument(instrument_id, 1000, 2);
     let batch2 = create_quote_ticks_for_instrument(instrument_id, 10000, 2); // Large gap to ensure disjoint
 
-    catalog.write_to_parquet(batch1, None, None, None).unwrap();
-    catalog.write_to_parquet(batch2, None, None, None).unwrap();
+    catalog.write_to_parquet(&batch1, None, None, None).unwrap();
+    catalog.write_to_parquet(&batch2, None, None, None).unwrap();
 
     // Get all files
     let all_files = catalog
@@ -3405,7 +3502,7 @@ fn test_query_directory_based_vs_file_based() {
         None,
         true, // directory-based
     );
-    let data_dir: Vec<Data> = result_dir.unwrap().collect();
+    let data_dir: Vec<Data> = result_dir.unwrap().collect::<Result<_, _>>().unwrap();
 
     // Query with file-based registration (all files)
     let result_file = catalog.query::<QuoteTick>(
@@ -3416,7 +3513,7 @@ fn test_query_directory_based_vs_file_based() {
         Some(all_files),
         false, // file-based
     );
-    let data_file: Vec<Data> = result_file.unwrap().collect();
+    let data_file: Vec<Data> = result_file.unwrap().collect::<Result<_, _>>().unwrap();
 
     // Both should return the same data
     assert_eq!(data_dir.len(), data_file.len());
@@ -3500,6 +3597,66 @@ fn test_rust_custom_data_roundtrip() {
         } else {
             panic!("Expected Data::Custom variant");
         }
+    }
+}
+
+#[rstest]
+fn test_rust_custom_data_binary_roundtrip() {
+    ensure_test_custom_data_registered();
+    let (_temp_dir, mut catalog) = create_temp_catalog();
+
+    let instrument_id = InstrumentId::from("RUST.TEST");
+    let data_type = DataType::new(
+        "RustTestBytesCustomData",
+        None,
+        Some(instrument_id.to_string()),
+    );
+    let original_data = [
+        RustTestBytesCustomData {
+            value: Vec::new(),
+            ts_event: UnixNanos::from(1),
+            ts_init: UnixNanos::from(1),
+        },
+        RustTestBytesCustomData {
+            value: vec![0x00, 0x7F, 0xFF],
+            ts_event: UnixNanos::from(2),
+            ts_init: UnixNanos::from(2),
+        },
+    ];
+    let custom_data = original_data
+        .iter()
+        .cloned()
+        .map(|item| CustomData::new(Arc::new(item), data_type.clone()))
+        .collect();
+
+    catalog
+        .write_custom_data_batch(custom_data, None, None, Some(false))
+        .unwrap();
+
+    let identifiers = [instrument_id.to_string()];
+    let loaded = catalog
+        .query_custom_data_dynamic(
+            "RustTestBytesCustomData",
+            Some(&identifiers),
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+
+    assert_eq!(loaded.len(), original_data.len());
+    for (expected, actual) in original_data.iter().zip(&loaded) {
+        let Data::Custom(custom) = actual else {
+            panic!("Expected custom data, was {actual:?}");
+        };
+        let actual = custom
+            .data
+            .as_any()
+            .downcast_ref::<RustTestBytesCustomData>()
+            .expect("Expected RustTestBytesCustomData");
+        assert_eq!(actual, expected);
     }
 }
 
@@ -4104,10 +4261,10 @@ fn test_query_directory_based_registration_with_cloud_uri() {
 
     // Write each batch separately to create multiple files
     local_catalog
-        .write_to_parquet(batch1, None, None, None)
+        .write_to_parquet(&batch1, None, None, None)
         .unwrap();
     local_catalog
-        .write_to_parquet(batch2, None, None, None)
+        .write_to_parquet(&batch2, None, None, None)
         .unwrap();
 
     // Verify that directory-based registration works with local paths
@@ -4126,7 +4283,7 @@ fn test_query_directory_based_registration_with_cloud_uri() {
     );
 
     let query_result = result.unwrap();
-    let data: Vec<Data> = query_result.collect();
+    let data: Vec<Data> = query_result.collect::<Result<_, _>>().unwrap();
 
     // Should get all 4 quotes from both files in the directory
     assert_eq!(data.len(), 4, "Should read all files in directory");
@@ -4150,7 +4307,7 @@ fn test_duplicate_table_registration() {
         .unwrap();
 
     let query_result: QueryResult = session.get_query_result();
-    let data: Vec<Data> = query_result.collect();
+    let data: Vec<Data> = query_result.collect::<Result<_, _>>().unwrap();
 
     // Should only get data once, not duplicated
     // The quotes.parquet file contains 9500 quotes
@@ -4162,7 +4319,7 @@ fn test_duplicate_table_registration() {
 fn test_query_typed_data_repeated_calls() {
     let (_temp_dir, mut catalog) = create_temp_catalog();
     let quotes = vec![create_quote_tick(1000), create_quote_tick(2000)];
-    catalog.write_to_parquet(quotes, None, None, None).unwrap();
+    catalog.write_to_parquet(&quotes, None, None, None).unwrap();
 
     let result1 = catalog
         .query_typed_data::<QuoteTick>(
@@ -4213,11 +4370,11 @@ fn test_write_skips_if_file_exists() {
 
     // Write initial data
     let bars1 = vec![create_bar(1), create_bar(2)];
-    let path1 = catalog.write_to_parquet(bars1, None, None, None).unwrap();
+    let path1 = catalog.write_to_parquet(&bars1, None, None, None).unwrap();
 
     // Attempt to write same interval again (same timestamps)
     let bars2 = vec![create_bar(1), create_bar(2)];
-    let path2 = catalog.write_to_parquet(bars2, None, None, None).unwrap();
+    let path2 = catalog.write_to_parquet(&bars2, None, None, None).unwrap();
 
     // Should return the same path (file exists, write skipped)
     assert_eq!(path1, path2);
@@ -4234,11 +4391,11 @@ fn test_write_errors_on_overlapping_intervals() {
 
     // Write initial data with interval (1, 5)
     let bars1 = vec![create_bar(1), create_bar(5)];
-    catalog.write_to_parquet(bars1, None, None, None).unwrap();
+    catalog.write_to_parquet(&bars1, None, None, None).unwrap();
 
     // Attempt to write overlapping interval (3, 7) - should fail
     let bars2 = vec![create_bar(3), create_bar(7)];
-    let result = catalog.write_to_parquet(bars2, None, None, None);
+    let result = catalog.write_to_parquet(&bars2, None, None, None);
 
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
@@ -4252,11 +4409,11 @@ fn test_write_succeeds_with_disjoint_intervals() {
     // Write first interval (1, 2)
     let bars1 = vec![create_bar(1), create_bar(2)];
     let bar_type = bars1[0].bar_type.to_string();
-    catalog.write_to_parquet(bars1, None, None, None).unwrap();
+    catalog.write_to_parquet(&bars1, None, None, None).unwrap();
 
     // Write non-overlapping interval (5, 6) - should succeed
     let bars2 = vec![create_bar(5), create_bar(6)];
-    catalog.write_to_parquet(bars2, None, None, None).unwrap();
+    catalog.write_to_parquet(&bars2, None, None, None).unwrap();
     let intervals = catalog.get_intervals("bars", Some(&bar_type)).unwrap();
     assert_eq!(intervals, vec![(1, 2), (5, 6)]);
 }
@@ -4267,11 +4424,11 @@ fn test_write_with_skip_disjoint_check() {
 
     // Write initial data with interval (1, 5)
     let bars1 = vec![create_bar(1), create_bar(5)];
-    catalog.write_to_parquet(bars1, None, None, None).unwrap();
+    catalog.write_to_parquet(&bars1, None, None, None).unwrap();
 
     // Write overlapping interval with skip_disjoint_check=true - should succeed
     let bars2 = vec![create_bar(3), create_bar(7)];
-    let result = catalog.write_to_parquet(bars2, None, None, Some(true));
+    let result = catalog.write_to_parquet(&bars2, None, None, Some(true));
 
     // Should succeed because we skipped the check
     assert!(result.is_ok());
@@ -4283,9 +4440,7 @@ fn test_query_first_timestamp() {
 
     // Write some bars
     let bars = vec![create_bar(1000), create_bar(2000), create_bar(3000)];
-    catalog
-        .write_to_parquet(bars.clone(), None, None, None)
-        .unwrap();
+    catalog.write_to_parquet(&bars, None, None, None).unwrap();
 
     let bar_type = bars[0].bar_type.to_string();
     // Query first timestamp
@@ -4316,9 +4471,7 @@ fn test_query_last_timestamp() {
 
     // Write some bars
     let bars = vec![create_bar(1000), create_bar(2000), create_bar(3000)];
-    catalog
-        .write_to_parquet(bars.clone(), None, None, None)
-        .unwrap();
+    catalog.write_to_parquet(&bars, None, None, None).unwrap();
 
     let bar_type = bars[0].bar_type.to_string();
     // Query last timestamp
@@ -4340,7 +4493,7 @@ fn test_list_data_types() {
 
     // Write some data
     let bars = vec![create_bar(1000)];
-    catalog.write_to_parquet(bars, None, None, None).unwrap();
+    catalog.write_to_parquet(&bars, None, None, None).unwrap();
 
     // Now should have bars
     let data_types = catalog.list_data_types().unwrap();
@@ -4857,39 +5010,39 @@ fn test_instrument_roundtrip_with_info_params() {
     info.insert("enabled".to_string(), json!(true));
 
     let instrument_id = InstrumentId::from("AUD/USD.SIM");
-    let currency_pair = CurrencyPair::new(
-        instrument_id,
-        Symbol::from("AUD/USD"),
-        Currency::from("AUD"),
-        Currency::from("USD"),
-        5,
-        0,
-        Price::new(0.00001, 5),
-        Quantity::new(1.0, 0),
-        None, // multiplier
-        None, // lot_size
-        None, // max_quantity
-        None, // min_quantity
-        None, // max_notional
-        None, // min_notional
-        None, // max_price
-        None, // min_price
-        Some(Decimal::from(3) / Decimal::from(100)),
-        Some(Decimal::from(3) / Decimal::from(100)),
-        Some(Decimal::from(2) / Decimal::from(100_000)),
-        Some(Decimal::from(2) / Decimal::from(100_000)),
-        Some(info.clone()),
-        UnixNanos::default(),
-        UnixNanos::default(),
-    );
+    let currency_pair = CurrencyPair::builder()
+        .instrument_id(instrument_id)
+        .raw_symbol(Symbol::from("AUD/USD"))
+        .base_currency(Currency::from("AUD"))
+        .quote_currency(Currency::from("USD"))
+        .price_precision(5)
+        .size_precision(0)
+        .price_increment(Price::new(0.00001, 5))
+        .size_increment(Quantity::new(1.0, 0))
+        .margin_init(Decimal::from(3) / Decimal::from(100))
+        .margin_maint(Decimal::from(3) / Decimal::from(100))
+        .maker_fee(Decimal::from(2) / Decimal::from(100_000))
+        .taker_fee(Decimal::from(2) / Decimal::from(100_000))
+        .info(info.clone())
+        .ts_event(UnixNanos::default())
+        .ts_init(UnixNanos::default())
+        .build()
+        .unwrap();
 
     let instrument_any = InstrumentAny::CurrencyPair(currency_pair);
     let id_str = Instrument::id(&instrument_any).to_string();
 
-    catalog.write_instruments(vec![instrument_any]).unwrap();
+    catalog
+        .write_instruments(vec![instrument_any.clone()])
+        .unwrap();
 
     let ids = vec![id_str];
     let read = catalog.query_instruments(Some(&ids)).unwrap();
+
+    assert_eq!(
+        serde_json::to_value(&read).unwrap(),
+        serde_json::to_value(vec![instrument_any]).unwrap()
+    );
     assert_eq!(read.len(), 1, "Should read back exactly one instrument");
 
     let read_any = &read[0];
@@ -5011,33 +5164,24 @@ fn test_instrument_roundtrip_with_unregistered_base_currency() {
     let quote_currency = Currency::from("USDT");
 
     let instrument_id = InstrumentId::from("XUNREG1USDT-PERP.BINANCE");
-    let perp = CryptoPerpetual::new(
-        instrument_id,
-        Symbol::from("XUNREG1USDT"),
-        base_currency,
-        quote_currency,
-        quote_currency,
-        false,
-        4,
-        0,
-        Price::from("0.0001"),
-        Quantity::from("1"),
-        None,
-        None,
-        None,
-        Some(Quantity::from("1")),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(Decimal::from(2) / Decimal::from(10_000)),
-        Some(Decimal::from(4) / Decimal::from(10_000)),
-        None,
-        UnixNanos::default(),
-        UnixNanos::default(),
-    );
+    let perp = CryptoPerpetual::builder()
+        .instrument_id(instrument_id)
+        .raw_symbol(Symbol::from("XUNREG1USDT"))
+        .base_currency(base_currency)
+        .quote_currency(quote_currency)
+        .settlement_currency(quote_currency)
+        .is_inverse(false)
+        .price_precision(4)
+        .size_precision(0)
+        .price_increment(Price::from("0.0001"))
+        .size_increment(Quantity::from("1"))
+        .min_quantity(Quantity::from("1"))
+        .maker_fee(Decimal::from(2) / Decimal::from(10_000))
+        .taker_fee(Decimal::from(4) / Decimal::from(10_000))
+        .ts_event(UnixNanos::default())
+        .ts_init(UnixNanos::default())
+        .build()
+        .unwrap();
 
     let (_temp_dir, catalog) = create_temp_catalog();
     catalog

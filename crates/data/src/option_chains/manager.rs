@@ -67,7 +67,7 @@ pub struct OptionChainManager {
     msgbus_priority: u32,
     /// Whether the first ATM price has been received and the active set bootstrapped.
     bootstrapped: bool,
-    /// Shared deferred command queue — the `DataEngine` drains this on each data tick.
+    /// Shared deferred command queue - the `DataEngine` drains this on each data tick.
     deferred_cmd_queue: DeferredCommandQueue,
     /// Clock reference for constructing command timestamps.
     clock: Rc<RefCell<dyn Clock>>,
@@ -111,7 +111,7 @@ impl OptionChainManager {
             OptionChainAggregator::new(series_id, cmd.strike_range.clone(), tracker, instruments);
 
         // Initial active set for msgbus handlers (subset of all instruments).
-        // When ATM is unknown (ATM-based ranges), this is empty — deferred until bootstrap.
+        // When ATM is unknown (ATM-based ranges), this is empty - deferred until bootstrap.
         let active_instrument_ids = aggregator.instrument_ids();
         let all_instrument_ids = aggregator.all_instrument_ids();
         // If active set is already populated (Fixed range or ATM provided), we're bootstrapped
@@ -148,7 +148,7 @@ impl OptionChainManager {
         );
 
         // Forward wire-level subscriptions for the active set.
-        // When ATM is unknown, active set is empty — deferred until bootstrap.
+        // When ATM is unknown, active set is empty - deferred until bootstrap.
         Self::forward_client_subscriptions(
             client,
             &active_instrument_ids,
@@ -328,6 +328,12 @@ impl OptionChainManager {
         self.aggregator.series_id().venue
     }
 
+    /// Returns whether the active instrument set has been bootstrapped.
+    #[must_use]
+    pub const fn is_bootstrapped(&self) -> bool {
+        self.bootstrapped
+    }
+
     /// Tears down this manager: unregisters all msgbus handlers and cancels the timer.
     pub fn teardown(&mut self, clock: &Rc<RefCell<dyn Clock>>) {
         // Unsubscribe from all currently active instruments
@@ -378,13 +384,19 @@ impl OptionChainManager {
             return;
         }
 
-        // Update ATM tracker from forward price (ForwardPrice source only)
-        self.aggregator
+        if let Err(e) = self
+            .aggregator
             .atm_tracker_mut()
-            .update_from_option_greeks(greeks);
-        // Route greeks to aggregator for storage
+            .try_update_from_option_greeks(greeks)
+        {
+            log::warn!(
+                "Dropping greeks for {}: invalid forward price: {e}",
+                greeks.instrument_id,
+            );
+            return;
+        }
+
         self.aggregator.update_greeks(greeks);
-        // Check if first ATM arrival triggers deferred bootstrap
         self.maybe_bootstrap();
 
         if self.raw_mode
@@ -473,7 +485,7 @@ impl OptionChainManager {
             return;
         }
 
-        // First ATM received — compute active set and register handlers
+        // First ATM received - compute active set and register handlers
         let active_ids = self.aggregator.recompute_active_set();
         self.register_handlers_for_instruments_bulk(&active_ids);
 
@@ -855,7 +867,7 @@ mod tests {
     fn test_manager_handle_quote_no_instrument() {
         let (mut manager, _queue) = make_manager();
 
-        // Should not panic — quote for unknown instrument
+        // Should not panic - quote for unknown instrument
         let quote = QuoteTick::new(
             InstrumentId::from("BTC-20240101-50000-C.DERIBIT"),
             Price::from("100.00"),
@@ -871,7 +883,7 @@ mod tests {
     #[rstest]
     fn test_manager_publish_slice_empty() {
         let (mut manager, _queue) = make_manager();
-        // Should not panic — empty slice skips publish
+        // Should not panic - empty slice skips publish
         manager.publish_slice(UnixNanos::from(100u64));
     }
 
@@ -879,7 +891,7 @@ mod tests {
     fn test_manager_teardown_no_handlers() {
         let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
         let (mut manager, _queue) = make_manager();
-        // Should not panic — no handlers to unregister
+        // Should not panic - no handlers to unregister
         manager.teardown(&clock);
         assert!(manager.quote_handlers.is_empty());
     }
@@ -943,7 +955,7 @@ mod tests {
         // Initially no instruments active (ATM unknown, deferred)
         assert_eq!(manager.aggregator.instrument_ids().len(), 0);
 
-        // Feed ATM near 50000 via greeks — bootstrap computes active set (3 strikes × 2 = 6)
+        // Feed ATM near 50000 via greeks - bootstrap computes active set (3 strikes × 2 = 6)
         bootstrap_via_greeks(&mut manager);
         assert!(manager.bootstrapped);
         assert_eq!(manager.aggregator.instrument_ids().len(), 6); // 3 strikes × 2
@@ -1018,7 +1030,7 @@ mod tests {
         assert!(manager.bootstrapped);
         let count = manager.aggregator.instrument_ids().len();
 
-        // Feed another ATM update — bootstrap should not fire again
+        // Feed another ATM update - bootstrap should not fire again
         let greeks2 = OptionGreeks {
             instrument_id: InstrumentId::from("BTC-20240101-50000-C.DERIBIT"),
             underlying_price: Some(50200.0),
@@ -1070,6 +1082,64 @@ mod tests {
         };
         manager.handle_greeks(&greeks);
         assert!(!manager.bootstrapped);
+    }
+
+    #[rstest]
+    fn test_manager_forward_price_rejects_invalid_underlying() {
+        use nautilus_model::data::option_chain::OptionGreeks;
+
+        let (mut manager, queue) = make_option_chain_manager();
+        let greeks = OptionGreeks {
+            instrument_id: InstrumentId::from("BTC-20240101-50000-C.DERIBIT"),
+            underlying_price: Some(f64::NAN),
+            ..Default::default()
+        };
+
+        manager.handle_greeks(&greeks);
+
+        assert!(!manager.bootstrapped);
+        assert!(manager.aggregator.atm_tracker().atm_price().is_none());
+        assert!(queue.borrow().is_empty());
+    }
+
+    #[rstest]
+    fn test_manager_forward_price_rejects_invalid_underlying_without_buffering_greeks() {
+        use nautilus_model::data::{greeks::OptionGreekValues, option_chain::OptionGreeks};
+
+        let (mut manager, queue) = make_option_chain_manager();
+        bootstrap_via_greeks(&mut manager);
+        queue.borrow_mut().clear();
+
+        let instrument_id = InstrumentId::from("BTC-20240101-50000-C.DERIBIT");
+        let quote = QuoteTick::new(
+            instrument_id,
+            Price::from("100.00"),
+            Price::from("101.00"),
+            Quantity::from("1.0"),
+            Quantity::from("1.0"),
+            UnixNanos::from(1u64),
+            UnixNanos::from(1u64),
+        );
+        manager.handle_quote(&quote);
+
+        let greeks = OptionGreeks {
+            instrument_id,
+            underlying_price: Some(f64::NAN),
+            greeks: OptionGreekValues {
+                delta: 0.55,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        manager.handle_greeks(&greeks);
+
+        let slice = manager.aggregator.snapshot(UnixNanos::from(2u64));
+        assert_eq!(
+            manager.aggregator.atm_tracker().atm_price().unwrap(),
+            Price::from("50000.00")
+        );
+        assert!(slice.get_call_greeks(&Price::from("50000")).is_none());
+        assert!(queue.borrow().is_empty());
     }
 
     #[rstest]
@@ -1162,7 +1232,7 @@ mod tests {
         bootstrap_via_greeks(&mut manager);
         queue.borrow_mut().clear();
 
-        // Publish at the expiration timestamp — should push ExpireSeries, not publish
+        // Publish at the expiration timestamp - should push ExpireSeries, not publish
         let expiry_ns = manager.aggregator.series_id().expiration_ns;
         manager.publish_slice(expiry_ns);
 
