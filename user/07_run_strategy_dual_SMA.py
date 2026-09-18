@@ -257,7 +257,8 @@ def main() -> None:
             slow_period=args.slow_period,
             bar_suffix=bar_suffix,
             global_config=global_config,
-            telegram_active=True
+            telegram_active=True,
+            strategy_id=f"{trader}-DUAL-SMA",
         ),
     )
 

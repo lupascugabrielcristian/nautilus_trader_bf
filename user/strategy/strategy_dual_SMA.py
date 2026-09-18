@@ -7,7 +7,10 @@ from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import BarType
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import TimeInForce
-from nautilus_trader.model.events import OrderCanceled, OrderFilled, OrderRejected
+from nautilus_trader.model.events import OrderCanceled, OrderDenied, OrderFilled, OrderRejected
+from nautilus_trader.model.identifiers import ClientOrderId
+from nautilus_trader.model.orders import LimitOrder
+from nautilus_trader.model.orders import StopMarketOrder
 from nautilus_trader.indicators import AverageTrueRange
 from nautilus_trader.indicators import DirectionalMovement
 from nautilus_trader.indicators import ExponentialMovingAverage
@@ -38,9 +41,12 @@ class DualSMAStrategy(Strategy):
         self.slow_ema = ExponentialMovingAverage(self.config.slow_period)
         self.atr = AverageTrueRange(self.config.atr_period)
         self.dm = DirectionalMovement(self.config.dm_period)
-        self.in_position = False
         self.order_in_flight = False
         self.bars_since_last_trade = 0
+        self._entry_order_id: ClientOrderId | None = None
+        self._exit_plan: dict | None = None
+        self._sl_order_id: ClientOrderId | None = None
+        self._tp_order_id: ClientOrderId | None = None
 
     def on_start(self) -> None:
         instrument = self.cache.instrument(self.config.instrument_id)
@@ -48,6 +54,7 @@ class DualSMAStrategy(Strategy):
         self.subscribe_bars(bar_type)
         self._log_cache_state()
         self._log_open_positions()
+        self._adopt_open_exit_orders()
         log_message(
             f"Dual SMA strategy started: fast={self.config.fast_period} "
             f"slow={self.config.slow_period} atr={self.config.atr_period} "
@@ -105,17 +112,10 @@ class DualSMAStrategy(Strategy):
         log_message(f"bar data received. OPEN: {float(bar.open):.2f}")
 
         if self.order_in_flight:
-            instrument_id = self.config.instrument_id
-            working_orders = self.cache.orders_open(
-                instrument_id=instrument_id, strategy_id=self.strategy_id
+            log_message(
+                f"entry order in flight - skipping bar "
+                f"(entry_order_id={self._entry_order_id})"
             )
-            for order in working_orders:
-                price = order.price if order.has_price else "N/A"
-                log_message(
-                    f"order in flight - cancelling: "
-                    f"side={order.side.name} qty={order.quantity} price={price} "
-                    f"status={order.status}"
-                )
             return
 
         self.bars_since_last_trade += 1
@@ -193,15 +193,18 @@ class DualSMAStrategy(Strategy):
         sl_distance = self.config.atr_sl_multiplier * atr_val
         tp_distance = self.config.atr_tp_multiplier * atr_val
 
-        order_list = self.order_factory.bracket(
+        entry = self.order_factory.market(
             instrument_id=self.config.instrument_id,
             order_side=OrderSide.BUY,
             quantity=quantity,
-            time_in_force=TimeInForce.GTC,
-            sl_trigger_price=instrument.make_price(close - sl_distance),
-            tp_price=instrument.make_price(close + tp_distance),
         )
-        self.submit_order_list(order_list)
+        self._entry_order_id = entry.client_order_id
+        self._exit_plan = {
+            "exit_side": OrderSide.SELL,
+            "sl_price": instrument.make_price(close - sl_distance),
+            "tp_price": instrument.make_price(close + tp_distance),
+        }
+        self.submit_order(entry)
         self.order_in_flight = True
         log_message(
             f"LONG entry={close:.2f} SL={close - sl_distance:.2f} "
@@ -220,15 +223,18 @@ class DualSMAStrategy(Strategy):
         sl_distance = self.config.atr_sl_multiplier * atr_val
         tp_distance = self.config.atr_tp_multiplier * atr_val
 
-        order_list = self.order_factory.bracket(
+        entry = self.order_factory.market(
             instrument_id=self.config.instrument_id,
             order_side=OrderSide.SELL,
             quantity=quantity,
-            time_in_force=TimeInForce.GTC,
-            sl_trigger_price=instrument.make_price(close + sl_distance),
-            tp_price=instrument.make_price(close - tp_distance),
         )
-        self.submit_order_list(order_list)
+        self._entry_order_id = entry.client_order_id
+        self._exit_plan = {
+            "exit_side": OrderSide.BUY,
+            "sl_price": instrument.make_price(close + sl_distance),
+            "tp_price": instrument.make_price(close - tp_distance),
+        }
+        self.submit_order(entry)
         self.order_in_flight = True
         log_message(
             f"SHORT entry={close:.2f} SL={close + sl_distance:.2f} "
@@ -239,20 +245,124 @@ class DualSMAStrategy(Strategy):
             f"TP={close - tp_distance:.2f}"
         )
 
+    def _submit_exits(self, entry_order) -> None:
+        plan = self._exit_plan
+        if plan is None:
+            return
+        quantity = entry_order.filled_qty
+        sl_order = self.order_factory.stop_market(
+            instrument_id=self.config.instrument_id,
+            order_side=plan["exit_side"],
+            quantity=quantity,
+            trigger_price=plan["sl_price"],
+            reduce_only=True,
+        )
+        tp_order = self.order_factory.limit(
+            instrument_id=self.config.instrument_id,
+            order_side=plan["exit_side"],
+            quantity=quantity,
+            price=plan["tp_price"],
+            time_in_force=TimeInForce.GTC,
+            reduce_only=True,
+        )
+        self._sl_order_id = sl_order.client_order_id
+        self._tp_order_id = tp_order.client_order_id
+        self.submit_order(sl_order)
+        self.submit_order(tp_order)
+        self._exit_plan = None
+        log_message(
+            f"exit orders submitted: side={plan['exit_side'].name} qty={quantity} "
+            f"SL={plan['sl_price']} TP={plan['tp_price']}"
+        )
+
+    def _cancel_sibling_exit(self, filled_order_id: ClientOrderId) -> None:
+        sibling_id = None
+        if filled_order_id == self._sl_order_id:
+            self._sl_order_id = None
+            sibling_id = self._tp_order_id
+        elif filled_order_id == self._tp_order_id:
+            self._tp_order_id = None
+            sibling_id = self._sl_order_id
+        if sibling_id is None:
+            return
+        sibling = self.cache.order(sibling_id)
+        if sibling is not None and sibling.is_open:
+            self.cancel_order(sibling)
+
+    def _reset_entry_state(self) -> None:
+        self.order_in_flight = False
+        self._entry_order_id = None
+        self._exit_plan = None
+
+    def _adopt_open_exit_orders(self) -> None:
+        working_orders = self.cache.orders_open(
+            instrument_id=self.config.instrument_id,
+            strategy_id=self.id,
+        )
+        for order in working_orders:
+            if isinstance(order, StopMarketOrder):
+                self._sl_order_id = order.client_order_id
+            elif isinstance(order, LimitOrder):
+                self._tp_order_id = order.client_order_id
+        if self._sl_order_id is not None or self._tp_order_id is not None:
+            log_message(
+                f"adopted open exit orders from previous session: "
+                f"SL={self._sl_order_id} TP={self._tp_order_id}"
+            )
+
     def on_order_filled(self, event: OrderFilled) -> None:
         order = self.cache.order(event.client_order_id)
-        if order is not None and order.is_closed:
-            self.order_in_flight = False
+        if order is None:
+            return
+        if event.client_order_id == self._entry_order_id:
+            if order.is_closed:
+                self.order_in_flight = False
+                self.bars_since_last_trade = 0
+                log_message(f"Entry order filled: side={order.side.name}")
+                self._submit_exits(order)
+            return
+        if not order.is_closed:
+            return
+        if event.client_order_id == self._sl_order_id:
             self.bars_since_last_trade = 0
-            log_message(f"Order filled: side={order.side.name}")
+            log_message("SL exit filled - cancelling TP sibling")
+            self._cancel_sibling_exit(event.client_order_id)
+        elif event.client_order_id == self._tp_order_id:
+            self.bars_since_last_trade = 0
+            log_message("TP exit filled - cancelling SL sibling")
+            self._cancel_sibling_exit(event.client_order_id)
+
+    def on_order_denied(self, event: OrderDenied) -> None:
+        log_message(f"Order denied: {event.client_order_id} reason={event.reason}")
+        self._handle_order_failed(event.client_order_id)
 
     def on_order_rejected(self, event: OrderRejected) -> None:
-        self.order_in_flight = False
         log_message(f"Order rejected: {event.client_order_id} reason={event.reason}")
+        self._handle_order_failed(event.client_order_id)
 
     def on_order_canceled(self, event: OrderCanceled) -> None:
-        self.order_in_flight = False
-        log_message(f"Order canceled: {event.client_order_id}")
+        if event.client_order_id == self._entry_order_id:
+            log_message(f"Entry order canceled: {event.client_order_id}")
+            self._reset_entry_state()
+        elif event.client_order_id == self._sl_order_id:
+            self._sl_order_id = None
+            log_message(f"SL exit order canceled: {event.client_order_id}")
+        elif event.client_order_id == self._tp_order_id:
+            self._tp_order_id = None
+            log_message(f"TP exit order canceled: {event.client_order_id}")
+
+    def _handle_order_failed(self, order_id: ClientOrderId) -> None:
+        if order_id == self._entry_order_id:
+            self._reset_entry_state()
+        elif order_id == self._sl_order_id:
+            self._sl_order_id = None
+            log_message("WARNING: SL exit failed - TP remains working, position may be unprotected")
+            self._sendTelegramNotification(
+                "WARNING: SL exit failed - TP remains working, position may be unprotected"
+            )
+        elif order_id == self._tp_order_id:
+            self._tp_order_id = None
+            log_message("WARNING: TP exit failed - SL remains working")
 
     def _sendTelegramNotification(self, message: str) -> None:
         if not self.config.telegram_active:
