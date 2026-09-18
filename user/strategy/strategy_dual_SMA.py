@@ -2,6 +2,7 @@ from decimal import Decimal
 
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.trading.strategy import Strategy
+from nautilus_trader.model import InstrumentId
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import BarType
 from nautilus_trader.model.enums import OrderSide
@@ -55,7 +56,17 @@ class DualSMAStrategy(Strategy):
         log_message(f"bar data received. OPEN: {bar.open:.2f}")
 
         if self.order_in_flight:
-            log_message('order in flight - cancelling')
+            instrument_id = InstrumentId.from_str(self.config.instrument_id)
+            working_orders = self.cache.orders_open(
+                instrument_id=instrument_id, strategy_id=self.strategy_id
+            )
+            for order in working_orders:
+                price = order.price if order.has_price else "N/A"
+                log_message(
+                    f"order in flight - cancelling: "
+                    f"side={order.side.name} qty={order.quantity} price={price} "
+                    f"status={order.status}"
+                )
             return
 
         self.bars_since_last_trade += 1
@@ -64,6 +75,16 @@ class DualSMAStrategy(Strategy):
         self.atr.handle_bar(bar)
         self.dm.handle_bar(bar)
 
+        if not self.fast_ema.initialized:
+            log_message(
+                f"warming up - not enough history bars for fast EMA "
+                f"({self.fast_ema.count}/{self.config.fast_period})"
+            )
+        if not self.slow_ema.initialized:
+            log_message(
+                f"warming up - not enough history bars for slow EMA "
+                f"({self.slow_ema.count}/{self.config.slow_period})"
+            )
         if not all([
             self.fast_ema.initialized,
             self.slow_ema.initialized,
