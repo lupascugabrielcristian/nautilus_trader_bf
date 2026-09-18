@@ -52,7 +52,7 @@ class DualSMAStrategy(Strategy):
         )
 
     def on_bar(self, bar: Bar) -> None:
-        log_message('bar data received')
+        log_message(f"bar data received. OPEN: {bar.open:.2f}")
 
         if self.order_in_flight:
             log_message('order in flight - cancelling')
@@ -70,6 +70,7 @@ class DualSMAStrategy(Strategy):
             self.atr.initialized,
             self.dm.initialized,
         ]):
+            log_message('initial conditions not satified - stop precessing bar')
             return
 
         fast_val = self.fast_ema.value
@@ -112,6 +113,7 @@ class DualSMAStrategy(Strategy):
                     self.close_all_positions(self.config.instrument_id)
                     self.cancel_all_orders(self.config.instrument_id)
                     self._enter_long(bar, atr_val)
+        log_message('Done precessing candle')
 
     def _enter_long(self, bar: Bar, atr_val: float) -> None:
         log_message('trying to enter long')
