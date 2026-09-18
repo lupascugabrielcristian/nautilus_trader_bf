@@ -78,7 +78,7 @@ class DualSMAStrategy(Strategy):
             )
         try:
             exposures = self.portfolio.net_exposures(
-                venue=InstrumentId.from_str(self.config.instrument_id).venue,
+                venue=self.config.instrument_id.venue,
             )
         except TypeError:
             log_message("[POSITION] net exposures unavailable during startup")
@@ -90,7 +90,7 @@ class DualSMAStrategy(Strategy):
             log_message(f"[POSITION] net exposure {instrument_id}: {quantity}")
 
     def on_stop(self) -> None:
-        instrument = InstrumentId.from_str(self.config.instrument_id)
+        instrument = self.config.instrument_id
         open_orders = self.cache.orders_open(instrument_id=instrument)
         open_positions = self.cache.positions_open(instrument_id=instrument)
         log_message(
@@ -105,7 +105,7 @@ class DualSMAStrategy(Strategy):
         log_message(f"bar data received. OPEN: {float(bar.open):.2f}")
 
         if self.order_in_flight:
-            instrument_id = InstrumentId.from_str(self.config.instrument_id)
+            instrument_id = self.config.instrument_id
             working_orders = self.cache.orders_open(
                 instrument_id=instrument_id, strategy_id=self.strategy_id
             )

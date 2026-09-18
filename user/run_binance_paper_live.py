@@ -4,6 +4,7 @@ import os
 from nautilus_trader.adapters.binance import BINANCE
 from nautilus_trader.adapters.binance import BinanceAccountType
 from nautilus_trader.adapters.binance import BinanceDataClientConfig
+from nautilus_trader.adapters.binance import BinanceEnvironment
 from nautilus_trader.adapters.binance import BinanceExecClientConfig
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.adapters.binance import BinanceLiveDataClientFactory
@@ -29,14 +30,16 @@ _ACCOUNT_TYPE_CREDENTIAL_MAP: dict[BinanceAccountType, tuple[str, str]] = {
 }
 
 
-def _validate_credentials(testnet: bool, account_type: BinanceAccountType) -> None:
-    if testnet:
+def _validate_credentials(environment: BinanceEnvironment, account_type: BinanceAccountType) -> None:
+    if environment == BinanceEnvironment.TESTNET:
         key_var, secret_var = _ACCOUNT_TYPE_CREDENTIAL_MAP.get(account_type, ("BINANCE_TESTNET_API_KEY", "BINANCE_TESTNET_API_SECRET"))
+    elif environment == BinanceEnvironment.DEMO:
+        key_var, secret_var = "BINANCE_DEMO_API_KEY", "BINANCE_DEMO_API_SECRET"
     else:
         key_var, secret_var = "BINANCE_API_KEY", "BINANCE_API_SECRET"
     key_is_set = bool(os.getenv(key_var))
     secret_is_set = bool(os.getenv(secret_var))
-    env_label = "TESTNET" if testnet else "LIVE"
+    env_label = str(environment)
     print(f"Binance startup validation: env={env_label}, account_type={account_type}")
     print(f"Credential var status: {key_var}={'SET' if key_is_set else 'MISSING'}")
     print(f"Credential var status: {secret_var}={'SET' if secret_is_set else 'MISSING'}")
@@ -54,8 +57,18 @@ def _parse_env_name() -> tuple[bool, bool]:
     if raw == "TESTNET":
         return True, False
     if raw == "DEMO":
-        return False, True
+        return False, False
     raise ValueError("BINANCE_ENV must be one of LIVE, TESTNET, DEMO")
+
+
+def _get_environment() -> BinanceEnvironment:
+    raw = os.getenv("BINANCE_ENV", "TESTNET").upper()
+    mapping = {
+        "LIVE": BinanceEnvironment.LIVE,
+        "TESTNET": BinanceEnvironment.TESTNET,
+        "DEMO": BinanceEnvironment.DEMO,
+    }
+    return mapping[raw]
 
 
 def _parse_account_type() -> BinanceAccountType:
@@ -75,9 +88,10 @@ def _parse_account_type() -> BinanceAccountType:
 
 def main() -> None:
     testnet, us = _parse_env_name()
+    environment = _get_environment()
     account_type = _parse_account_type()
 
-    _validate_credentials(testnet, account_type)
+    _validate_credentials(environment, account_type)
 
     default_symbol = "BTCUSDT" if account_type == BinanceAccountType.SPOT else "BTCUSDT-PERP"
     symbol = os.getenv("BINANCE_INSTRUMENT", default_symbol)
@@ -97,6 +111,7 @@ def main() -> None:
         data_clients={
             BINANCE: BinanceDataClientConfig(
                 account_type=account_type,
+                environment=environment,
                 testnet=testnet,
                 us=us,
                 instrument_provider=InstrumentProviderConfig(
@@ -107,6 +122,7 @@ def main() -> None:
         exec_clients={
             BINANCE: BinanceExecClientConfig(
                 account_type=account_type,
+                environment=environment,
                 testnet=testnet,
                 us=us,
                 instrument_provider=InstrumentProviderConfig(
