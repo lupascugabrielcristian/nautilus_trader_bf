@@ -268,6 +268,12 @@ def main() -> None:
 
     try:
         node.run()
+    except KeyboardInterrupt:
+        log_message("CTRL+C received - closing strategy gracefully")
+        try:
+            node.stop()
+        except Exception as e:
+            log_message(f"Error stopping trading node gracefully: {e}")
     finally:
         node.dispose()
 

@@ -46,14 +46,63 @@ class DualSMAStrategy(Strategy):
         instrument = self.cache.instrument(self.config.instrument_id)
         bar_type = BarType.from_str(f"{instrument.id}-{self.config.bar_suffix}")
         self.subscribe_bars(bar_type)
+        self._log_cache_state()
+        self._log_open_positions()
         log_message(
             f"Dual SMA strategy started: fast={self.config.fast_period} "
             f"slow={self.config.slow_period} atr={self.config.atr_period} "
             f"dm={self.config.dm_period}"
         )
 
+    def _log_cache_state(self) -> None:
+        instruments = self.cache.instruments()
+        for inst in instruments:
+            log_message(f"[CACHE] instrument available: {inst.id}")
+        orders = self.cache.orders()
+        open_orders = self.cache.orders_open()
+        log_message(
+            f"[CACHE] instruments={len(instruments)} "
+            f"orders={len(orders)} open_orders={len(open_orders)} "
+            f"accounts={len(self.cache.accounts())}"
+        )
+
+    def _log_open_positions(self) -> None:
+        positions = self.cache.positions_open()
+        log_message(f"[POSITIONS] open positions count: {len(positions)}")
+        for position in positions:
+            log_message(
+                f"[POSITION] id={position.id} instrument={position.instrument_id} "
+                f"side={'LONG' if position.is_long else 'SHORT'} "
+                f"qty={position.quantity} avg_open={position.avg_px_open} "
+                f"realized_pnl={position.realized_pnl}"
+            )
+        try:
+            exposures = self.portfolio.net_exposures(
+                venue=InstrumentId.from_str(self.config.instrument_id).venue,
+            )
+        except TypeError:
+            log_message("[POSITION] net exposures unavailable during startup")
+            return
+        if not exposures:
+            log_message("[POSITION] no net exposure to report")
+            return
+        for instrument_id, quantity in exposures.items():
+            log_message(f"[POSITION] net exposure {instrument_id}: {quantity}")
+
+    def on_stop(self) -> None:
+        instrument = InstrumentId.from_str(self.config.instrument_id)
+        open_orders = self.cache.orders_open(instrument_id=instrument)
+        open_positions = self.cache.positions_open(instrument_id=instrument)
+        log_message(
+            f"Stopping strategy - cancelling open orders "
+            f"count={len(open_orders)} and closing open positions count={len(open_positions)}"
+        )
+        self.cancel_all_orders(instrument)
+        self.close_all_positions(instrument)
+        self.order_in_flight = False
+
     def on_bar(self, bar: Bar) -> None:
-        log_message(f"bar data received. OPEN: {bar.open:.2f}")
+        log_message(f"bar data received. OPEN: {float(bar.open):.2f}")
 
         if self.order_in_flight:
             instrument_id = InstrumentId.from_str(self.config.instrument_id)
@@ -91,7 +140,7 @@ class DualSMAStrategy(Strategy):
             self.atr.initialized,
             self.dm.initialized,
         ]):
-            log_message('initial conditions not satified - stop precessing bar')
+            log_message('initial conditions not satified - stop processing bar')
             return
 
         fast_val = self.fast_ema.value
