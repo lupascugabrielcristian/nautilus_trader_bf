@@ -1,9 +1,8 @@
 import argparse
 from decimal import Decimal
 import os
-import sys
 import yaml
-import requests
+import json
 
 from nautilus_trader.adapters.binance import BINANCE
 from nautilus_trader.adapters.binance import BinanceAccountType
@@ -98,40 +97,6 @@ def _load_step_config() -> dict:
         return {}
 
 
-def _log_message(format, *args):                          
-    LOGGING_PORT = os.environ.get('LOGGING_PORT', '')
-    if not LOGGING_PORT:
-        ports = _load_service_ports()
-        LOGGING_PORT = ports.get('LOGGING_PORT', '')
-    if not LOGGING_PORT:
-        return
-    LOGGING_PORT = int(LOGGING_PORT)
-    msg = format % args
-    url = f"http://localhost:{LOGGING_PORT}/service/log"
-    try:   
-        requests.post(url, data=msg, timeout=5)                                 
-    except requests.RequestException:
-      pass
-
-def _telegram(format, *args):                          
-    TELEGRAM_PORT = os.environ.get('TELEGRAM_PORT', '')
-    if not TELEGRAM_PORT:
-        ports = _load_service_ports()
-        TELEGRAM_PORT = ports.get('TELEGRAM_PORT', '')
-    if not TELEGRAM_PORT:
-        return
-    TELEGRAM_PORT = int(TELEGRAM_PORT)
-    msg = format % args
-    url = f"http://localhost:{TELEGRAM_PORT}/service/telegram"
-    try:   
-        requests.post(url, data=msg, timeout=5)                                 
-    except requests.RequestException:
-      pass
-
-
-def main() -> None:
-    global_config = _load_global_config()
-=======
 def _load_step_config() -> dict:
     raw = global_config()
     if not raw:
@@ -183,7 +148,6 @@ def _resolve_bar_suffix(interval: str) -> str:
 
 def main() -> None:
     global_config = _load_step_config()
->>>>>>> 743189f1b4438457cb48cd1c5aa414b3b097ddc8
 
     parser = argparse.ArgumentParser(description="Run DualSMAStrategy on Binance")
     parser.add_argument("symbol", type=str, help="Instrument symbol e.g. BTCUSDT-PERP or ETHUSDT")

@@ -52,7 +52,7 @@ class DualSMAStrategy(Strategy):
         )
 
     def on_bar(self, bar: Bar) -> None:
-        log_message('on bar')
+        log_message('bar data received')
 
         if self.order_in_flight:
             log_message('order in flight - cancelling')
