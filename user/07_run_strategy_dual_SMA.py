@@ -30,6 +30,7 @@ from tr_utils import log_message
 Example usage:
   python 07_run_strategy_dual_SMA.py BTCUSDT-PERP
   python 07_run_strategy_dual_SMA.py ETHUSDT --fast-period 10 --slow-period 50
+  python 07_run_strategy_dual_SMA.py BTCUSDT-PERP --leverage 10
 
 Optional environment variables:
   BINANCE_ENV              LIVE | TESTNET (default) | DEMO
@@ -37,6 +38,12 @@ Optional environment variables:
   BINANCE_TRADER_ID        default: TESTER-001
   BINANCE_LOG_LEVEL        default: INFO
   BINANCE_TRADE_SIZE       default: 0.2
+
+On start the strategy logs the account balances reported by the venue, and
+entry orders are sized to the funds available (capped or skipped when the
+balance cannot cover the trade size), so insufficient-balance rejections are
+avoided. --leverage only affects the required-margin estimate on margin/futures
+accounts; SPOT ignores it.
 """
 
 
@@ -154,6 +161,12 @@ def main() -> None:
     parser.add_argument("--fast-period", type=int, default=10, help="Fast SMA period")
     parser.add_argument("--slow-period", type=int, default=50, help="Slow SMA period")
     parser.add_argument("--bar-suffix", type=str, default=None, help="Bar suffix e.g. 15-MINUTE-LAST-EXTERNAL. Overrides interval from global config.")
+    parser.add_argument(
+        "--leverage",
+        type=Decimal,
+        default=Decimal("1"),
+        help="Leverage used to estimate required margin on margin/futures accounts (SPOT ignores it)",
+    )
     args = parser.parse_args()
 
     env_name = os.getenv("BINANCE_ENV", "TESTNET").upper()
@@ -256,6 +269,7 @@ def main() -> None:
             fast_period=args.fast_period,
             slow_period=args.slow_period,
             bar_suffix=bar_suffix,
+            leverage=args.leverage,
             global_config=global_config,
             telegram_active=True,
             strategy_id=f"{trader}-DUAL-SMA",

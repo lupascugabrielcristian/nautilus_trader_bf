@@ -9,6 +9,7 @@ from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.events import OrderCanceled, OrderDenied, OrderFilled, OrderRejected
 from nautilus_trader.model.identifiers import ClientOrderId
+from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.orders import LimitOrder
 from nautilus_trader.model.orders import StopMarketOrder
 from nautilus_trader.indicators import AverageTrueRange
@@ -30,6 +31,7 @@ class DualSMAConfig(StrategyConfig):
     dm_period: int = 14
     atr_sl_multiplier: float = 1.5
     atr_tp_multiplier: float = 3.0
+    leverage: Decimal = Decimal("1")
     telegram_active: bool = False
     global_config: dict = {}
 
@@ -47,18 +49,22 @@ class DualSMAStrategy(Strategy):
         self._exit_plan: dict | None = None
         self._sl_order_id: ClientOrderId | None = None
         self._tp_order_id: ClientOrderId | None = None
+        self._account_reported = False
+        self._account_wait_logged = False
 
     def on_start(self) -> None:
         instrument = self.cache.instrument(self.config.instrument_id)
         bar_type = BarType.from_str(f"{instrument.id}-{self.config.bar_suffix}")
         self.subscribe_bars(bar_type)
         self._log_cache_state()
+        self._log_account_balances()
         self._log_open_positions()
         self._adopt_open_exit_orders()
         log_message(
             f"Dual SMA strategy started: fast={self.config.fast_period} "
             f"slow={self.config.slow_period} atr={self.config.atr_period} "
-            f"dm={self.config.dm_period}"
+            f"dm={self.config.dm_period} trade_size={self.config.trade_size} "
+            f"leverage={self.config.leverage}"
         )
 
     def _log_cache_state(self) -> None:
@@ -72,6 +78,115 @@ class DualSMAStrategy(Strategy):
             f"orders={len(orders)} open_orders={len(open_orders)} "
             f"accounts={len(self.cache.accounts())}"
         )
+
+    def _report(self, message: str) -> None:
+        log_message(message)
+        self.log.info(message)
+
+    def _account(self):
+        return self.portfolio.account(venue=self.config.instrument_id.venue)
+
+    def _log_account_balances(self) -> None:
+        if self._account_reported:
+            return
+        account = self._account()
+        if account is None:
+            if not self._account_wait_logged:
+                self._account_wait_logged = True
+                self._report(
+                    "[ACCOUNT] account state not yet received - "
+                    "balances will be logged once available"
+                )
+            return
+        self._account_reported = True
+        account_kind = "MARGIN" if account.is_margin_account else "CASH"
+        self._report(f"[ACCOUNT] id={account.id} type={account_kind}")
+        balances = account.balances()
+        if not balances:
+            self._report("[ACCOUNT] no balances reported by the venue")
+            return
+        for currency, balance in balances.items():
+            self._report(
+                f"[ACCOUNT] {currency.code}: total={balance.total} "
+                f"locked={balance.locked} free={balance.free}"
+            )
+
+    @staticmethod
+    def _free_balance(account, currency) -> Decimal | None:
+        balance = account.balances().get(currency)
+        if balance is None:
+            return None
+        return balance.free.as_decimal()
+
+    def _funding_currency(self, instrument, account, order_side: OrderSide):
+        if account.is_margin_account:
+            settlement = getattr(instrument, "settlement_currency", None)
+            return settlement if settlement is not None else instrument.quote_currency
+        if order_side == OrderSide.BUY:
+            return instrument.quote_currency
+        return instrument.base_currency
+
+    def _resolve_entry_quantity(
+        self,
+        instrument,
+        order_side: OrderSide,
+        price: Decimal,
+    ) -> Quantity | None:
+        desired = instrument.make_qty(self.config.trade_size)
+        account = self._account()
+        if account is None:
+            return desired
+
+        funding_currency = self._funding_currency(instrument, account, order_side)
+        if funding_currency is None:
+            return desired
+        free = self._free_balance(account, funding_currency)
+        if free is None:
+            free = Decimal("0")
+
+        if account.is_margin_account:
+            # Estimated margin locked by the entry: notional / leverage
+            max_quantity = free * self.config.leverage / price
+            needed = desired.as_decimal() * price / self.config.leverage
+        elif order_side == OrderSide.BUY:
+            max_quantity = free / price
+            needed = desired.as_decimal() * price
+        else:
+            # Cash account SELL entries spend the base asset held
+            max_quantity = free
+            needed = desired.as_decimal()
+
+        if desired.as_decimal() <= max_quantity:
+            return desired
+
+        step = instrument.size_increment.as_decimal()
+        capped = (max_quantity // step) * step if step > 0 else max_quantity
+        min_quantity = (
+            instrument.min_quantity.as_decimal()
+            if instrument.min_quantity is not None
+            else Decimal("0")
+        )
+        if capped <= 0 or capped < min_quantity:
+            self._report(
+                f"[FUNDS] insufficient funds for {order_side.name} {desired} {instrument.id}: "
+                f"need ~{needed} {funding_currency.code}, free {free} {funding_currency.code} "
+                f"- entry skipped"
+            )
+            return None
+
+        min_notional = instrument.min_notional
+        if min_notional is not None and capped * price < min_notional.as_decimal():
+            self._report(
+                f"[FUNDS] affordable quantity {capped} {instrument.id} is below "
+                f"minimum notional {min_notional} - entry skipped"
+            )
+            return None
+
+        self._report(
+            f"[FUNDS] trade size capped to affordable amount: {capped} {instrument.id} "
+            f"(free {free} {funding_currency.code})"
+        )
+        return instrument.make_qty(capped)
 
     def _log_open_positions(self) -> None:
         positions = self.cache.positions_open()
@@ -109,6 +224,7 @@ class DualSMAStrategy(Strategy):
         self.order_in_flight = False
 
     def on_bar(self, bar: Bar) -> None:
+        self._log_account_balances()
         log_message(f"bar data received. OPEN: {float(bar.open):.2f}")
 
         if self.order_in_flight:
@@ -188,7 +304,10 @@ class DualSMAStrategy(Strategy):
     def _enter_long(self, bar: Bar, atr_val: float) -> None:
         log_message('trying to enter long')
         instrument = self.cache.instrument(self.config.instrument_id)
-        quantity = instrument.make_qty(self.config.trade_size)
+        quantity = self._resolve_entry_quantity(instrument, OrderSide.BUY, bar.close.as_decimal())
+        if quantity is None:
+            self.bars_since_last_trade = 0
+            return
         close = bar.close.as_double()
         sl_distance = self.config.atr_sl_multiplier * atr_val
         tp_distance = self.config.atr_tp_multiplier * atr_val
@@ -218,7 +337,10 @@ class DualSMAStrategy(Strategy):
     def _enter_short(self, bar: Bar, atr_val: float) -> None:
         log_message('trying to enter short')
         instrument = self.cache.instrument(self.config.instrument_id)
-        quantity = instrument.make_qty(self.config.trade_size)
+        quantity = self._resolve_entry_quantity(instrument, OrderSide.SELL, bar.close.as_decimal())
+        if quantity is None:
+            self.bars_since_last_trade = 0
+            return
         close = bar.close.as_double()
         sl_distance = self.config.atr_sl_multiplier * atr_val
         tp_distance = self.config.atr_tp_multiplier * atr_val
